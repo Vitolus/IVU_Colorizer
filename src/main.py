@@ -2,7 +2,7 @@
 import os
 import re
 import cv2
-from tqdm.notebook import tqdm
+from tqdm import tqdm
 import torch
 from torch import nn, optim
 import torch.nn.functional as F
