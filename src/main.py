@@ -104,3 +104,31 @@ color_transform = transforms.Compose([
 ])
 trainset = MyDataset(gray_train, color_train, gray_transform=gray_transform, color_transform=color_transform)
 testset = MyDataset(gray_test, color_test, gray_transform=gray_transform, color_transform=color_transform)
+#%%
+class EarlyStopping:
+    def __init__(self, patience=15, delta=0.5, window_size=10):
+        self.patience = patience
+        self.counter = 0
+        self.best_score = np.Inf
+        self.early_stop = False
+        self.delta = delta
+        self.window_size = window_size
+        self.val_window = []
+
+    def __call__(self, val_loss, net):
+        self.val_window.append(val_loss)
+        if len(self.val_window) > self.window_size:
+            self.val_window.pop(0)
+        avg_val = np.mean(self.val_window)
+
+        if avg_val == self.best_score or avg_val > self.best_score + self.delta:
+            self.counter += 1
+        elif avg_val < self.best_score:
+            self.best_score = avg_val
+            self.save_checkpoint(net)
+            self.counter = 0
+        if self.counter >= self.patience:
+            self.early_stop = True
+
+    def save_checkpoint(self, model):
+        torch.save(model.state_dict(), '../models/checkpoint.pth')
