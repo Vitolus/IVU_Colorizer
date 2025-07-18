@@ -69,3 +69,22 @@ gray_mean = np.mean(data_gray_scaled, axis=(0, 1, 2))
 gray_std = np.std(data_gray_scaled, axis=(0, 1, 2))
 print(color_mean, color_std)
 print(gray_mean, gray_std)
+#%%
+class MyDataset(torch.utils.data.Dataset):
+    def __init__(self, data_gray, data_color, gray_transform=None, color_transform=None):
+        self.data_color = data_color
+        self.data_gray = data_gray
+        self.gray_transform = gray_transform
+        self.color_transform = color_transform
+
+    def __len__(self):
+        return len(self.data_gray)
+
+    def __getitem__(self, idx):
+        gray_img = self.data_gray[idx]
+        color_img = self.data_color[idx]
+        if self.gray_transform:
+            gray_img = self.gray_transform(gray_img)
+        if self.color_transform:
+            color_img = self.color_transform(color_img)
+        return gray_img, color_img
