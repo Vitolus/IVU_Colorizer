@@ -46,12 +46,13 @@ for file in tqdm(folder):
     data_gray.append(img)
 data_gray = np.array(data_gray)
 #%%
-for i in range(10):
+for _ in range(5):
+    idx = np.random.randint(0, len(data_color) - 1)
     plt.figure(figsize=(15, 15))
     plt.subplot(1, 3, 1)
     plt.title('Color Image', fontsize=20)
-    plt.imshow(data_color[i])
+    plt.imshow(data_color[idx])
     plt.subplot(1, 3, 2)
     plt.title('Grayscale Image ', fontsize=20)
-    plt.imshow(data_gray[i])
+    plt.imshow(data_gray[idx])
     plt.show()
