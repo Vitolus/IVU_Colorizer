@@ -88,3 +88,19 @@ class MyDataset(torch.utils.data.Dataset):
         if self.color_transform:
             color_img = self.color_transform(color_img)
         return gray_img, color_img
+#%%
+#TODO: need to adjust stratify
+gray_train, gray_test, color_train, color_test = (
+    train_test_split(data_gray, data_color, test_size=0.2, random_state=42, stratify=data_color))
+print(len(gray_train), len(gray_test))
+#%%
+gray_transform = transforms.Compose([
+    transforms.ToTensor(),
+    transforms.Normalize(mean=gray_mean, std=gray_std)
+])
+color_transform = transforms.Compose([
+    transforms.ToTensor(),
+    transforms.Normalize(mean=color_mean, std=color_std)
+])
+trainset = MyDataset(gray_train, color_train, gray_transform=gray_transform, color_transform=color_transform)
+testset = MyDataset(gray_test, color_test, gray_transform=gray_transform, color_transform=color_transform)
