@@ -133,26 +133,46 @@ class EarlyStopping:
     def save_checkpoint(self, model):
         torch.save(model.state_dict(), '../models/checkpoint.pth')
 #%% Loss functions
-class GradientDifferenceLoss(nn.Module):
+class ImageGradientLoss(nn.Module):
     def __init__(self, weight=None, size_average=True):
-        super(GradientDifferenceLoss, self).__init__()
+        super(ImageGradientLoss, self).__init__()
 
     def forward(self, inputs, targets):
+        dh_comp = inputs.diff(dim=3) - targets.diff(dim=3) # (B, C, H, W-1)
+        dv_comp = inputs.diff(dim=2) - targets.diff(dim=2) # (B, C, H-1, W)
+        dh_comp = dh_comp.pow(2).sum(dim=1)
+        dv_comp = dv_comp.pow(2).sum(dim=1)
+        return dh_comp.sum() + dv_comp.sum()
 
-        gradient_diff = (inputs.diff(axis=0)-targets.diff(axis=0)).pow(2) + (inputs.diff(axis=1)-targets.diff(axis=1)).pow(2)
-        loss_gdl = gradient_diff.sum()/inputs.numel()
+def fit(net, trainloader, optimizer, loss_fn1=nn.MSELoss(reduction='sum'), loss_fn2=ImageGradientLoss(), lamda1=0.5, lamda2=0.5):
+    net.train()
+    total_loss, acc, count = 0, 0, 0
+    for grays, colors in tqdm(trainloader):
+        grays, colors = grays.to(device), colors.to(device)
+        optimizer.zero_grad()
+        out = net(grays)
+        loss1, loss2 = loss_fn1(out, colors), loss_fn2(out, colors)
+        loss = (lamda1 * loss1 + lamda2 * loss2) / out.numel()
+        loss.backward()
+        optimizer.step()
+        total_loss += loss.item()
+        predicted = torch.max(out, 1)[1]
+        acc += (predicted == colors).sum().item()
+        count += len(colors)
+    return total_loss / count, acc / count
 
-        return loss_gdl
+def predict(net, testloader, loss_fn1=nn.MSELoss(reduction='sum'), loss_fn2=ImageGradientLoss(), lamda1=0.5, lamda2=0.5):
+    net.eval()
+    total_loss, acc, count = 0, 0, 0
+    with torch.no_grad():
+        for grays, colors in tqdm(testloader):
+            grays, colors = grays.to(device), colors.to(device)
+            out = net(grays)
+            loss1, loss2 = loss_fn1(out, colors), loss_fn2(out, colors)
+            loss = (lamda1 * loss1 + lamda2 * loss2) / out.numel()
+            total_loss += loss.item()
+            predicted = torch.max(out, 1)[1]
+            acc += (predicted == colors).sum().item()
+            count += len(colors)
+    return total_loss / count, acc / count
 
-class MSE_and_GDL(nn.Module):
-    def __init__(self, weight=None, size_average=True):
-        super(MSE_and_GDL, self).__init__()
-
-    def forward(self, inputs, targets, lambda_mse, lambda_gdl):
-
-        squared_error = (inputs - targets).pow(2)
-        gradient_diff_i = (inputs.diff(axis=-1)-targets.diff(axis=-1)).pow(2)
-        gradient_diff_j =  (inputs.diff(axis=-2)-targets.diff(axis=-2)).pow(2)
-        loss = (lambda_mse*squared_error.sum() + lambda_gdl*gradient_diff_i.sum() + lambda_gdl*gradient_diff_j.sum())/inputs.numel()
-
-        return loss
