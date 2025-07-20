@@ -3,6 +3,8 @@ import os
 import re
 import cv2
 from tqdm import tqdm
+import optuna
+from optuna.trial import TrialState
 import torch
 from torch import nn, optim
 import torch.nn.functional as F
@@ -11,7 +13,7 @@ from torch.utils.tensorboard import SummaryWriter
 import torchvision
 from torchvision import transforms
 from torchinfo import summary
-from sklearn.model_selection import StratifiedKFold, train_test_split
+from sklearn.model_selection import KFold, train_test_split
 import numpy as np
 import matplotlib.pyplot as plt
 #%%
@@ -175,3 +177,36 @@ def predict(net, testloader, loss_fn1=nn.MSELoss(reduction='sum'), loss_fn2=Imag
             count += len(colors)
     return total_loss / count, acc / count
 
+def objective(trial, trainset, X, y):
+    lr = trial.suggest_float('lr', 1e-5, 1e-2, log=True)
+    batch_size = trial.suggest_categorical('batch_size', [64,256, 512, 1024])
+    kf = KFold(n_splits=5, shuffle=True, random_state=42)
+    val_accs = []
+    train_acc, train_loss, val_acc, val_loss, mean_acc = 0, 0, 0, 0, 0
+    split_n = 0
+    prog_bar = tqdm(kf.split(X, y), desc="Splits")
+    for train_idx, val_idx in prog_bar:
+        split_n += 1
+        trainloader = DataLoader(trainset, batch_size=batch_size, sampler=SubsetRandomSampler(train_idx))
+        valloader = DataLoader(trainset, batch_size=batch_size, sampler=SubsetRandomSampler(val_idx))
+        net = Net().to(device)
+        optimizer = optim.Adam(net.parameters(), lr=lr)
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.1, patience=5)
+        early_stopping = EarlyStopping()
+        for epoch in range(100):
+            train_loss, train_acc = fit(net, trainloader, optimizer)
+            val_loss, val_acc = predict(net, valloader)
+            scheduler.step(val_acc)
+            early_stopping(val_loss, net)
+            prog_bar.set_description(
+                f"Split {split_n} - Epoch {epoch + 1}, Train acc={train_acc:.3f}, Train loss={train_loss:.3f}, "
+                f"Validation acc={val_acc:.3f}, Validation loss={val_loss:.3f}")
+            if early_stopping.early_stop:
+                break
+        val_accs.append(val_acc)
+        meanacc = np.mean(val_accs)
+        trial.report(meanacc, split_n)
+        if trial.should_prune():
+            raise optuna.exceptions.TrialPruned()
+    return mean_acc
+#%%
