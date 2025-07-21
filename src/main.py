@@ -213,27 +213,44 @@ def objective(trial, trainset, X, y):
 class Net(nn.Module):
     def __init__(self):
         super(Net, self).__init__()
-        self.conv = lambda in_c, out_c, kernel, stride: nn.Conv2d(in_c, out_c, kernel, stride)
-        self.convT = lambda in_c, out_c, kernel, stride: nn.ConvTranspose2d(in_c, out_c, kernel, stride)
-        self.bnorm = lambda c: nn.BatchNorm2d(c)
+        self.conv1 = nn.Conv2d(3, 128, 3, 2)
+        self.conv2 = nn.Conv2d(128, 128, 3, 2)
+        self.conv3 = nn.Conv2d(128, 256, 3, 2)
+        self.conv4 = nn.Conv2d(256, 512, 3, 2)
+        self.conv5 = nn.Conv2d(512, 512, 3, 2)
+        self.convt1 = nn.ConvTranspose2d(512, 512, 3, 2)
+        self.convt2 = nn.ConvTranspose2d(1024, 256, 3, 2)
+        self.convt3 = nn.ConvTranspose2d(512, 128, 3, 2)
+        self.convt4 = nn.ConvTranspose2d(256, 128, 3, 2)
+        self.convt5 = nn.ConvTranspose2d(256, 3, 3, 2, output_padding=1)
+        self.bnorm1 = nn.BatchNorm2d(256)
+        self.bnorm2 = nn.BatchNorm2d(512)
         self.dropout = nn.Dropout(0.2)
         self.lrelu = nn.LeakyReLU()
+        self.final = nn.Conv2d(6, 3, 2, 1)
 
-    def forward(self, x):
-        d1 = self.lrelu(self.conv(3, 128, 3, 2)(x)) # (B, 128, H-2, W-2) downsample 1
-        d2 = self.lrelu(self.conv(128, 128, 3, 2)(d1)) # (B, 128, H-4, W-4) downsample 2
-        d3 = self.lrelu(self.bnorm(256)(self.conv(128, 256, 3, 2)(d2))) # (B, 256, H-6, W-6) downsample 3 with batch norm
-        d4 = self.lrelu(self.bnorm(512)(self.conv(256, 512, 3, 2)(d3))) # (B, 512, H-8, W-8) downsample 4 with batch norm
-        d5 = self.lrelu(self.bnorm(512)(self.conv(512, 512, 3, 2)(d4))) # (B, 512, H-10, W-10) downsample 5 with batch norm
-        u1 = self.lrelu(self.convT(512, 512, 3, 2)(d5)) # (B, 512, H-12, W-12) upsample 1
-        u1 = torch.cat([u1, d4], dim=1)
-        u2 = self.lrelu(self.convT(512, 256, 3, 2)(u1)) # (B, 256, H-14, W-14) upsample 2
-        u2 = torch.cat([u2, d3], dim=1)
-        u3 = self.lrelu(self.convT(256, 128, 3, 2)(u2)) # (B, 128, H-16, W-16) upsample 3
-        u3 = torch.cat([u3, d2], dim=1)
-        u4 = self.lrelu(self.convT(128, 128, 3, 2)(u3)) # (B, 128, H-18, W-18) upsample 4
-        u4 = torch.cat([u4, d1], dim=1)
-        u5 = self.lrelu(self.convT(128, 3, 3, 2)(u4)) # (B, 3, H-2, W-2) upsample 5
-        u5 = torch.cat([u5, x], dim=1)
-        x = self.conv(3, 3, 2, 1)(u5)
+    def forward(self, x): # x: (B, 3, H, W) input image
+        d1 = self.lrelu(self.conv1(x))  # (B, 128, H-2, W-2) downsample 1
+        d2 = self.lrelu(self.conv2(d1))  # (B, 128, H-4, W-4) downsample 2
+        d3 = self.lrelu(self.bnorm1(self.conv3(d2)))  # (B, 256, H-6, W-6) downsample 3 with batch norm
+        d4 = self.lrelu(self.bnorm2(self.conv4(d3)))  # (B, 512, H-8, W-8) downsample 4 with batch norm
+        d5 = self.lrelu(self.bnorm2(self.conv5(d4)))  # (B, 512, H-10, W-10) downsample 5 with batch norm
+        u1 = self.lrelu(self.convt1(d5))  # (B, 512, H-12, W-12) upsample 1
+        u1 = torch.cat([u1, d4], dim=1) # (B, 1024, H-8, W-8) concatenate with d4
+        u2 = self.lrelu(self.convt2(u1)) # (B, 256, H-6, W-6) upsample 2
+        u2 = torch.cat([u2, d3], dim=1) # (B, 512, H-6, W-6) concatenate with d3
+        u3 = self.lrelu(self.convt3(u2)) # (B, 128, H-4, W-4) upsample 3
+        u3 = torch.cat([u3, d2], dim=1) # (B, 256, H-4, W-4) concatenate with d2
+        u4 = self.lrelu(self.convt4(u3)) # (B, 128, H-2, W-2) upsample 4
+        u4 = torch.cat([u4, d1], dim=1) # (B, 256, H-2, W-2) concatenate with d1
+        u5 = self.lrelu(self.convt5(u4)) # (B, 3, H, W) upsample 5
+        u5 = torch.cat([u5, x], dim=1) # (B, 6, H, W) concatenate with input x
+        x = self.final(u5) # (B, 3, H, W) final convolution to reduce channels
         return x
+#%%
+writer = SummaryWriter('../runs')
+net = Net().to(device)
+writer.add_graph(net, torch.zeros(1, 3, SIZE, SIZE).to(device))
+writer.flush()
+summary(net, input_size=(1, 3, SIZE, SIZE), device=device)
+
