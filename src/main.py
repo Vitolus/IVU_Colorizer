@@ -10,7 +10,6 @@ from torch import nn, optim
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, random_split, SubsetRandomSampler
 from torch.utils.tensorboard import SummaryWriter
-from torcheval.metrics import PeakSignalNoiseRatio
 import torchvision
 from torchvision import transforms
 from torchinfo import summary
