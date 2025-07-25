@@ -10,6 +10,7 @@ from torch import nn, optim
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, random_split, SubsetRandomSampler
 from torch.utils.tensorboard import SummaryWriter
+from torcheval.metrics import PeakSignalNoiseRatio
 import torchvision
 from torchvision import transforms
 from torchinfo import summary
@@ -145,6 +146,7 @@ class ImageGradientLoss(nn.Module):
         dv_comp = dv_comp.pow(2).sum(dim=1)
         return dh_comp.sum() + dv_comp.sum()
 
+#TODO: change accuracy with correct metrics for regression
 def fit(net, trainloader, optimizer, loss_fn1=nn.MSELoss(reduction='sum'), loss_fn2=ImageGradientLoss(), lamda1=0.5, lamda2=0.5):
     net.train()
     total_loss, acc, count = 0, 0, 0
@@ -213,39 +215,39 @@ def objective(trial, trainset, X, y):
 class Net(nn.Module):
     def __init__(self):
         super(Net, self).__init__()
-        self.conv1 = nn.Conv2d(3, 128, 3, 2)
-        self.conv2 = nn.Conv2d(128, 128, 3, 2)
-        self.conv3 = nn.Conv2d(128, 256, 3, 2)
-        self.conv4 = nn.Conv2d(256, 512, 3, 2)
-        self.conv5 = nn.Conv2d(512, 512, 3, 2)
-        self.convt1 = nn.ConvTranspose2d(512, 512, 3, 2)
-        self.convt2 = nn.ConvTranspose2d(1024, 256, 3, 2)
-        self.convt3 = nn.ConvTranspose2d(512, 128, 3, 2)
-        self.convt4 = nn.ConvTranspose2d(256, 128, 3, 2)
-        self.convt5 = nn.ConvTranspose2d(256, 3, 3, 2, output_padding=1)
+        self.conv1 = nn.Conv2d(3, 128, 4, 2, 1)
+        self.conv2 = nn.Conv2d(128, 128, 4, 2, 1)
+        self.conv3 = nn.Conv2d(128, 256, 4, 2, 1)
+        self.conv4 = nn.Conv2d(256, 512, 4, 2, 1)
+        self.conv5 = nn.Conv2d(512, 512, 4, 2, 1)
+        self.convt1 = nn.ConvTranspose2d(512, 512, 4, 2, 1)
+        self.convt2 = nn.ConvTranspose2d(1024, 256, 4, 2, 1)
+        self.convt3 = nn.ConvTranspose2d(512, 128, 4, 2, 1)
+        self.convt4 = nn.ConvTranspose2d(256, 128, 4, 2, 1)
+        self.convt5 = nn.ConvTranspose2d(256, 3, 4, 2, 1)
         self.bnorm1 = nn.BatchNorm2d(256)
         self.bnorm2 = nn.BatchNorm2d(512)
         self.dropout = nn.Dropout(0.2)
         self.lrelu = nn.LeakyReLU()
-        self.final = nn.Conv2d(6, 3, 2, 1)
+        self.final = nn.Conv2d(6, 3, 1, 1)
 
-    def forward(self, x): # x: (B, 3, H, W) input image
-        d1 = self.lrelu(self.conv1(x))  # (B, 128, H-2, W-2) downsample 1
-        d2 = self.lrelu(self.conv2(d1))  # (B, 128, H-4, W-4) downsample 2
-        d3 = self.lrelu(self.bnorm1(self.conv3(d2)))  # (B, 256, H-6, W-6) downsample 3 with batch norm
-        d4 = self.lrelu(self.bnorm2(self.conv4(d3)))  # (B, 512, H-8, W-8) downsample 4 with batch norm
-        d5 = self.lrelu(self.bnorm2(self.conv5(d4)))  # (B, 512, H-10, W-10) downsample 5 with batch norm
-        u1 = self.lrelu(self.convt1(d5))  # (B, 512, H-12, W-12) upsample 1
-        u1 = torch.cat([u1, d4], dim=1) # (B, 1024, H-8, W-8) concatenate with d4
-        u2 = self.lrelu(self.convt2(u1)) # (B, 256, H-6, W-6) upsample 2
-        u2 = torch.cat([u2, d3], dim=1) # (B, 512, H-6, W-6) concatenate with d3
-        u3 = self.lrelu(self.convt3(u2)) # (B, 128, H-4, W-4) upsample 3
-        u3 = torch.cat([u3, d2], dim=1) # (B, 256, H-4, W-4) concatenate with d2
-        u4 = self.lrelu(self.convt4(u3)) # (B, 128, H-2, W-2) upsample 4
-        u4 = torch.cat([u4, d1], dim=1) # (B, 256, H-2, W-2) concatenate with d1
-        u5 = self.lrelu(self.convt5(u4)) # (B, 3, H, W) upsample 5
-        u5 = torch.cat([u5, x], dim=1) # (B, 6, H, W) concatenate with input x
-        x = self.final(u5) # (B, 3, H, W) final convolution to reduce channels
+    def forward(self, x):
+        d1 = self.lrelu(self.conv1(x)) # (B, 128, 80, 80)
+        d2 = self.lrelu(self.conv2(d1)) # (B, 128, 40, 40)
+        d3 = self.lrelu(self.bnorm1(self.conv3(d2))) # (B, 256, 20, 20)
+        d4 = self.lrelu(self.bnorm2(self.conv4(d3))) # (B, 512, 10, 10)
+        d5 = self.lrelu(self.bnorm2(self.conv5(d4))) # (B, 512, 5, 5)
+        u1 = self.lrelu(self.convt1(d5)) # (B, 512, 10, 10)
+        u1 = torch.cat([u1, d4], dim=1) # (B, 1024, 10, 10)
+        u2 = self.lrelu(self.convt2(u1)) # (B, 256, 20, 20)
+        u2 = torch.cat([u2, d3], dim=1) # (B, 512, 20, 20)
+        u3 = self.lrelu(self.convt3(u2)) # (B, 128, 40, 40)
+        u3 = torch.cat([u3, d2], dim=1) # (B, 256, 40, 40)
+        u4 = self.lrelu(self.convt4(u3)) # (B, 128, 80, 80)
+        u4 = torch.cat([u4, d1], dim=1) # (B, 256, 80, 80)
+        u5 = self.lrelu(self.convt5(u4)) # (B, 3, 160, 160)
+        u5 = torch.cat([u5, x], dim=1) # (B, 6, 160, 160)
+        x = self.final(u5) # (B, 3, 160, 160)
         return x
 #%%
 writer = SummaryWriter('../runs')
@@ -253,4 +255,45 @@ net = Net().to(device)
 writer.add_graph(net, torch.zeros(1, 3, SIZE, SIZE).to(device))
 writer.flush()
 summary(net, input_size=(1, 3, SIZE, SIZE), device=device)
+#%% TODO: Optina portion (hyperparameter tuning)
 
+#%%
+trainloader = DataLoader(trainset, batch_size=256, shuffle=True)
+testloader = DataLoader(testset, batch_size=256, shuffle=False)
+optimizer = optim.Adam(net.parameters(), lr=1e-3)
+sheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.1, patience=5)
+early_stopping = EarlyStopping()
+train_accs, train_losses, test_accs, test_losses = [], [], [], []
+prog_bar = tqdm(range(100), total=100)
+for epoch in prog_bar:
+    train_loss, train_acc = fit(net, trainloader, optimizer)
+    train_losses.append(train_loss)
+    train_accs.append(train_acc)
+    test_loss, test_acc = predict(net, testloader)
+    test_losses.append(test_loss)
+    test_accs.append(test_acc)
+    sheduler.step(test_acc)
+    #early_stopping(test_loss, net)
+    prog_bar.set_description(f"Epoch {epoch + 1}, Train acc={train_acc:.3f}, Train loss={train_loss:.3f}, "
+                             f"Test acc={test_acc:.3f}, Test loss={test_loss:.3f}")
+    # if early_stopping.early_stop:
+    #     print("Early stopping")
+    #     break
+#%%
+plt.figure()
+plt.plot(train_accs, label='Train acc')
+plt.plot(test_accs, label='Test acc')
+plt.xlabel('Epoch')
+plt.ylabel('Accuracy')
+plt.ylim(0, 1)
+plt.legend()
+plt.show()
+
+plt.figure()
+plt.plot(train_losses, label='Train loss')
+plt.plot(test_losses, label='Test loss')
+plt.xlabel('Epoch')
+plt.ylabel('Loss')
+plt.ylim(bottom=0)
+plt.legend()
+plt.show()
