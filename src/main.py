@@ -10,7 +10,8 @@ from torch import nn, optim
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, random_split, SubsetRandomSampler
 from torch.utils.tensorboard import SummaryWriter
-from torchmetrics.functional import image_gradients, peak_signal_noise_ratio, structural_similarity_index_measure, pearson_corrcoef
+from torchmetrics.functional.image import image_gradients, peak_signal_noise_ratio, structural_similarity_index_measure
+from torchmetrics.regression import PearsonCorrCoef
 import torchvision
 from torchvision import transforms
 from torchinfo import summary
@@ -146,7 +147,6 @@ class ImageGradientLoss(nn.Module):
         dv_comp = (dv_in - dv_tar) ** 2
         return (dh_comp + dv_comp).sum()
 
-#TODO: change accuracy with correct metrics for regression
 def fit(net, trainloader, optimizer, loss_fn1=nn.MSELoss(reduction='sum'), loss_fn2=ImageGradientLoss(), coeff=0.5):
     net.train()
     total_loss, rmse, psnr, ssim, pcc, count = 0, 0, 0, 0, 0, 0
@@ -161,7 +161,7 @@ def fit(net, trainloader, optimizer, loss_fn1=nn.MSELoss(reduction='sum'), loss_
             rmse += torch.sqrt(loss1 / numel).item()
             psnr += peak_signal_noise_ratio(out, colors).item()
             ssim += structural_similarity_index_measure(out, colors).item()
-            pcc += pearson_corrcoef(out.reshape(out.size(0), -1), colors.reshape(colors.size(0), -1)).item()
+            pcc += PearsonCorrCoef()(out.reshape(out.size(0), -1), colors.reshape(colors.size(0), -1)).item()
         loss.backward()
         optimizer.step()
         total_loss += loss.item()
@@ -181,7 +181,7 @@ def predict(net, testloader, loss_fn1=nn.MSELoss(reduction='sum'), loss_fn2=Imag
             rmse += torch.sqrt(loss1 / numel).item()
             psnr += peak_signal_noise_ratio(out, colors).item()
             ssim += structural_similarity_index_measure(out, colors).item()
-            pcc += pearson_corrcoef(out.reshape(out.size(0), -1), colors.reshape(colors.size(0), -1)).item()
+            pcc += PearsonCorrCoef()(out.reshape(out.size(0), -1), colors.reshape(colors.size(0), -1)).item()
             total_loss += loss.item()
             count += len(colors)
     return total_loss / count, rmse / count, psnr / count, ssim / count, pcc / count
