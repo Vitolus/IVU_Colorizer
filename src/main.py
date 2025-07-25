@@ -10,6 +10,7 @@ from torch import nn, optim
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, random_split, SubsetRandomSampler
 from torch.utils.tensorboard import SummaryWriter
+from torchmetrics.functional import image_gradients, peak_signal_noise_ratio, structural_similarity_index_measure, pearson_corrcoef
 import torchvision
 from torchvision import transforms
 from torchinfo import summary
@@ -139,44 +140,51 @@ class ImageGradientLoss(nn.Module):
         super(ImageGradientLoss, self).__init__()
 
     def forward(self, inputs, targets):
-        dh_comp = inputs.diff(dim=3) - targets.diff(dim=3) # (B, C, H, W-1)
-        dv_comp = inputs.diff(dim=2) - targets.diff(dim=2) # (B, C, H-1, W)
-        dh_comp = dh_comp.pow(2).sum(dim=1)
-        dv_comp = dv_comp.pow(2).sum(dim=1)
-        return dh_comp.sum() + dv_comp.sum()
+        dh_in, dv_in = image_gradients(inputs) # (B, C, H, W-1), (B, C, H-1, W)
+        dh_tar, dv_tar = image_gradients(targets)
+        dh_comp = (dh_in - dh_tar) ** 2
+        dv_comp = (dv_in - dv_tar) ** 2
+        return (dh_comp + dv_comp).sum()
 
 #TODO: change accuracy with correct metrics for regression
-def fit(net, trainloader, optimizer, loss_fn1=nn.MSELoss(reduction='sum'), loss_fn2=ImageGradientLoss(), lamda1=0.5, lamda2=0.5):
+def fit(net, trainloader, optimizer, loss_fn1=nn.MSELoss(reduction='sum'), loss_fn2=ImageGradientLoss(), coeff=0.5):
     net.train()
-    total_loss, acc, count = 0, 0, 0
+    total_loss, rmse, psnr, ssim, pcc, count = 0, 0, 0, 0, 0, 0
     for grays, colors in tqdm(trainloader):
         grays, colors = grays.to(device), colors.to(device)
         optimizer.zero_grad()
         out = net(grays)
+        numel = out.numel()
         loss1, loss2 = loss_fn1(out, colors), loss_fn2(out, colors)
-        loss = (lamda1 * loss1 + lamda2 * loss2) / out.numel()
+        loss = (coeff * loss1 + (1-coeff) * loss2) / numel
+        with torch.no_grad():
+            rmse += torch.sqrt(loss1 / numel).item()
+            psnr += peak_signal_noise_ratio(out, colors).item()
+            ssim += structural_similarity_index_measure(out, colors).item()
+            pcc += pearson_corrcoef(out.reshape(out.size(0), -1), colors.reshape(colors.size(0), -1)).item()
         loss.backward()
         optimizer.step()
         total_loss += loss.item()
-        predicted = torch.max(out, 1)[1]
-        acc += (predicted == colors).sum().item()
         count += len(colors)
-    return total_loss / count, acc / count
+    return total_loss / count, rmse / count, psnr / count, ssim / count, pcc / count
 
-def predict(net, testloader, loss_fn1=nn.MSELoss(reduction='sum'), loss_fn2=ImageGradientLoss(), lamda1=0.5, lamda2=0.5):
+def predict(net, testloader, loss_fn1=nn.MSELoss(reduction='sum'), loss_fn2=ImageGradientLoss(), coeff=0.5):
     net.eval()
-    total_loss, acc, count = 0, 0, 0
+    total_loss, rmse, psnr, ssim, pcc, count = 0, 0, 0, 0, 0, 0
     with torch.no_grad():
         for grays, colors in tqdm(testloader):
             grays, colors = grays.to(device), colors.to(device)
             out = net(grays)
+            numel = out.numel()
             loss1, loss2 = loss_fn1(out, colors), loss_fn2(out, colors)
-            loss = (lamda1 * loss1 + lamda2 * loss2) / out.numel()
+            loss = (coeff * loss1 + (1 - coeff) * loss2) / numel
+            rmse += torch.sqrt(loss1 / numel).item()
+            psnr += peak_signal_noise_ratio(out, colors).item()
+            ssim += structural_similarity_index_measure(out, colors).item()
+            pcc += pearson_corrcoef(out.reshape(out.size(0), -1), colors.reshape(colors.size(0), -1)).item()
             total_loss += loss.item()
-            predicted = torch.max(out, 1)[1]
-            acc += (predicted == colors).sum().item()
             count += len(colors)
-    return total_loss / count, acc / count
+    return total_loss / count, rmse / count, psnr / count, ssim / count, pcc / count
 
 def objective(trial, trainset, X, y):
     lr = trial.suggest_float('lr', 1e-5, 1e-2, log=True)
@@ -262,28 +270,63 @@ testloader = DataLoader(testset, batch_size=256, shuffle=False)
 optimizer = optim.Adam(net.parameters(), lr=1e-3)
 sheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.1, patience=5)
 early_stopping = EarlyStopping()
-train_accs, train_losses, test_accs, test_losses = [], [], [], []
+train_RMSEs, train_PSNRs, train_SSIMs, train_PCCs, train_losses = [], [], [], [], []
+test_RMSEs, test_PSNRs, test_SSIMs, test_PCCs, test_losses = [], [], [], [], []
 prog_bar = tqdm(range(100), total=100)
 for epoch in prog_bar:
-    train_loss, train_acc = fit(net, trainloader, optimizer)
+    train_loss, train_RMSE, train_PSNR, train_SSIM, train_PCC = fit(net, trainloader, optimizer)
     train_losses.append(train_loss)
-    train_accs.append(train_acc)
-    test_loss, test_acc = predict(net, testloader)
+    train_RMSEs.append(train_RMSE)
+    train_PSNRs.append(train_PSNR)
+    train_SSIMs.append(train_SSIM)
+    train_PCCs.append(train_PCC)
+    test_loss, test_RMSE, test_PSNR, test_SSIM, test_PCC = predict(net, testloader)
     test_losses.append(test_loss)
-    test_accs.append(test_acc)
-    sheduler.step(test_acc)
+    test_RMSEs.append(test_RMSE)
+    test_PSNRs.append(test_PSNR)
+    test_SSIMs.append(test_SSIM)
+    test_PCCs.append(test_PCC)
+    #sheduler.step(test_loss)
     #early_stopping(test_loss, net)
-    prog_bar.set_description(f"Epoch {epoch + 1}, Train acc={train_acc:.3f}, Train loss={train_loss:.3f}, "
-                             f"Test acc={test_acc:.3f}, Test loss={test_loss:.3f}")
+    current_lr = optimizer.param_groups[0]['lr']
+    prog_bar.set_description(f"Epoch {epoch + 1} | lr={current_lr:.2f} | "
+                             f"Metrics train/test: RMSE={train_RMSE:.3f}/{test_RMSE:.3f}, "
+                             f"PSNR={train_PSNR:.3f}/{test_PSNR:.3f}, SSIM={train_SSIM:.3f}/{test_SSIM:.3f}, "
+                             f"PCC={train_PCC:.3f}/{test_PCC:.3f} | Loss: {train_loss:.3f}/{test_loss:.3f}")
     # if early_stopping.early_stop:
     #     print("Early stopping")
     #     break
 #%%
 plt.figure()
-plt.plot(train_accs, label='Train acc')
-plt.plot(test_accs, label='Test acc')
+plt.plot(train_RMSEs, label='Train RMSE')
+plt.plot(test_RMSEs, label='Test RMSE')
 plt.xlabel('Epoch')
-plt.ylabel('Accuracy')
+plt.ylabel('RMSE')
+plt.legend()
+plt.show()
+
+plt.figure()
+plt.plot(train_PSNRs, label='Train PSNR')
+plt.plot(test_PSNRs, label='Test PSNR')
+plt.xlabel('Epoch')
+plt.ylabel('PSNR')
+plt.legend()
+plt.show()
+
+plt.figure()
+plt.plot(train_SSIMs, label='Train SSIM')
+plt.plot(test_SSIMs, label='Test SSIM')
+plt.xlabel('Epoch')
+plt.ylabel('SSIM')
+plt.ylim(0, 1)
+plt.legend()
+plt.show()
+
+plt.figure()
+plt.plot(train_PCCs, label='Train PCC')
+plt.plot(test_PCCs, label='Test PCC')
+plt.xlabel('Epoch')
+plt.ylabel('PCC')
 plt.ylim(0, 1)
 plt.legend()
 plt.show()
