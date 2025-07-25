@@ -268,7 +268,7 @@ summary(net, input_size=(1, 3, SIZE, SIZE), device=device)
 trainloader = DataLoader(trainset, batch_size=256, shuffle=True)
 testloader = DataLoader(testset, batch_size=256, shuffle=False)
 optimizer = optim.Adam(net.parameters(), lr=1e-3)
-sheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.1, patience=5)
+sheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=5)
 early_stopping = EarlyStopping()
 train_RMSEs, train_PSNRs, train_SSIMs, train_PCCs, train_losses = [], [], [], [], []
 test_RMSEs, test_PSNRs, test_SSIMs, test_PCCs, test_losses = [], [], [], [], []
