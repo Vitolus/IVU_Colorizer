@@ -190,8 +190,9 @@ def objective(trial, trainset, X, y):
     lr = trial.suggest_float('lr', 1e-5, 1e-2, log=True)
     batch_size = trial.suggest_categorical('batch_size', [64,256, 512, 1024])
     kf = KFold(n_splits=5, shuffle=True, random_state=42)
-    val_accs = []
-    train_acc, train_loss, val_acc, val_loss, mean_acc = 0, 0, 0, 0, 0
+    val_losses, mean_loss = [], 0
+    train_loss, train_rmse, train_psnr, train_ssim, train_pcc = 0, 0, 0, 0, 0
+    val_loss, val_rmse, val_psnr, val_ssim, val_pcc = 0, 0, 0, 0, 0
     split_n = 0
     prog_bar = tqdm(kf.split(X, y), desc="Splits")
     for train_idx, val_idx in prog_bar:
@@ -203,21 +204,23 @@ def objective(trial, trainset, X, y):
         scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.1, patience=5)
         early_stopping = EarlyStopping()
         for epoch in range(100):
-            train_loss, train_acc = fit(net, trainloader, optimizer)
-            val_loss, val_acc = predict(net, valloader)
-            scheduler.step(val_acc)
+            train_loss, train_rmse, train_psnr, train_ssim, train_pcc = fit(net, trainloader, optimizer)
+            val_loss, val_rmse, val_psnr, val_ssim, val_pcc = predict(net, valloader)
+            scheduler.step(val_loss)
             early_stopping(val_loss, net)
             prog_bar.set_description(
-                f"Split {split_n} - Epoch {epoch + 1}, Train acc={train_acc:.3f}, Train loss={train_loss:.3f}, "
-                f"Validation acc={val_acc:.3f}, Validation loss={val_loss:.3f}")
+                f"Split {split_n} - Epoch {epoch + 1} | lr={current_lr:.2f} | "
+                f"Metrics train/val: RMSE={train_rmse:.3f}/{val_rmse:.3f}, "
+                f"PSNR={train_psnr:.3f}/{val_psnr:.3f}, SSIM={train_ssim:.3f}/{val_ssim:.3f}, "
+                f"PCC={train_pcc:.3f}/{val_pcc:.3f} | Loss: {train_loss:.3f}/{val_loss:.3f}")
             if early_stopping.early_stop:
                 break
-        val_accs.append(val_acc)
-        meanacc = np.mean(val_accs)
-        trial.report(meanacc, split_n)
+        val_losses.append(val_loss)
+        mean_loss = np.mean(val_losses)
+        trial.report(mean_loss, split_n)
         if trial.should_prune():
             raise optuna.exceptions.TrialPruned()
-    return mean_acc
+    return mean_loss
 #%%
 class Net(nn.Module):
     def __init__(self):
