@@ -2,7 +2,7 @@
 import os
 import re
 import cv2
-from tqdm import tqdm
+from tqdm.notebook import tqdm
 import optuna
 from optuna.trial import TrialState
 import torch
@@ -147,44 +147,60 @@ class ImageGradientLoss(nn.Module):
         dv_comp = (dv_in - dv_tar) ** 2
         return (dh_comp + dv_comp).sum()
 
+def compute_pcc(pred, targets):
+    pred_flat = pred.reshape(pred.size(0), -1)
+    target_flat = targets.reshape(targets.size(0), -1)
+    vx = pred_flat - pred_flat.mean(dim=1, keepdim=True)
+    vy = target_flat - target_flat.mean(dim=1, keepdim=True)
+    numerator = (vx * vy).sum(dim=1) # covariance
+    denominator = torch.sqrt((vx**2).sum(dim=1) * (vy**2).sum(dim=1)) # standard deviation
+    return (numerator / denominator).mean()
+
 def fit(net, trainloader, optimizer, loss_fn1=nn.MSELoss(reduction='sum'), loss_fn2=ImageGradientLoss(), coeff=0.5):
     net.train()
-    total_loss, rmse, psnr, ssim, pcc, count = 0, 0, 0, 0, 0, 0
-    for grays, colors in tqdm(trainloader):
+    total_loss, total_rmse, total_psnr, total_ssim, total_pcc, count = 0, 0, 0, 0, 0, 0
+    ssim_accum = 0.0
+    for grays, colors in tqdm(trainloader, desc='trainloader'):
         grays, colors = grays.to(device), colors.to(device)
         optimizer.zero_grad()
         out = net(grays)
         numel = out.numel()
         loss1, loss2 = loss_fn1(out, colors), loss_fn2(out, colors)
         loss = (coeff * loss1 + (1-coeff) * loss2) / numel
-        with torch.no_grad():
-            rmse += torch.sqrt(loss1 / numel).item()
-            psnr += peak_signal_noise_ratio(out, colors).item()
-            ssim += structural_similarity_index_measure(out, colors).item()
-            pcc += PearsonCorrCoef()(out.reshape(out.size(0), -1), colors.reshape(colors.size(0), -1)).item()
         loss.backward()
         optimizer.step()
+        torch.cuda.empty_cache()
         total_loss += loss.item()
         count += len(colors)
-    return total_loss / count, rmse / count, psnr / count, ssim / count, pcc / count
+        with torch.no_grad():
+            batch_rmse = torch.sqrt(loss1 / numel)
+            batch_psnr = (20 * torch.log10(1.0 / batch_rmse))
+            total_rmse += batch_rmse.item() * len(colors)
+            total_psnr += batch_psnr.item() * len(colors)
+            ssim_accum += structural_similarity_index_measure(out, colors).item() * len(colors)
+            total_pcc += compute_pcc(out, colors).item() * len(colors)
+    return total_loss / count, total_rmse / count, total_psnr / count, total_ssim / count, total_pcc / count
 
 def predict(net, testloader, loss_fn1=nn.MSELoss(reduction='sum'), loss_fn2=ImageGradientLoss(), coeff=0.5):
     net.eval()
-    total_loss, rmse, psnr, ssim, pcc, count = 0, 0, 0, 0, 0, 0
+    total_loss, total_rmse, total_psnr, total_ssim, total_pcc, count = 0, 0, 0, 0, 0, 0
+    ssim_accum = 0.0
     with torch.no_grad():
-        for grays, colors in tqdm(testloader):
+        for grays, colors in tqdm(testloader, desc='testloader'):
             grays, colors = grays.to(device), colors.to(device)
             out = net(grays)
             numel = out.numel()
             loss1, loss2 = loss_fn1(out, colors), loss_fn2(out, colors)
             loss = (coeff * loss1 + (1 - coeff) * loss2) / numel
-            rmse += torch.sqrt(loss1 / numel).item()
-            psnr += peak_signal_noise_ratio(out, colors).item()
-            ssim += structural_similarity_index_measure(out, colors).item()
-            pcc += PearsonCorrCoef()(out.reshape(out.size(0), -1), colors.reshape(colors.size(0), -1)).item()
             total_loss += loss.item()
             count += len(colors)
-    return total_loss / count, rmse / count, psnr / count, ssim / count, pcc / count
+            batch_rmse = torch.sqrt(loss1 / numel)
+            batch_psnr = (20 * torch.log10(1.0 / batch_rmse))
+            total_rmse += batch_rmse.item() * len(colors)
+            total_psnr += batch_psnr.item() * len(colors)
+            ssim_accum += structural_similarity_index_measure(out, colors).item() * len(colors)
+            total_pcc += compute_pcc(out, colors).item() * len(colors)
+    return total_loss / count, total_rmse / count, total_psnr / count, total_ssim / count, total_pcc / count
 
 def objective(trial, trainset, X, y):
     lr = trial.suggest_float('lr', 1e-5, 1e-2, log=True)
@@ -276,6 +292,7 @@ early_stopping = EarlyStopping()
 train_RMSEs, train_PSNRs, train_SSIMs, train_PCCs, train_losses = [], [], [], [], []
 test_RMSEs, test_PSNRs, test_SSIMs, test_PCCs, test_losses = [], [], [], [], []
 prog_bar = tqdm(range(100), total=100)
+torch.cuda.empty_cache()
 for epoch in prog_bar:
     train_loss, train_RMSE, train_PSNR, train_SSIM, train_PCC = fit(net, trainloader, optimizer)
     train_losses.append(train_loss)
