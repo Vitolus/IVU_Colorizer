@@ -3,6 +3,7 @@ import os
 import re
 import cv2
 from tqdm.notebook import tqdm
+from IPython.display import clear_output
 import optuna
 from optuna.trial import TrialState
 import torch
@@ -160,7 +161,7 @@ def compute_pcc(pred, targets):
 def fit(net, trainloader, optimizer, loss_fn1=nn.MSELoss(reduction='sum'), loss_fn2=ImageGradientLoss(), coeff=0.5):
     net.train()
     total_loss, total_rmse, total_psnr, total_ssim, total_pcc, count = 0, 0, 0, 0, 0, 0
-    for grays, colors in tqdm(trainloader, desc='trainloader'):
+    for grays, colors in tqdm(trainloader, desc='trainloader', position=1):
         grays, colors = grays.to(device), colors.to(device)
         optimizer.zero_grad()
         out = net(grays)
@@ -184,10 +185,14 @@ def fit(net, trainloader, optimizer, loss_fn1=nn.MSELoss(reduction='sum'), loss_
 def predict(net, testloader, loss_fn1=nn.MSELoss(reduction='sum'), loss_fn2=ImageGradientLoss(), coeff=0.5):
     net.eval()
     total_loss, total_rmse, total_psnr, total_ssim, total_pcc, count = 0, 0, 0, 0, 0, 0
+    ins, preds, truths = [], [], []
     with torch.no_grad():
-        for grays, colors in tqdm(testloader, desc='testloader'):
+        for grays, colors in tqdm(testloader, desc='testloader', position=1):
             grays, colors = grays.to(device), colors.to(device)
             out = net(grays)
+            ins.append(grays.cpu())
+            preds.append(out.cpu())
+            truths.append(colors.cpu())
             numel = out.numel()
             loss1, loss2 = loss_fn1(out, colors), loss_fn2(out, colors)
             loss = (coeff * loss1 + (1 - coeff) * loss2) / numel
@@ -199,7 +204,7 @@ def predict(net, testloader, loss_fn1=nn.MSELoss(reduction='sum'), loss_fn2=Imag
             total_psnr += batch_psnr.item() * len(colors)
             total_ssim += structural_similarity_index_measure(out, colors).item() * len(colors)
             total_pcc += compute_pcc(out, colors).item() * len(colors)
-    return total_loss / count, total_rmse / count, total_psnr / count, total_ssim / count, total_pcc / count
+    return ins, preds, truths, total_loss / count, total_rmse / count, total_psnr / count, total_ssim / count, total_pcc / count
 
 def objective(trial, trainset, X, y):
     lr = trial.suggest_float('lr', 1e-5, 1e-2, log=True)
@@ -209,7 +214,7 @@ def objective(trial, trainset, X, y):
     train_loss, train_rmse, train_psnr, train_ssim, train_pcc = 0, 0, 0, 0, 0
     val_loss, val_rmse, val_psnr, val_ssim, val_pcc = 0, 0, 0, 0, 0
     split_n = 0
-    prog_bar = tqdm(kf.split(X, y), desc="Splits")
+    prog_bar = tqdm(kf.split(X, y), desc="Splits", position=0)
     for train_idx, val_idx in prog_bar:
         split_n += 1
         trainloader = DataLoader(trainset, batch_size=batch_size, sampler=SubsetRandomSampler(train_idx))
@@ -220,7 +225,7 @@ def objective(trial, trainset, X, y):
         early_stopping = EarlyStopping()
         for epoch in range(100):
             train_loss, train_rmse, train_psnr, train_ssim, train_pcc = fit(net, trainloader, optimizer)
-            val_loss, val_rmse, val_psnr, val_ssim, val_pcc = predict(net, valloader)
+            _, _, _, val_loss, val_rmse, val_psnr, val_ssim, val_pcc = predict(net, valloader)
             scheduler.step(val_loss)
             early_stopping(val_loss, net)
             prog_bar.set_description(
@@ -290,7 +295,7 @@ sheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.
 early_stopping = EarlyStopping()
 train_RMSEs, train_PSNRs, train_SSIMs, train_PCCs, train_losses = [], [], [], [], []
 test_RMSEs, test_PSNRs, test_SSIMs, test_PCCs, test_losses = [], [], [], [], []
-prog_bar = tqdm(range(100), total=100)
+prog_bar = tqdm(range(20), total=100, desc='Training', position=0)
 torch.cuda.empty_cache()
 for epoch in prog_bar:
     train_loss, train_RMSE, train_PSNR, train_SSIM, train_PCC = fit(net, trainloader, optimizer)
@@ -299,22 +304,39 @@ for epoch in prog_bar:
     train_PSNRs.append(train_PSNR)
     train_SSIMs.append(train_SSIM)
     train_PCCs.append(train_PCC)
-    test_loss, test_RMSE, test_PSNR, test_SSIM, test_PCC = predict(net, testloader)
+    _, _, _, test_loss, test_RMSE, test_PSNR, test_SSIM, test_PCC = predict(net, testloader)
     test_losses.append(test_loss)
     test_RMSEs.append(test_RMSE)
     test_PSNRs.append(test_PSNR)
     test_SSIMs.append(test_SSIM)
     test_PCCs.append(test_PCC)
     #sheduler.step(test_loss)
-    #early_stopping(test_loss, net)
+    early_stopping(test_loss, net)
     current_lr = optimizer.param_groups[0]['lr']
     prog_bar.set_description(f"Epoch {epoch + 1} | lr={current_lr:.3e} | "
                              f"Metrics train/test: RMSE={train_RMSE:.3e}/{test_RMSE:.3e}, "
                              f"PSNR={train_PSNR:.3e}/{test_PSNR:.3e}, SSIM={train_SSIM:.3e}/{test_SSIM:.3e}, "
                              f"PCC={train_PCC:.3e}/{test_PCC:.3e} | Loss: {train_loss:.3e}/{test_loss:.3e}")
-    # if early_stopping.early_stop:
-    #     print("Early stopping")
-    #     break
+    if early_stopping.early_stop:
+        print("Early stopping")
+        break
+#%% final evaluation
+ins, preds, truths, test_loss, test_RMSE, test_PSNR, test_SSIM, test_PCC = predict(net, testloader)
+ins = torch.cat(ins, dim=0)
+preds = torch.cat(preds, dim=0)
+truths = torch.cat(truths, dim=0)
+reverse_trans_gray = transforms.Compose([
+    transforms.Normalize(mean=[0., 0., 0.], std=[1/s for s in gray_std]),
+    transforms.Normalize(mean=[-m for m in gray_mean], std=[1., 1., 1.])
+])
+reverse_trans_color = transforms.Compose([
+    transforms.Normalize(mean=[0., 0., 0.], std=[1/s for s in color_std]),
+    transforms.Normalize(mean=[-m for m in color_mean], std=[1., 1., 1.])
+])
+ins = reverse_trans_gray(ins).permute(0, 2, 3, 1).numpy()
+preds = reverse_trans_color(preds).permute(0, 2, 3, 1).numpy()
+truths = reverse_trans_color(truths).permute(0, 2, 3, 1).numpy()
+print(test_loss, test_RMSE, test_PSNR, test_SSIM, test_PCC)
 #%%
 plt.figure()
 plt.plot(train_RMSEs, label='Train RMSE')
@@ -358,3 +380,17 @@ plt.ylabel('Loss')
 plt.ylim(bottom=0)
 plt.legend()
 plt.show()
+
+for _ in range(5):
+    idx = np.random.randint(0, len(ins) - 1)
+    plt.figure(figsize=(15, 15))
+    plt.subplot(1, 3, 1)
+    plt.title('Gray Image', fontsize=20)
+    plt.imshow(ins[idx])
+    plt.subplot(1, 3, 2)
+    plt.title('Predicted Image', fontsize=20)
+    plt.imshow(preds[idx])
+    plt.subplot(1, 3, 3)
+    plt.title('Groundtruth Image ', fontsize=20)
+    plt.imshow(truths[idx])
+    plt.show()
