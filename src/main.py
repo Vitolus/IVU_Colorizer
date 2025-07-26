@@ -107,6 +107,7 @@ color_transform = transforms.Compose([
 ])
 trainset = MyDataset(gray_train, color_train, gray_transform=gray_transform, color_transform=color_transform)
 testset = MyDataset(gray_test, color_test, gray_transform=gray_transform, color_transform=color_transform)
+del gray_train, gray_test, color_train, color_test # release memory
 #%%
 class EarlyStopping:
     def __init__(self, patience=15, delta=0.5, window_size=10):
@@ -159,7 +160,6 @@ def compute_pcc(pred, targets):
 def fit(net, trainloader, optimizer, loss_fn1=nn.MSELoss(reduction='sum'), loss_fn2=ImageGradientLoss(), coeff=0.5):
     net.train()
     total_loss, total_rmse, total_psnr, total_ssim, total_pcc, count = 0, 0, 0, 0, 0, 0
-    ssim_accum = 0.0
     for grays, colors in tqdm(trainloader, desc='trainloader'):
         grays, colors = grays.to(device), colors.to(device)
         optimizer.zero_grad()
@@ -177,14 +177,13 @@ def fit(net, trainloader, optimizer, loss_fn1=nn.MSELoss(reduction='sum'), loss_
             batch_psnr = (20 * torch.log10(1.0 / batch_rmse))
             total_rmse += batch_rmse.item() * len(colors)
             total_psnr += batch_psnr.item() * len(colors)
-            ssim_accum += structural_similarity_index_measure(out, colors).item() * len(colors)
+            total_ssim += structural_similarity_index_measure(out, colors).item() * len(colors)
             total_pcc += compute_pcc(out, colors).item() * len(colors)
     return total_loss / count, total_rmse / count, total_psnr / count, total_ssim / count, total_pcc / count
 
 def predict(net, testloader, loss_fn1=nn.MSELoss(reduction='sum'), loss_fn2=ImageGradientLoss(), coeff=0.5):
     net.eval()
     total_loss, total_rmse, total_psnr, total_ssim, total_pcc, count = 0, 0, 0, 0, 0, 0
-    ssim_accum = 0.0
     with torch.no_grad():
         for grays, colors in tqdm(testloader, desc='testloader'):
             grays, colors = grays.to(device), colors.to(device)
@@ -198,7 +197,7 @@ def predict(net, testloader, loss_fn1=nn.MSELoss(reduction='sum'), loss_fn2=Imag
             batch_psnr = (20 * torch.log10(1.0 / batch_rmse))
             total_rmse += batch_rmse.item() * len(colors)
             total_psnr += batch_psnr.item() * len(colors)
-            ssim_accum += structural_similarity_index_measure(out, colors).item() * len(colors)
+            total_ssim += structural_similarity_index_measure(out, colors).item() * len(colors)
             total_pcc += compute_pcc(out, colors).item() * len(colors)
     return total_loss / count, total_rmse / count, total_psnr / count, total_ssim / count, total_pcc / count
 
@@ -225,10 +224,10 @@ def objective(trial, trainset, X, y):
             scheduler.step(val_loss)
             early_stopping(val_loss, net)
             prog_bar.set_description(
-                f"Split {split_n} - Epoch {epoch + 1} | lr={current_lr:.2f} | "
-                f"Metrics train/val: RMSE={train_rmse:.3f}/{val_rmse:.3f}, "
-                f"PSNR={train_psnr:.3f}/{val_psnr:.3f}, SSIM={train_ssim:.3f}/{val_ssim:.3f}, "
-                f"PCC={train_pcc:.3f}/{val_pcc:.3f} | Loss: {train_loss:.3f}/{val_loss:.3f}")
+                f"Split {split_n} - Epoch {epoch + 1} | lr={current_lr:.3e} | "
+                f"Metrics train/val: RMSE={train_rmse:.3e}/{val_rmse:.3e}, "
+                f"PSNR={train_psnr:.3e}/{val_psnr:.3e}, SSIM={train_ssim:.3e}/{val_ssim:.3e}, "
+                f"PCC={train_pcc:.3e}/{val_pcc:.3e} | Loss: {train_loss:.3e}/{val_loss:.3e}")
             if early_stopping.early_stop:
                 break
         val_losses.append(val_loss)
@@ -309,10 +308,10 @@ for epoch in prog_bar:
     #sheduler.step(test_loss)
     #early_stopping(test_loss, net)
     current_lr = optimizer.param_groups[0]['lr']
-    prog_bar.set_description(f"Epoch {epoch + 1} | lr={current_lr:.2f} | "
-                             f"Metrics train/test: RMSE={train_RMSE:.3f}/{test_RMSE:.3f}, "
-                             f"PSNR={train_PSNR:.3f}/{test_PSNR:.3f}, SSIM={train_SSIM:.3f}/{test_SSIM:.3f}, "
-                             f"PCC={train_PCC:.3f}/{test_PCC:.3f} | Loss: {train_loss:.3f}/{test_loss:.3f}")
+    prog_bar.set_description(f"Epoch {epoch + 1} | lr={current_lr:.3e} | "
+                             f"Metrics train/test: RMSE={train_RMSE:.3e}/{test_RMSE:.3e}, "
+                             f"PSNR={train_PSNR:.3e}/{test_PSNR:.3e}, SSIM={train_SSIM:.3e}/{test_SSIM:.3e}, "
+                             f"PCC={train_PCC:.3e}/{test_PCC:.3e} | Loss: {train_loss:.3e}/{test_loss:.3e}")
     # if early_stopping.early_stop:
     #     print("Early stopping")
     #     break
