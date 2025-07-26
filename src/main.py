@@ -329,12 +329,18 @@ reverse_trans_gray = transforms.Compose([
     transforms.Normalize(mean=[0., 0., 0.], std=[1/s for s in gray_std]),
     transforms.Normalize(mean=[-m for m in gray_mean], std=[1., 1., 1.])
 ])
+mean_pred = preds.mean(dim=(0, 2, 3))
+std_pred = preds.std(dim=(0, 2, 3))
+reverse_trans_predicted = transforms.Compose([
+    transforms.Normalize(mean=[0., 0., 0.], std=[1/s for s in std_pred]),
+    transforms.Normalize(mean=[-m for m in mean_pred], std=[1., 1., 1.])
+])
 reverse_trans_color = transforms.Compose([
     transforms.Normalize(mean=[0., 0., 0.], std=[1/s for s in color_std]),
     transforms.Normalize(mean=[-m for m in color_mean], std=[1., 1., 1.])
 ])
 ins = reverse_trans_gray(ins).permute(0, 2, 3, 1).numpy()
-preds = reverse_trans_color(preds).permute(0, 2, 3, 1).numpy()
+preds = reverse_trans_predicted(preds).permute(0, 2, 3, 1).numpy()
 truths = reverse_trans_color(truths).permute(0, 2, 3, 1).numpy()
 print(test_loss, test_RMSE, test_PSNR, test_SSIM, test_PCC)
 #%%
