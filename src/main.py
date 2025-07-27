@@ -206,22 +206,23 @@ def predict(net, testloader, loss_fn1=nn.MSELoss(reduction='sum'), loss_fn2=Imag
             total_pcc += compute_pcc(out, colors).item() * len(colors)
     return ins, preds, truths, total_loss / count, total_rmse / count, total_psnr / count, total_ssim / count, total_pcc / count
 
-def objective(trial, trainset, X, y):
-    lr = trial.suggest_float('lr', 1e-5, 1e-2, log=True)
+def objective(trial, trainset, X):
+    lr = trial.suggest_float('lr', 1e-5, 1e-1, log=True)
     batch_size = trial.suggest_categorical('batch_size', [64,256, 512, 1024])
+    coeff = trial.suggest_float('coeff', 0.0, 1.0, log=True)
     kf = KFold(n_splits=5, shuffle=True, random_state=42)
     val_losses, mean_loss = [], 0
     train_loss, train_rmse, train_psnr, train_ssim, train_pcc = 0, 0, 0, 0, 0
     val_loss, val_rmse, val_psnr, val_ssim, val_pcc = 0, 0, 0, 0, 0
     split_n = 0
-    prog_bar = tqdm(kf.split(X, y), desc="Splits", position=0)
+    prog_bar = tqdm(kf.split(X), desc="Splits", position=0)
     for train_idx, val_idx in prog_bar:
         split_n += 1
         trainloader = DataLoader(trainset, batch_size=batch_size, sampler=SubsetRandomSampler(train_idx))
         valloader = DataLoader(trainset, batch_size=batch_size, sampler=SubsetRandomSampler(val_idx))
         net = Net().to(device)
         optimizer = optim.Adam(net.parameters(), lr=lr)
-        scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.1, patience=5)
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=5, verbose=True)
         early_stopping = EarlyStopping()
         for epoch in range(100):
             train_loss, train_rmse, train_psnr, train_ssim, train_pcc = fit(net, trainloader, optimizer)
@@ -286,7 +287,24 @@ writer.add_graph(net, torch.zeros(1, 3, SIZE, SIZE).to(device))
 writer.flush()
 summary(net, input_size=(1, 3, SIZE, SIZE), device=device)
 #%% TODO: Optina portion (hyperparameter tuning)
+X = np.zeros(len(trainset))
+study = optuna.create_study(direction='minimize', pruner=optuna.pruners.MedianPruner())
+study.optimize(lambda trial: objective(trial, trainset, X), n_trials=5)
 
+pruned_trials = study.get_trials(deepcopy=False, states=[TrialState.PRUNED])
+complete_trials = study.get_trials(deepcopy=False, states=[TrialState.COMPLETE])
+
+print("Study statistics: ")
+print("  Number of finished trials: ", len(study.trials))
+print("  Number of pruned trials: ", len(pruned_trials))
+print("  Number of complete trials: ", len(complete_trials))
+
+print("Best trial:")
+trial = study.best_trial
+print("  Value: ", trial.value)
+print("  Params: ")
+for key, value in trial.params.items():
+    print("    {}: {}".format(key, value))
 #%%
 trainloader = DataLoader(trainset, batch_size=256, shuffle=True)
 testloader = DataLoader(testset, batch_size=256, shuffle=False)
@@ -329,8 +347,11 @@ reverse_trans_gray = transforms.Compose([
     transforms.Normalize(mean=[0., 0., 0.], std=[1/s for s in gray_std]),
     transforms.Normalize(mean=[-m for m in gray_mean], std=[1., 1., 1.])
 ])
-mean_pred = preds.mean(dim=(0, 2, 3))
-std_pred = preds.std(dim=(0, 2, 3))
+pred_min = preds.amin(dim=(0, 2, 3), keepdim=True)  # [C,1,1]
+pred_max = preds.amax(dim=(0, 2, 3), keepdim=True)
+preds_scaled = (preds - pred_min) / (pred_max - pred_min + 1e-8)
+mean_pred = preds_scaled.mean(dim=(0, 2, 3))
+std_pred = preds_scaled.std(dim=(0, 2, 3))
 reverse_trans_predicted = transforms.Compose([
     transforms.Normalize(mean=[0., 0., 0.], std=[1/s for s in std_pred]),
     transforms.Normalize(mean=[-m for m in mean_pred], std=[1., 1., 1.])
