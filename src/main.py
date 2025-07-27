@@ -62,16 +62,17 @@ for _ in range(5):
     plt.imshow(data_gray[idx])
     plt.show()
 #%%
-color_min = np.min(data_color, axis=(0, 1, 2), keepdims=True)
-color_max = np.max(data_color, axis=(0, 1, 2), keepdims=True)
-gray_min = np.min(data_gray, axis=(0, 1, 2), keepdims=True)
-gray_max = np.max(data_gray, axis=(0, 1, 2), keepdims=True)
-data_color_scaled = (data_color - color_min) / (color_max - color_min)
-data_gray_scaled = (data_gray - gray_min) / (gray_max - gray_min)
-color_mean = np.mean(data_color_scaled, axis=(0, 1, 2))
-color_std = np.std(data_color_scaled, axis=(0, 1, 2))
-gray_mean = np.mean(data_gray_scaled, axis=(0, 1, 2))
-gray_std = np.std(data_gray_scaled, axis=(0, 1, 2))
+gray_train, gray_test, color_train, color_test = (
+    train_test_split(data_gray, data_color, test_size=0.2, random_state=42))
+gray_train = torch.stack([transforms.ToTensor()(x) for x in gray_train], dim=0)
+color_train = torch.stack([transforms.ToTensor()(x) for x in color_train], dim=0)
+gray_test = torch.stack([transforms.ToTensor()(x) for x in gray_test], dim=0)
+color_test = torch.stack([transforms.ToTensor()(x) for x in color_test], dim=0)
+#%%
+gray_mean = gray_train.mean(dim=(0, 2, 3))
+gray_std = gray_train.std(dim=(0, 2, 3))
+color_mean = color_train.mean(dim=(0, 2, 3))
+color_std = color_train.std(dim=(0, 2, 3))
 print(color_mean, color_std)
 print(gray_mean, gray_std)
 #%%
@@ -94,20 +95,10 @@ class MyDataset(torch.utils.data.Dataset):
             color_img = self.color_transform(color_img)
         return gray_img, color_img
 #%%
-gray_train, gray_test, color_train, color_test = (
-    train_test_split(data_gray, data_color, test_size=0.2, random_state=42))
-print(len(gray_train), len(gray_test))
-#%%
-gray_transform = transforms.Compose([
-    transforms.ToTensor(),
-    transforms.Normalize(mean=gray_mean, std=gray_std)
-])
-color_transform = transforms.Compose([
-    transforms.ToTensor(),
-    transforms.Normalize(mean=color_mean, std=color_std)
-])
-trainset = MyDataset(gray_train, color_train, gray_transform=gray_transform, color_transform=color_transform)
-testset = MyDataset(gray_test, color_test, gray_transform=gray_transform, color_transform=color_transform)
+trainset = MyDataset(gray_train, color_train, gray_transform=transforms.Normalize(mean=gray_mean, std=gray_std),
+                     color_transform=transforms.Normalize(mean=color_mean, std=color_std))
+testset = MyDataset(gray_test, color_test, gray_transform=transforms.Normalize(mean=gray_mean, std=gray_std),
+                    color_transform=transforms.Normalize(mean=color_mean, std=color_std))
 del gray_train, gray_test, color_train, color_test # release memory
 #%%
 class EarlyStopping:
@@ -306,14 +297,27 @@ print("  Params: ")
 for key, value in trial.params.items():
     print("    {}: {}".format(key, value))
 #%%
+# %matplotlib notebook
+
+def update_plot():
+    line1.set_data(range(len(test_losses)), test_losses)
+    ax.relim()
+    ax.autoscale_view()
+    fig.canvas.draw()
+#%%
 trainloader = DataLoader(trainset, batch_size=256, shuffle=True)
 testloader = DataLoader(testset, batch_size=256, shuffle=False)
 optimizer = optim.Adam(net.parameters(), lr=1e-3)
-sheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=5)
+sheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=5, verbose=True)
 early_stopping = EarlyStopping()
 train_RMSEs, train_PSNRs, train_SSIMs, train_PCCs, train_losses = [], [], [], [], []
 test_RMSEs, test_PSNRs, test_SSIMs, test_PCCs, test_losses = [], [], [], [], []
-prog_bar = tqdm(range(20), total=100, desc='Training', position=0)
+prog_bar = tqdm(range(100), total=100, desc='Training', position=0)
+
+fig, ax = plt.subplots()
+line1, = ax.plot([], [], label='Test Loss')
+ax.legend()
+
 torch.cuda.empty_cache()
 for epoch in prog_bar:
     train_loss, train_RMSE, train_PSNR, train_SSIM, train_PCC = fit(net, trainloader, optimizer)
@@ -328,41 +332,28 @@ for epoch in prog_bar:
     test_PSNRs.append(test_PSNR)
     test_SSIMs.append(test_SSIM)
     test_PCCs.append(test_PCC)
-    #sheduler.step(test_loss)
+    sheduler.step(test_loss)
     early_stopping(test_loss, net)
     current_lr = optimizer.param_groups[0]['lr']
     prog_bar.set_description(f"Epoch {epoch + 1} | lr={current_lr:.3e} | "
                              f"Metrics train/test: RMSE={train_RMSE:.3e}/{test_RMSE:.3e}, "
                              f"PSNR={train_PSNR:.3e}/{test_PSNR:.3e}, SSIM={train_SSIM:.3e}/{test_SSIM:.3e}, "
                              f"PCC={train_PCC:.3e}/{test_PCC:.3e} | Loss: {train_loss:.3e}/{test_loss:.3e}")
+    update_plot()
     if early_stopping.early_stop:
         print("Early stopping")
         break
 #%% final evaluation
 ins, preds, truths, test_loss, test_RMSE, test_PSNR, test_SSIM, test_PCC = predict(net, testloader)
-ins = torch.cat(ins, dim=0)
-preds = torch.cat(preds, dim=0)
-truths = torch.cat(truths, dim=0)
-reverse_trans_gray = transforms.Compose([
-    transforms.Normalize(mean=[0., 0., 0.], std=[1/s for s in gray_std]),
-    transforms.Normalize(mean=[-m for m in gray_mean], std=[1., 1., 1.])
-])
-pred_min = preds.amin(dim=(0, 2, 3), keepdim=True)  # [C,1,1]
-pred_max = preds.amax(dim=(0, 2, 3), keepdim=True)
-preds_scaled = (preds - pred_min) / (pred_max - pred_min + 1e-8)
-mean_pred = preds_scaled.mean(dim=(0, 2, 3))
-std_pred = preds_scaled.std(dim=(0, 2, 3))
-reverse_trans_predicted = transforms.Compose([
-    transforms.Normalize(mean=[0., 0., 0.], std=[1/s for s in std_pred]),
-    transforms.Normalize(mean=[-m for m in mean_pred], std=[1., 1., 1.])
-])
-reverse_trans_color = transforms.Compose([
-    transforms.Normalize(mean=[0., 0., 0.], std=[1/s for s in color_std]),
-    transforms.Normalize(mean=[-m for m in color_mean], std=[1., 1., 1.])
-])
-ins = reverse_trans_gray(ins).permute(0, 2, 3, 1).numpy()
-preds = reverse_trans_predicted(preds).permute(0, 2, 3, 1).numpy()
-truths = reverse_trans_color(truths).permute(0, 2, 3, 1).numpy()
+ins = [transforms.Normalize(mean=[-m/s for m, s in zip(gray_mean, gray_std)], std=[1/s for s in gray_std])(x)
+       .clamp(0, 1) for x in ins]
+preds = [transforms.Normalize(mean=[-m/s for m, s in zip(color_mean, color_std)], std=[1/s for s in color_std])(x)
+         .clamp(0, 1) for x in preds]
+truths = [transforms.Normalize(mean=[-m/s for m, s in zip(color_mean, color_std)], std=[1/s for s in color_std])(x)
+            .clamp(0, 1) for x in truths]
+ins = torch.cat(ins, dim=0).permute(0, 2, 3, 1).numpy()
+preds = torch.cat(preds, dim=0).permute(0, 2, 3, 1).numpy()
+truths = torch.cat(truths, dim=0).permute(0, 2, 3, 1).numpy()
 print(test_loss, test_RMSE, test_PSNR, test_SSIM, test_PCC)
 #%%
 plt.figure()
