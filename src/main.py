@@ -102,7 +102,7 @@ testset = MyDataset(gray_test, color_test, gray_transform=transforms.Normalize(m
 del gray_train, gray_test, color_train, color_test # release memory
 #%%
 class EarlyStopping:
-    def __init__(self, patience=15, delta=0.5, window_size=10):
+    def __init__(self, patience=5, delta=0.00005, window_size=3):
         self.patience = patience
         self.counter = 0
         self.best_score = np.Inf
@@ -117,14 +117,14 @@ class EarlyStopping:
             self.val_window.pop(0)
         avg_val = np.mean(self.val_window)
 
-        if avg_val == self.best_score or avg_val > self.best_score + self.delta:
-            self.counter += 1
-        elif avg_val < self.best_score:
+        if avg_val < self.best_score - self.delta:
             self.best_score = avg_val
             self.save_checkpoint(net)
             self.counter = 0
-        if self.counter >= self.patience:
-            self.early_stop = True
+        else:
+            self.counter += 1
+            if self.counter >= self.patience:
+                self.early_stop = True
 
     def save_checkpoint(self, model):
         torch.save(model.state_dict(), '../models/checkpoint.pth')
@@ -152,16 +152,16 @@ def compute_pcc(pred, targets):
 def fit(net, trainloader, optimizer, loss_fn1=nn.MSELoss(reduction='sum'), loss_fn2=ImageGradientLoss(), coeff=0.5):
     net.train()
     total_loss, total_rmse, total_psnr, total_ssim, total_pcc, count = 0, 0, 0, 0, 0, 0
-    for grays, colors in tqdm(trainloader, desc='trainloader', position=1):
+    for grays, colors in trainloader:
         grays, colors = grays.to(device), colors.to(device)
         optimizer.zero_grad()
         out = net(grays)
         numel = out.numel()
         loss1, loss2 = loss_fn1(out, colors), loss_fn2(out, colors)
         loss = (coeff * loss1 + (1-coeff) * loss2) / numel
-        loss.backward()
-        optimizer.step()
-        torch.cuda.empty_cache()
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
         total_loss += loss.item()
         count += len(colors)
         with torch.no_grad():
@@ -171,6 +171,8 @@ def fit(net, trainloader, optimizer, loss_fn1=nn.MSELoss(reduction='sum'), loss_
             total_psnr += batch_psnr.item() * len(colors)
             total_ssim += structural_similarity_index_measure(out, colors).item() * len(colors)
             total_pcc += compute_pcc(out, colors).item() * len(colors)
+        del out, grays, colors, loss1, loss2, loss
+        torch.cuda.empty_cache()
     return total_loss / count, total_rmse / count, total_psnr / count, total_ssim / count, total_pcc / count
 
 def predict(net, testloader, loss_fn1=nn.MSELoss(reduction='sum'), loss_fn2=ImageGradientLoss(), coeff=0.5):
@@ -178,7 +180,7 @@ def predict(net, testloader, loss_fn1=nn.MSELoss(reduction='sum'), loss_fn2=Imag
     total_loss, total_rmse, total_psnr, total_ssim, total_pcc, count = 0, 0, 0, 0, 0, 0
     ins, preds, truths = [], [], []
     with torch.no_grad():
-        for grays, colors in tqdm(testloader, desc='testloader', position=1):
+        for grays, colors in testloader:
             grays, colors = grays.to(device), colors.to(device)
             out = net(grays)
             ins.append(grays.cpu())
@@ -195,12 +197,14 @@ def predict(net, testloader, loss_fn1=nn.MSELoss(reduction='sum'), loss_fn2=Imag
             total_psnr += batch_psnr.item() * len(colors)
             total_ssim += structural_similarity_index_measure(out, colors).item() * len(colors)
             total_pcc += compute_pcc(out, colors).item() * len(colors)
+            del out, grays, colors, loss1, loss2, loss
+            torch.cuda.empty_cache()
     return ins, preds, truths, total_loss / count, total_rmse / count, total_psnr / count, total_ssim / count, total_pcc / count
 
 def objective(trial, trainset, X):
     lr = trial.suggest_float('lr', 1e-5, 1e-1, log=True)
     batch_size = trial.suggest_categorical('batch_size', [64,256, 512, 1024])
-    coeff = trial.suggest_float('coeff', 0.0, 1.0, log=True)
+    coeff = trial.suggest_float('coeff', 0.0, 1.0, log=False)
     kf = KFold(n_splits=5, shuffle=True, random_state=42)
     val_losses, mean_loss = [], 0
     train_loss, train_rmse, train_psnr, train_ssim, train_pcc = 0, 0, 0, 0, 0
@@ -211,22 +215,27 @@ def objective(trial, trainset, X):
         split_n += 1
         trainloader = DataLoader(trainset, batch_size=batch_size, sampler=SubsetRandomSampler(train_idx))
         valloader = DataLoader(trainset, batch_size=batch_size, sampler=SubsetRandomSampler(val_idx))
+        del train_idx, val_idx
         net = Net().to(device)
         optimizer = optim.Adam(net.parameters(), lr=lr)
-        scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=5, verbose=True)
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.05, patience=3)
         early_stopping = EarlyStopping()
         for epoch in range(100):
-            train_loss, train_rmse, train_psnr, train_ssim, train_pcc = fit(net, trainloader, optimizer)
-            _, _, _, val_loss, val_rmse, val_psnr, val_ssim, val_pcc = predict(net, valloader)
+            train_loss, train_rmse, train_psnr, train_ssim, train_pcc = fit(net, trainloader, optimizer, coeff=coeff)
+            ins, preds, truths, val_loss, val_rmse, val_psnr, val_ssim, val_pcc = predict(net, valloader, coeff=coeff)
+            del ins, preds, truths
+            torch.cuda.empty_cache()
             scheduler.step(val_loss)
             early_stopping(val_loss, net)
             prog_bar.set_description(
-                f"Split {split_n} - Epoch {epoch + 1} | lr={current_lr:.3e} | "
+                f"Split {split_n} - Epoch {epoch + 1} |\nlr={lr:.3e}, batch size={batch_size:.3e}, coeff={coeff:.3e} |\n"
                 f"Metrics train/val: RMSE={train_rmse:.3e}/{val_rmse:.3e}, "
                 f"PSNR={train_psnr:.3e}/{val_psnr:.3e}, SSIM={train_ssim:.3e}/{val_ssim:.3e}, "
                 f"PCC={train_pcc:.3e}/{val_pcc:.3e} | Loss: {train_loss:.3e}/{val_loss:.3e}")
             if early_stopping.early_stop:
                 break
+        del net, optimizer, sheduler, early_stopping,
+        torch.cuda.empty_cache()
         val_losses.append(val_loss)
         mean_loss = np.mean(val_losses)
         trial.report(mean_loss, split_n)
@@ -277,7 +286,7 @@ net = Net().to(device)
 writer.add_graph(net, torch.zeros(1, 3, SIZE, SIZE).to(device))
 writer.flush()
 summary(net, input_size=(1, 3, SIZE, SIZE), device=device)
-#%% TODO: Optina portion (hyperparameter tuning)
+#%%
 X = np.zeros(len(trainset))
 study = optuna.create_study(direction='minimize', pruner=optuna.pruners.MedianPruner())
 study.optimize(lambda trial: objective(trial, trainset, X), n_trials=5)
@@ -305,10 +314,10 @@ def update_plot():
     ax.autoscale_view()
     fig.canvas.draw()
 #%%
-trainloader = DataLoader(trainset, batch_size=256, shuffle=True)
-testloader = DataLoader(testset, batch_size=256, shuffle=False)
-optimizer = optim.Adam(net.parameters(), lr=1e-3)
-sheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=5, verbose=True)
+trainloader = DataLoader(trainset, batch_size=trial.params['batch_size'], shuffle=True)
+testloader = DataLoader(testset, batch_size=trial.params['batch_size'], shuffle=False)
+optimizer = optim.Adam(net.parameters(), lr=trial.params['lr'])
+sheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.05, patience=3)
 early_stopping = EarlyStopping()
 train_RMSEs, train_PSNRs, train_SSIMs, train_PCCs, train_losses = [], [], [], [], []
 test_RMSEs, test_PSNRs, test_SSIMs, test_PCCs, test_losses = [], [], [], [], []
@@ -319,14 +328,17 @@ line1, = ax.plot([], [], label='Test Loss')
 ax.legend()
 
 torch.cuda.empty_cache()
+scaler = torch.cuda.amp.GradScaler()
 for epoch in prog_bar:
-    train_loss, train_RMSE, train_PSNR, train_SSIM, train_PCC = fit(net, trainloader, optimizer)
+    train_loss, train_RMSE, train_PSNR, train_SSIM, train_PCC = fit(net, trainloader, optimizer, coeff=trial.params['coeff'])
     train_losses.append(train_loss)
     train_RMSEs.append(train_RMSE)
     train_PSNRs.append(train_PSNR)
     train_SSIMs.append(train_SSIM)
     train_PCCs.append(train_PCC)
-    _, _, _, test_loss, test_RMSE, test_PSNR, test_SSIM, test_PCC = predict(net, testloader)
+    ins, preds, truths, test_loss, test_RMSE, test_PSNR, test_SSIM, test_PCC = predict(net, testloader, coeff=trial.params['coeff'])
+    del ins, preds, truths
+    torch.cuda.empty_cache()
     test_losses.append(test_loss)
     test_RMSEs.append(test_RMSE)
     test_PSNRs.append(test_PSNR)
@@ -335,14 +347,17 @@ for epoch in prog_bar:
     sheduler.step(test_loss)
     early_stopping(test_loss, net)
     current_lr = optimizer.param_groups[0]['lr']
-    prog_bar.set_description(f"Epoch {epoch + 1} | lr={current_lr:.3e} | "
+    prog_bar.set_description(f"Epoch {epoch + 1} | lr={current_lr:.3e} |\n"
                              f"Metrics train/test: RMSE={train_RMSE:.3e}/{test_RMSE:.3e}, "
                              f"PSNR={train_PSNR:.3e}/{test_PSNR:.3e}, SSIM={train_SSIM:.3e}/{test_SSIM:.3e}, "
                              f"PCC={train_PCC:.3e}/{test_PCC:.3e} | Loss: {train_loss:.3e}/{test_loss:.3e}")
+    writer.add_scalar('Loss/train', train_loss, epoch)
+    writer.add_scalar('Loss/test', test_loss, epoch)
     update_plot()
     if early_stopping.early_stop:
         print("Early stopping")
         break
+writer.flush()
 #%% final evaluation
 ins, preds, truths, test_loss, test_RMSE, test_PSNR, test_SSIM, test_PCC = predict(net, testloader)
 ins = [transforms.Normalize(mean=[-m/s for m, s in zip(gray_mean, gray_std)], std=[1/s for s in gray_std])(x)
