@@ -3,17 +3,13 @@ import os
 import re
 import cv2
 from tqdm.notebook import tqdm
-from IPython.display import clear_output
 import optuna
 from optuna.trial import TrialState
 import torch
 from torch import nn, optim
-import torch.nn.functional as F
 from torch.utils.data import DataLoader, random_split, SubsetRandomSampler
 from torch.utils.tensorboard import SummaryWriter
-from torchmetrics.functional.image import image_gradients, peak_signal_noise_ratio, structural_similarity_index_measure
-from torchmetrics.regression import PearsonCorrCoef
-import torchvision
+from torchmetrics.functional.image import image_gradients, structural_similarity_index_measure
 from torchvision import transforms
 from torchinfo import summary
 from sklearn.model_selection import KFold, train_test_split
@@ -36,7 +32,7 @@ folder = os.listdir(path)
 folder = sort_files(folder)
 for file in tqdm(folder):
     img = cv2.imread(path + '/' + file, 1)
-    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    img = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
     img = cv2.resize(img, (SIZE, SIZE))
     data_color.append(img)
 data_color = np.array(data_color)
@@ -55,9 +51,12 @@ for _ in range(5):
     idx = np.random.randint(0, len(data_color) - 1)
     plt.figure(figsize=(15, 15))
     plt.subplot(1, 3, 1)
-    plt.title('Color Image', fontsize=20)
-    plt.imshow(data_color[idx])
+    plt.title('RGB Color Image', fontsize=20)
+    plt.imshow(cv2.cvtColor(data_color[idx], cv2.COLOR_LAB2RGB))
     plt.subplot(1, 3, 2)
+    plt.title('Lab Color Image', fontsize=20)
+    plt.imshow(data_color[idx])
+    plt.subplot(1, 3, 3)
     plt.title('Grayscale Image ', fontsize=20)
     plt.imshow(data_gray[idx])
     plt.show()
@@ -78,22 +77,14 @@ print(gray_mean, gray_std)
 #%%
 class MyDataset(torch.utils.data.Dataset):
     def __init__(self, data_gray, data_color, gray_transform=None, color_transform=None):
-        self.data_color = data_color
-        self.data_gray = data_gray
-        self.gray_transform = gray_transform
-        self.color_transform = color_transform
+        self.data_color = color_transform(data_color)
+        self.data_gray = gray_transform(data_gray)
 
     def __len__(self):
         return len(self.data_gray)
 
     def __getitem__(self, idx):
-        gray_img = self.data_gray[idx]
-        color_img = self.data_color[idx]
-        if self.gray_transform:
-            gray_img = self.gray_transform(gray_img)
-        if self.color_transform:
-            color_img = self.color_transform(color_img)
-        return gray_img, color_img
+        return self.data_gray[idx], self.data_color[idx]
 #%%
 trainset = MyDataset(gray_train, color_train, gray_transform=transforms.Normalize(mean=gray_mean, std=gray_std),
                      color_transform=transforms.Normalize(mean=color_mean, std=color_std))
@@ -101,6 +92,9 @@ testset = MyDataset(gray_test, color_test, gray_transform=transforms.Normalize(m
                     color_transform=transforms.Normalize(mean=color_mean, std=color_std))
 del gray_train, gray_test, color_train, color_test # release memory
 #%%
+def save_checkpoint(model, name='checkpoint'):
+    torch.save(model.state_dict(), f"../models/{name}.pth")
+
 class EarlyStopping:
     def __init__(self, patience=10, delta=5e-6):
         self.patience = patience
@@ -113,13 +107,11 @@ class EarlyStopping:
         if self.best_score > val_loss:
             self.best_score = val_loss
             self.counter = 0
+            save_checkpoint(net)
         elif self.best_score + self.delta < val_loss:
             self.counter += 1
             if self.counter >= self.patience:
                 self.early_stop = True
-
-    def save_checkpoint(self, model):
-        torch.save(model.state_dict(), '../models/checkpoint.pth')
 #%% Loss functions
 class ImageGradientLoss(nn.Module):
     def __init__(self, weight=None, size_average=True):
@@ -192,7 +184,7 @@ def predict(net, testloader, loss_fn1=nn.MSELoss(reduction='sum'), loss_fn2=Imag
             total_pcc += compute_pcc(out, colors).item() * len(colors)
             del out, grays, colors, loss1, loss2, loss
     return ins, preds, truths, total_loss / count, total_rmse / count, total_psnr / count, total_ssim / count, total_pcc / count
-
+#%%
 def objective(trial, trainset, X):
     lr = trial.suggest_float('lr', 1e-5, 1e-1, log=True)
     batch_size = trial.suggest_categorical('batch_size', [64,256, 512, 1024])
@@ -284,7 +276,7 @@ torch.cuda.empty_cache()
 scaler = torch.cuda.amp.GradScaler()
 study = optuna.create_study(direction='minimize', pruner=optuna.pruners.MedianPruner())
 study.optimize(lambda trial: objective(trial, trainset, X), n_trials=5)
-
+#%%
 pruned_trials = study.get_trials(deepcopy=False, states=[TrialState.PRUNED])
 complete_trials = study.get_trials(deepcopy=False, states=[TrialState.COMPLETE])
 
@@ -308,13 +300,14 @@ def update_plot():
     ax.autoscale_view()
     fig.canvas.draw()
 #%%
-trainloader = DataLoader(trainset, batch_size=64, shuffle=True, num_workers=4, pin_memory=True, prefetch_factor=2)
-testloader = DataLoader(testset, batch_size=64, shuffle=False, num_workers=4, pin_memory=True, prefetch_factor=2)
-optimizer = optim.Adam(net.parameters(), lr=1e-3)
+trainloader = DataLoader(trainset, batch_size=trial.params['batch_size'], shuffle=True, num_workers=4, pin_memory=True, prefetch_factor=2)
+testloader = DataLoader(testset, batch_size=trial.params['batch_size'], shuffle=False, num_workers=4, pin_memory=True, prefetch_factor=2)
+optimizer = optim.Adam(net.parameters(), lr=trial.params['lr'])
 sheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.05, patience=2)
 early_stopping = EarlyStopping()
 train_RMSEs, train_PSNRs, train_SSIMs, train_PCCs, train_losses = [], [], [], [], []
 test_RMSEs, test_PSNRs, test_SSIMs, test_PCCs, test_losses = [], [], [], [], []
+last_checkpoint = None
 prog_bar = tqdm(range(50), total=50, desc='Training', position=0)
 
 fig, ax = plt.subplots()
@@ -324,13 +317,13 @@ ax.legend()
 torch.cuda.empty_cache()
 scaler = torch.cuda.amp.GradScaler()
 for epoch in prog_bar:
-    train_loss, train_RMSE, train_PSNR, train_SSIM, train_PCC = fit(net, trainloader, optimizer, coeff=1.0)
+    train_loss, train_RMSE, train_PSNR, train_SSIM, train_PCC = fit(net, trainloader, optimizer, coeff=trial.params['coeff'])
     train_losses.append(train_loss)
     train_RMSEs.append(train_RMSE)
     train_PSNRs.append(train_PSNR)
     train_SSIMs.append(train_SSIM)
     train_PCCs.append(train_PCC)
-    ins, preds, truths, test_loss, test_RMSE, test_PSNR, test_SSIM, test_PCC = predict(net, testloader, coeff=1.0)
+    ins, preds, truths, test_loss, test_RMSE, test_PSNR, test_SSIM, test_PCC = predict(net, testloader, coeff=trial.params['coeff'])
     del ins, preds, truths
     test_losses.append(test_loss)
     test_RMSEs.append(test_RMSE)
@@ -349,25 +342,55 @@ for epoch in prog_bar:
     update_plot()
     torch.cuda.empty_cache()
     if early_stopping.early_stop:
+        save_checkpoint(net, 'lastcheck')
         print("Early stopping")
         break
 writer.flush()
 #%% final evaluation
+net.load_state_dict(torch.load('../models/checkpoint.pth'))
 ins, preds, truths, test_loss, test_RMSE, test_PSNR, test_SSIM, test_PCC = predict(net, testloader)
-ins = [transforms.Normalize(mean=[-m/s for m, s in zip(gray_mean, gray_std)], std=[1/s for s in gray_std])(x.float())
-       .clamp(0, 1) for x in ins]
-preds = [transforms.Normalize(mean=[-m/s for m, s in zip(color_mean, color_std)], std=[1/s for s in color_std])(x.float())
-         .clamp(0, 1) for x in preds]
-truths = [transforms.Normalize(mean=[-m/s for m, s in zip(color_mean, color_std)], std=[1/s for s in color_std])(x.float())
-            .clamp(0, 1) for x in truths]
-ins = torch.cat(ins, dim=0).permute(0, 2, 3, 1).numpy()
-preds = torch.cat(preds, dim=0).permute(0, 2, 3, 1).numpy()
-truths = torch.cat(truths, dim=0).permute(0, 2, 3, 1).numpy()
-print(test_loss, test_RMSE, test_PSNR, test_SSIM, test_PCC)
+if early_stopping.early_stop:
+    net.load_state_dict(torch.load('../models/lastcheck.pth'))
+    ins2, preds2, truths2, loss2, rmse2, psnr2, ssim2, pcc2 = predict(net, testloader)
 #%%
+def unstandardize(tensor, mean, std):
+    unnorm = transforms.Normalize(mean=[-m/s for m, s in zip(mean, std)], std=[1/s for s in std])
+    return unnorm(tensor).clamp(0, 1)
+
+def lab_to_rgb(x):
+    lab = (x * 255).to(torch.uint8).permute(1, 2, 0).numpy()
+    rgb = cv2.cvtColor(lab, cv2.COLOR_LAB2RGB)
+    return rgb
+#%%
+ins = torch.cat(ins, dim=0)
+preds = torch.cat(preds, dim=0)
+truths = torch.cat(truths, dim=0)
+ins = [unstandardize(x, gray_mean, gray_std)for x in ins]
+preds = [unstandardize(x, color_mean, color_std)for x in preds]
+truths = [unstandardize(x, color_mean, color_std) for x in truths]
+preds = [lab_to_rgb(x) for x in preds]
+truths = [lab_to_rgb(x) for x in truths]
+if early_stopping.early_stop:
+    ins2 = torch.cat(ins2, dim=0)
+    preds2 = torch.cat(preds2, dim=0)
+    truths2 = torch.cat(truths2, dim=0)
+    ins2 = [unstandardize(x, gray_mean, gray_std)for x in ins2]
+    preds2 = [unstandardize(x, color_mean, color_std)for x in preds2]
+    truths2 = [unstandardize(x, color_mean, color_std) for x in truths2]
+    preds2 = [lab_to_rgb(x) for x in preds2]
+    truths2 = [lab_to_rgb(x) for x in truths2]
+print(test_loss, test_RMSE, test_PSNR, test_SSIM, test_PCC)
+if early_stopping.early_stop:
+    print(loss2, rmse2, psnr2, ssim2, pcc2)
+#%%
+# %matplotlib inline
+
 plt.figure()
 plt.plot(train_RMSEs, label='Train RMSE')
 plt.plot(test_RMSEs, label='Test RMSE')
+plt.axhline(y=test_RMSE, color='g', linestyle='--')
+if early_stopping.early_stop:
+    plt.axhline(y=rmse2, color='r', linestyle='--')
 plt.xlabel('Epoch')
 plt.ylabel('RMSE')
 plt.legend()
@@ -376,6 +399,9 @@ plt.show()
 plt.figure()
 plt.plot(train_PSNRs, label='Train PSNR')
 plt.plot(test_PSNRs, label='Test PSNR')
+plt.axhline(y=test_PSNR, color='g', linestyle='--')
+if early_stopping.early_stop:
+    plt.axhline(y=psnr2, color='r', linestyle='--')
 plt.xlabel('Epoch')
 plt.ylabel('PSNR')
 plt.legend()
@@ -384,6 +410,9 @@ plt.show()
 plt.figure()
 plt.plot(train_SSIMs, label='Train SSIM')
 plt.plot(test_SSIMs, label='Test SSIM')
+plt.axhline(y=test_SSIM, color='g', linestyle='--')
+if early_stopping.early_stop:
+    plt.axhline(y=ssim2, color='r', linestyle='--')
 plt.xlabel('Epoch')
 plt.ylabel('SSIM')
 plt.ylim(0, 1)
@@ -393,6 +422,9 @@ plt.show()
 plt.figure()
 plt.plot(train_PCCs, label='Train PCC')
 plt.plot(test_PCCs, label='Test PCC')
+plt.axhline(y=test_PCC, color='g', linestyle='--')
+if early_stopping.early_stop:
+    plt.axhline(y=pcc2, color='r', linestyle='--')
 plt.xlabel('Epoch')
 plt.ylabel('PCC')
 plt.ylim(0, 1)
@@ -402,12 +434,15 @@ plt.show()
 plt.figure()
 plt.plot(train_losses, label='Train loss')
 plt.plot(test_losses, label='Test loss')
+plt.axhline(y=test_loss, color='g', linestyle='--')
+if early_stopping.early_stop:
+    plt.axhline(y=loss2, color='r', linestyle='--')
 plt.xlabel('Epoch')
 plt.ylabel('Loss')
 plt.ylim(bottom=0)
 plt.legend()
 plt.show()
-
+#%%
 for _ in range(5):
     idx = np.random.randint(0, len(ins) - 1)
     plt.figure(figsize=(15, 15))
