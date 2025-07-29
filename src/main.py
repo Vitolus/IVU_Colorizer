@@ -102,26 +102,18 @@ testset = MyDataset(gray_test, color_test, gray_transform=transforms.Normalize(m
 del gray_train, gray_test, color_train, color_test # release memory
 #%%
 class EarlyStopping:
-    def __init__(self, patience=5, delta=0.00005, window_size=3):
+    def __init__(self, patience=10, delta=5e-6):
         self.patience = patience
         self.counter = 0
         self.best_score = np.Inf
         self.early_stop = False
         self.delta = delta
-        self.window_size = window_size
-        self.val_window = []
 
     def __call__(self, val_loss, net):
-        self.val_window.append(val_loss)
-        if len(self.val_window) > self.window_size:
-            self.val_window.pop(0)
-        avg_val = np.mean(self.val_window)
-
-        if avg_val < self.best_score - self.delta:
-            self.best_score = avg_val
-            self.save_checkpoint(net)
+        if self.best_score > val_loss:
+            self.best_score = val_loss
             self.counter = 0
-        else:
+        elif self.best_score + self.delta < val_loss:
             self.counter += 1
             if self.counter >= self.patience:
                 self.early_stop = True
@@ -155,10 +147,11 @@ def fit(net, trainloader, optimizer, loss_fn1=nn.MSELoss(reduction='sum'), loss_
     for grays, colors in trainloader:
         grays, colors = grays.to(device), colors.to(device)
         optimizer.zero_grad()
-        out = net(grays)
-        numel = out.numel()
-        loss1, loss2 = loss_fn1(out, colors), loss_fn2(out, colors)
-        loss = (coeff * loss1 + (1-coeff) * loss2) / numel
+        with torch.cuda.amp.autocast():
+            out = net(grays)
+            numel = out.numel()
+            loss1, loss2 = loss_fn1(out, colors), loss_fn2(out, colors)
+            loss = (coeff * loss1 + (1-coeff) * loss2) / numel
         scaler.scale(loss).backward()
         scaler.step(optimizer)
         scaler.update()
@@ -172,7 +165,6 @@ def fit(net, trainloader, optimizer, loss_fn1=nn.MSELoss(reduction='sum'), loss_
             total_ssim += structural_similarity_index_measure(out, colors).item() * len(colors)
             total_pcc += compute_pcc(out, colors).item() * len(colors)
         del out, grays, colors, loss1, loss2, loss
-        torch.cuda.empty_cache()
     return total_loss / count, total_rmse / count, total_psnr / count, total_ssim / count, total_pcc / count
 
 def predict(net, testloader, loss_fn1=nn.MSELoss(reduction='sum'), loss_fn2=ImageGradientLoss(), coeff=0.5):
@@ -182,13 +174,14 @@ def predict(net, testloader, loss_fn1=nn.MSELoss(reduction='sum'), loss_fn2=Imag
     with torch.no_grad():
         for grays, colors in testloader:
             grays, colors = grays.to(device), colors.to(device)
-            out = net(grays)
-            ins.append(grays.cpu())
-            preds.append(out.cpu())
-            truths.append(colors.cpu())
-            numel = out.numel()
-            loss1, loss2 = loss_fn1(out, colors), loss_fn2(out, colors)
-            loss = (coeff * loss1 + (1 - coeff) * loss2) / numel
+            with torch.cuda.amp.autocast():
+                out = net(grays)
+                ins.append(grays.cpu())
+                preds.append(out.cpu())
+                truths.append(colors.cpu())
+                numel = out.numel()
+                loss1, loss2 = loss_fn1(out, colors), loss_fn2(out, colors)
+                loss = (coeff * loss1 + (1 - coeff) * loss2) / numel
             total_loss += loss.item()
             count += len(colors)
             batch_rmse = torch.sqrt(loss1 / numel)
@@ -198,7 +191,6 @@ def predict(net, testloader, loss_fn1=nn.MSELoss(reduction='sum'), loss_fn2=Imag
             total_ssim += structural_similarity_index_measure(out, colors).item() * len(colors)
             total_pcc += compute_pcc(out, colors).item() * len(colors)
             del out, grays, colors, loss1, loss2, loss
-            torch.cuda.empty_cache()
     return ins, preds, truths, total_loss / count, total_rmse / count, total_psnr / count, total_ssim / count, total_pcc / count
 
 def objective(trial, trainset, X):
@@ -213,32 +205,32 @@ def objective(trial, trainset, X):
     prog_bar = tqdm(kf.split(X), desc="Splits", position=0)
     for train_idx, val_idx in prog_bar:
         split_n += 1
-        trainloader = DataLoader(trainset, batch_size=batch_size, sampler=SubsetRandomSampler(train_idx))
-        valloader = DataLoader(trainset, batch_size=batch_size, sampler=SubsetRandomSampler(val_idx))
+        trainloader = DataLoader(trainset, batch_size=batch_size, sampler=SubsetRandomSampler(train_idx), num_workers=4, pin_memory=True, prefetch_factor=2)
+        valloader = DataLoader(trainset, batch_size=batch_size, sampler=SubsetRandomSampler(val_idx), num_workers=4, pin_memory=True, prefetch_factor=2)
         del train_idx, val_idx
         net = Net().to(device)
         optimizer = optim.Adam(net.parameters(), lr=lr)
-        scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.05, patience=3)
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.05, patience=2)
         early_stopping = EarlyStopping()
-        for epoch in range(100):
+        for epoch in range(50):
             train_loss, train_rmse, train_psnr, train_ssim, train_pcc = fit(net, trainloader, optimizer, coeff=coeff)
             ins, preds, truths, val_loss, val_rmse, val_psnr, val_ssim, val_pcc = predict(net, valloader, coeff=coeff)
             del ins, preds, truths
-            torch.cuda.empty_cache()
-            scheduler.step(val_loss)
+            scheduler.step(val_ssim)
             early_stopping(val_loss, net)
             prog_bar.set_description(
                 f"Split {split_n} - Epoch {epoch + 1} |\nlr={lr:.3e}, batch size={batch_size:.3e}, coeff={coeff:.3e} |\n"
                 f"Metrics train/val: RMSE={train_rmse:.3e}/{val_rmse:.3e}, "
                 f"PSNR={train_psnr:.3e}/{val_psnr:.3e}, SSIM={train_ssim:.3e}/{val_ssim:.3e}, "
                 f"PCC={train_pcc:.3e}/{val_pcc:.3e} | Loss: {train_loss:.3e}/{val_loss:.3e}")
+            torch.cuda.empty_cache()
             if early_stopping.early_stop:
                 break
         del net, optimizer, sheduler, early_stopping,
-        torch.cuda.empty_cache()
         val_losses.append(val_loss)
         mean_loss = np.mean(val_losses)
         trial.report(mean_loss, split_n)
+        torch.cuda.empty_cache()
         if trial.should_prune():
             raise optuna.exceptions.TrialPruned()
     return mean_loss
@@ -288,6 +280,8 @@ writer.flush()
 summary(net, input_size=(1, 3, SIZE, SIZE), device=device)
 #%%
 X = np.zeros(len(trainset))
+torch.cuda.empty_cache()
+scaler = torch.cuda.amp.GradScaler()
 study = optuna.create_study(direction='minimize', pruner=optuna.pruners.MedianPruner())
 study.optimize(lambda trial: objective(trial, trainset, X), n_trials=5)
 
@@ -314,14 +308,14 @@ def update_plot():
     ax.autoscale_view()
     fig.canvas.draw()
 #%%
-trainloader = DataLoader(trainset, batch_size=trial.params['batch_size'], shuffle=True)
-testloader = DataLoader(testset, batch_size=trial.params['batch_size'], shuffle=False)
-optimizer = optim.Adam(net.parameters(), lr=trial.params['lr'])
-sheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.05, patience=3)
+trainloader = DataLoader(trainset, batch_size=64, shuffle=True, num_workers=4, pin_memory=True, prefetch_factor=2)
+testloader = DataLoader(testset, batch_size=64, shuffle=False, num_workers=4, pin_memory=True, prefetch_factor=2)
+optimizer = optim.Adam(net.parameters(), lr=1e-3)
+sheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.05, patience=2)
 early_stopping = EarlyStopping()
 train_RMSEs, train_PSNRs, train_SSIMs, train_PCCs, train_losses = [], [], [], [], []
 test_RMSEs, test_PSNRs, test_SSIMs, test_PCCs, test_losses = [], [], [], [], []
-prog_bar = tqdm(range(100), total=100, desc='Training', position=0)
+prog_bar = tqdm(range(50), total=50, desc='Training', position=0)
 
 fig, ax = plt.subplots()
 line1, = ax.plot([], [], label='Test Loss')
@@ -330,21 +324,20 @@ ax.legend()
 torch.cuda.empty_cache()
 scaler = torch.cuda.amp.GradScaler()
 for epoch in prog_bar:
-    train_loss, train_RMSE, train_PSNR, train_SSIM, train_PCC = fit(net, trainloader, optimizer, coeff=trial.params['coeff'])
+    train_loss, train_RMSE, train_PSNR, train_SSIM, train_PCC = fit(net, trainloader, optimizer, coeff=1.0)
     train_losses.append(train_loss)
     train_RMSEs.append(train_RMSE)
     train_PSNRs.append(train_PSNR)
     train_SSIMs.append(train_SSIM)
     train_PCCs.append(train_PCC)
-    ins, preds, truths, test_loss, test_RMSE, test_PSNR, test_SSIM, test_PCC = predict(net, testloader, coeff=trial.params['coeff'])
+    ins, preds, truths, test_loss, test_RMSE, test_PSNR, test_SSIM, test_PCC = predict(net, testloader, coeff=1.0)
     del ins, preds, truths
-    torch.cuda.empty_cache()
     test_losses.append(test_loss)
     test_RMSEs.append(test_RMSE)
     test_PSNRs.append(test_PSNR)
     test_SSIMs.append(test_SSIM)
     test_PCCs.append(test_PCC)
-    sheduler.step(test_loss)
+    sheduler.step(test_SSIM)
     early_stopping(test_loss, net)
     current_lr = optimizer.param_groups[0]['lr']
     prog_bar.set_description(f"Epoch {epoch + 1} | lr={current_lr:.3e} |\n"
@@ -354,17 +347,18 @@ for epoch in prog_bar:
     writer.add_scalar('Loss/train', train_loss, epoch)
     writer.add_scalar('Loss/test', test_loss, epoch)
     update_plot()
+    torch.cuda.empty_cache()
     if early_stopping.early_stop:
         print("Early stopping")
         break
 writer.flush()
 #%% final evaluation
 ins, preds, truths, test_loss, test_RMSE, test_PSNR, test_SSIM, test_PCC = predict(net, testloader)
-ins = [transforms.Normalize(mean=[-m/s for m, s in zip(gray_mean, gray_std)], std=[1/s for s in gray_std])(x)
+ins = [transforms.Normalize(mean=[-m/s for m, s in zip(gray_mean, gray_std)], std=[1/s for s in gray_std])(x.float())
        .clamp(0, 1) for x in ins]
-preds = [transforms.Normalize(mean=[-m/s for m, s in zip(color_mean, color_std)], std=[1/s for s in color_std])(x)
+preds = [transforms.Normalize(mean=[-m/s for m, s in zip(color_mean, color_std)], std=[1/s for s in color_std])(x.float())
          .clamp(0, 1) for x in preds]
-truths = [transforms.Normalize(mean=[-m/s for m, s in zip(color_mean, color_std)], std=[1/s for s in color_std])(x)
+truths = [transforms.Normalize(mean=[-m/s for m, s in zip(color_mean, color_std)], std=[1/s for s in color_std])(x.float())
             .clamp(0, 1) for x in truths]
 ins = torch.cat(ins, dim=0).permute(0, 2, 3, 1).numpy()
 preds = torch.cat(preds, dim=0).permute(0, 2, 3, 1).numpy()
