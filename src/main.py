@@ -7,9 +7,9 @@ import optuna
 from optuna.trial import TrialState
 import torch
 from torch import nn, optim
-from torch.utils.data import DataLoader, random_split, SubsetRandomSampler
+from torch.utils.data import DataLoader, SubsetRandomSampler
 from torch.utils.tensorboard import SummaryWriter
-from torchmetrics.functional.image import image_gradients, structural_similarity_index_measure
+from torchmetrics.functional.image import structural_similarity_index_measure
 from torchvision import transforms
 from torchinfo import summary
 from sklearn.model_selection import KFold, train_test_split
@@ -101,23 +101,27 @@ cluster_centers = torch.from_numpy(np.load(cluster_path)).float() # (313, 2)
 def compute_ab_prior(dataloader):
     hist = torch.zeros(313, device=device)
     total = 0
-    for L, ab in dataloader:
+    for _, ab in dataloader:
         ab = ab * 255.0 - 128.0
         B, _, H, W = ab.shape
         ab = ab.permute(0, 2, 3, 1).reshape(-1, 2)
-        d2 = ((ab.unsqueeze(1) - cluster_centers.unsqueeze(0)) ** 2).sum(dim=2) # (B*H*W, 313)
+        d2 = torch.cdist(ab, cluster_centers, p=2) ** 2 # (B*H*W, 313)
         labels = d2.argmin(dim=1)
         hist.scatter_add_(0, labels, torch.ones_like(labels, dtype=torch.float32, device=device))
         total += labels.numel()
-        return hist / total # p(c)
+    return hist / total # p(c)
 
 def make_rebalancing_weights(priors, alpha=0.5):
     C = priors.size(0)
-    uniform = torch.ones_like(priors) / C
+    uniform = torch.full_like(priors, 1.0 / C, device=device)
     smoothed = (1.0 - alpha) * uniform + alpha * priors
     weights = 1.0 / smoothed
-    weights /= weights.mean()
-    return weights
+    return weights / weights.mean()
+
+def image_gradients(tensors):
+    dh = tensors[:, :, :, 1:] - tensors[:, :, :, :-1]  # horizontal gradient
+    dv = tensors[:, :, 1:, :] - tensors[:, :, :-1, :]  # vertical gradient
+    return dh, dv
 
 def unstandardize(tensor, mean, std):
     unnorm = transforms.Normalize(mean=[-m/s for m, s in zip(mean, std)], std=[1/s for s in std])
@@ -132,44 +136,33 @@ def lab_to_rgb(x):
     rgb = cv2.cvtColor(lab_cv, cv2.COLOR_LAB2RGB)
     return rgb
 #%%
-class ImageGradientLoss(nn.Module):
-    def __init__(self, weight=None, size_average=True):
-        super(ImageGradientLoss, self).__init__()
-
-    def forward(self, inputs, targets):
-        dh_in, dv_in = image_gradients(inputs) # (B, C, H, W-1), (B, C, H-1, W)
-        dh_tar, dv_tar = image_gradients(targets)
-        dh_comp = (dh_in - dh_tar) ** 2
-        dv_comp = (dv_in - dv_tar) ** 2
-        return dh_comp + dv_comp
-
 class RebalanceLoss(nn.Module):
     def __init__(self, cluster_centers, weights, coeff=0.5):
         super(RebalanceLoss, self).__init__()
         self.register_buffer('cluster_centers', cluster_centers)
         self.register_buffer('weights', weights)
+        self.register_buffer('mean', ab_mean.reshape(1, 2, 1, 1))
+        self.register_buffer('std', ab_std.reshape(1, 2, 1, 1))
         self.coeff = coeff
         self.l2 = nn.MSELoss(reduction='none')  # L2 loss for ab channels
-        self.grad_loss = ImageGradientLoss()  # Gradient loss
 
     def forward(self, inputs, targets):
         B, C, H, W = inputs.shape
-        # TODO: maybe can be optimized using batch unstandardization
-        targets = torch.stack([unstandardize(targets[i], ab_mean, ab_std) for i in range(B)], dim=0)
-        targets = targets * 255.0 - 128.0  # unnormalize to [-128, 127]
-        targets = targets.permute(0, 2, 3, 1).reshape(-1, 2)  # (B*H*W, 2)
-        d2 = ((targets.unsqueeze(1) - self.cluster_centers.unsqueeze(0)) ** 2).sum(dim=2)
+        targets = (targets * self.std + self.mean) * 255.0 - 128.0 # unnormalize to [-128, 127]
+        targets_flat = targets.permute(0, 2, 3, 1).reshape(-1, 2)  # (B*H*W, 2)
+        d2 = torch.cdist(targets_flat, self.cluster_centers, p=2) ** 2  # (B*H*W, 313)
         labels = d2.argmin(dim=1)
-        w = self.weights[labels]
-        w = w.reshape(B, H, W).unsqueeze(1)
+        w = self.weights[labels].reshape(B, 1, H, W)  # (B*H*W,) -> (B, 1, H, W)
         mse_map = self.l2(inputs, targets)
         weighted_mse = (mse_map * w).sum()
-        grad_map = self.grad_loss(inputs, targets)
-        wighted_grad = (grad_map * w).sum()
-        total_pixels = float(B * C * H * W)
-        loss = (self.coeff * weighted_mse + (1 - self.coeff) * wighted_grad) / total_pixels
-        return loss
-
+        dh_i, dv_i = image_gradients(inputs) # (B, C, H, W-1), (B, C, H-1, W)
+        dh_t, dv_t = image_gradients(targets) # (B, C, H, W-1), (B, C, H-1, W)
+        grad_map = (dh_i -dh_t) ** 2 + (dv_i - dv_t) ** 2
+        weighted_grad = w[..., :, :-1]
+        weighted_grad = weighted_grad.expand_as(grad_map)
+        weighted_grad = (grad_map * weighted_grad).sum()
+        total = float(B * C * H * W)
+        return (self.coeff * weighted_mse + (1 - self.coeff) * weighted_grad) / total
 #%% Loss functions
 def save_checkpoint(model, name='checkpoint'):
     torch.save(model.state_dict(), f"../models/{name}.pth")
