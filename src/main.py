@@ -68,6 +68,8 @@ L_train = torch.tensor(L_train, dtype=torch.float32)
 ab_train = torch.tensor(ab_train, dtype=torch.float32)
 L_test = torch.tensor(L_test, dtype=torch.float32)
 ab_test = torch.tensor(ab_test, dtype=torch.float32)
+print(L_train.shape, ab_train.shape)
+print(L_test.shape, ab_test.shape)
 #%%
 L_mean = L_train.mean(dim=(0, 2, 3))
 L_std = L_train.std(dim=(0, 2, 3))
@@ -92,6 +94,83 @@ testset = MyDataset(L_test, ab_test, L_transform=transforms.Normalize(mean=L_mea
                      ab_transform=transforms.Normalize(mean=ab_mean, std=ab_std))
 del L_train, L_test, ab_train, ab_test # release memory
 #%%
+cluster_path = '../data/pts_in_hull.npy'
+assert os.path.exists(cluster_path), "Download pts_in_hull.npy and place next to this script"
+cluster_centers = torch.from_numpy(np.load(cluster_path)).float() # (313, 2)
+
+def compute_ab_prior(dataloader):
+    hist = torch.zeros(313, device=device)
+    total = 0
+    for L, ab in dataloader:
+        ab = ab * 255.0 - 128.0
+        B, _, H, W = ab.shape
+        ab = ab.permute(0, 2, 3, 1).reshape(-1, 2)
+        d2 = ((ab.unsqueeze(1) - cluster_centers.unsqueeze(0)) ** 2).sum(dim=2) # (B*H*W, 313)
+        labels = d2.argmin(dim=1)
+        hist.scatter_add_(0, labels, torch.ones_like(labels, dtype=torch.float32, device=device))
+        total += labels.numel()
+        return hist / total # p(c)
+
+def make_rebalancing_weights(priors, alpha=0.5):
+    C = priors.size(0)
+    uniform = torch.ones_like(priors) / C
+    smoothed = (1.0 - alpha) * uniform + alpha * priors
+    weights = 1.0 / smoothed
+    weights /= weights.mean()
+    return weights
+
+def unstandardize(tensor, mean, std):
+    unnorm = transforms.Normalize(mean=[-m/s for m, s in zip(mean, std)], std=[1/s for s in std])
+    return unnorm(tensor).clamp(0, 1)
+
+def lab_to_rgb(x):
+    lab = x.permute(1, 2, 0).cpu().numpy()
+    L = (lab[:, :, 0] * 255).astype(np.uint8)
+    a = (lab[:, :, 1] * 255).astype(np.uint8)
+    b = (lab[:, :, 2] * 255).astype(np.uint8)
+    lab_cv = np.stack([L, a, b], axis=2)
+    rgb = cv2.cvtColor(lab_cv, cv2.COLOR_LAB2RGB)
+    return rgb
+#%%
+class ImageGradientLoss(nn.Module):
+    def __init__(self, weight=None, size_average=True):
+        super(ImageGradientLoss, self).__init__()
+
+    def forward(self, inputs, targets):
+        dh_in, dv_in = image_gradients(inputs) # (B, C, H, W-1), (B, C, H-1, W)
+        dh_tar, dv_tar = image_gradients(targets)
+        dh_comp = (dh_in - dh_tar) ** 2
+        dv_comp = (dv_in - dv_tar) ** 2
+        return dh_comp + dv_comp
+
+class RebalanceLoss(nn.Module):
+    def __init__(self, cluster_centers, weights, coeff=0.5):
+        super(RebalanceLoss, self).__init__()
+        self.register_buffer('cluster_centers', cluster_centers)
+        self.register_buffer('weights', weights)
+        self.coeff = coeff
+        self.l2 = nn.MSELoss(reduction='none')  # L2 loss for ab channels
+        self.grad_loss = ImageGradientLoss()  # Gradient loss
+
+    def forward(self, inputs, targets):
+        B, C, H, W = inputs.shape
+        # TODO: maybe can be optimized using batch unstandardization
+        targets = torch.stack([unstandardize(targets[i], ab_mean, ab_std) for i in range(B)], dim=0)
+        targets = targets * 255.0 - 128.0  # unnormalize to [-128, 127]
+        targets = targets.permute(0, 2, 3, 1).reshape(-1, 2)  # (B*H*W, 2)
+        d2 = ((targets.unsqueeze(1) - self.cluster_centers.unsqueeze(0)) ** 2).sum(dim=2)
+        labels = d2.argmin(dim=1)
+        w = self.weights[labels]
+        w = w.reshape(B, H, W).unsqueeze(1)
+        mse_map = self.l2(inputs, targets)
+        weighted_mse = (mse_map * w).sum()
+        grad_map = self.grad_loss(inputs, targets)
+        wighted_grad = (grad_map * w).sum()
+        total_pixels = float(B * C * H * W)
+        loss = (self.coeff * weighted_mse + (1 - self.coeff) * wighted_grad) / total_pixels
+        return loss
+
+#%% Loss functions
 def save_checkpoint(model, name='checkpoint'):
     torch.save(model.state_dict(), f"../models/{name}.pth")
 
@@ -112,17 +191,6 @@ class EarlyStopping:
             self.counter += 1
             if self.counter >= self.patience:
                 self.early_stop = True
-#%% Loss functions
-class ImageGradientLoss(nn.Module):
-    def __init__(self, weight=None, size_average=True):
-        super(ImageGradientLoss, self).__init__()
-
-    def forward(self, inputs, targets):
-        dh_in, dv_in = image_gradients(inputs) # (B, C, H, W-1), (B, C, H-1, W)
-        dh_tar, dv_tar = image_gradients(targets)
-        dh_comp = (dh_in - dh_tar) ** 2
-        dv_comp = (dv_in - dv_tar) ** 2
-        return (dh_comp + dv_comp).sum()
 
 def compute_pcc(pred, targets):
     pred_flat = pred.reshape(pred.size(0), -1)
@@ -133,7 +201,7 @@ def compute_pcc(pred, targets):
     denominator = torch.sqrt((vx**2).sum(dim=1) * (vy**2).sum(dim=1)) # standard deviation
     return (numerator / denominator).mean()
 
-def fit(net, trainloader, optimizer, loss_fn1=nn.MSELoss(reduction='sum'), loss_fn2=ImageGradientLoss(), coeff=0.5):
+def fit(net, trainloader, optimizer, loss_fn):
     net.train()
     total_loss, total_rmse, total_psnr, total_ssim, total_pcc, count = 0, 0, 0, 0, 0, 0
     for L, ab in trainloader:
@@ -141,25 +209,23 @@ def fit(net, trainloader, optimizer, loss_fn1=nn.MSELoss(reduction='sum'), loss_
         optimizer.zero_grad()
         with torch.cuda.amp.autocast():
             out = net(L)
-            numel = ab.numel()
-            loss1, loss2 = loss_fn1(out, ab), loss_fn2(out, ab)
-            loss = (coeff * loss1 + (1-coeff) * loss2) / numel
+            loss = loss_fn(out, ab)
         scaler.scale(loss).backward()
         scaler.step(optimizer)
         scaler.update()
         total_loss += loss.item()
         count += len(ab)
         with torch.no_grad():
-            batch_rmse = torch.sqrt(loss1 / numel)
+            batch_rmse = torch.sqrt(nn.MSELoss()(out, ab))
             batch_psnr = (20 * torch.log10(1.0 / batch_rmse))
             total_rmse += batch_rmse.item() * len(ab)
             total_psnr += batch_psnr.item() * len(ab)
             total_ssim += structural_similarity_index_measure(out, ab).item() * len(ab)
             total_pcc += compute_pcc(out, ab).item() * len(ab)
-        del out, L, ab, loss1, loss2, loss
+        del out, L, ab, loss
     return total_loss / count, total_rmse / count, total_psnr / count, total_ssim / count, total_pcc / count
 
-def predict(net, testloader, loss_fn1=nn.MSELoss(reduction='sum'), loss_fn2=ImageGradientLoss(), coeff=0.5):
+def predict(net, testloader, loss_fn):
     net.eval()
     total_loss, total_rmse, total_psnr, total_ssim, total_pcc, count = 0, 0, 0, 0, 0, 0
     ins, preds, truths = [], [], []
@@ -171,18 +237,15 @@ def predict(net, testloader, loss_fn1=nn.MSELoss(reduction='sum'), loss_fn2=Imag
                 ins.append(L.cpu())
                 preds.append(out.cpu())
                 truths.append(ab.cpu())
-                numel = out.numel()
-                loss1, loss2 = loss_fn1(out, ab), loss_fn2(out, ab)
-                loss = (coeff * loss1 + (1 - coeff) * loss2) / numel
-            total_loss += loss.item()
+            total_loss += loss_fn(out, ab).item()
             count += len(ab)
-            batch_rmse = torch.sqrt(loss1 / numel)
+            batch_rmse = torch.sqrt(nn.MSELoss()(out, ab))
             batch_psnr = (20 * torch.log10(1.0 / batch_rmse))
             total_rmse += batch_rmse.item() * len(ab)
             total_psnr += batch_psnr.item() * len(ab)
             total_ssim += structural_similarity_index_measure(out, ab).item() * len(ab)
             total_pcc += compute_pcc(out, ab).item() * len(ab)
-            del out, L, ab, loss1, loss2, loss
+            del out, L, ab
     return ins, preds, truths, total_loss / count, total_rmse / count, total_psnr / count, total_ssim / count, total_pcc / count
 #%%
 def objective(trial, trainset, X):
@@ -203,9 +266,12 @@ def objective(trial, trainset, X):
         net = Net().to(device)
         optimizer = optim.Adam(net.parameters(), lr=lr)
         scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.05, patience=2)
+        prior = compute_ab_prior(trainloader)
+        weights = make_rebalancing_weights(prior, alpha=0.5)
+        criterion = RebalanceLoss(cluster_centers, weights, coeff=coeff)
         for epoch in range(50):
-            train_loss, train_rmse, train_psnr, train_ssim, train_pcc = fit(net, trainloader, optimizer, coeff=coeff)
-            ins, preds, truths, val_loss, val_rmse, val_psnr, val_ssim, val_pcc = predict(net, valloader, coeff=coeff)
+            train_loss, train_rmse, train_psnr, train_ssim, train_pcc = fit(net, trainloader, optimizer, criterion)
+            ins, preds, truths, val_loss, val_rmse, val_psnr, val_ssim, val_pcc = predict(net, valloader, criterion)
             del ins, preds, truths
             scheduler.step(val_ssim)
             prog_bar.set_description(
@@ -293,7 +359,8 @@ for key, value in trial.params.items():
 # %matplotlib notebook
 
 def update_plot():
-    line1.set_data(range(len(test_losses)), test_losses)
+    line1.set_data(range(len(train_losses)), train_losses)
+    line2.set_data(range(len(test_losses)), test_losses)
     ax.relim()
     ax.autoscale_view()
     fig.canvas.draw()
@@ -302,6 +369,9 @@ trainloader = DataLoader(trainset, batch_size=trial.params['batch_size'], shuffl
 testloader = DataLoader(testset, batch_size=trial.params['batch_size'], shuffle=False, num_workers=4, pin_memory=True, prefetch_factor=2)
 optimizer = optim.Adam(net.parameters(), lr=trial.params['lr'])
 scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.05, patience=2)
+prior = compute_ab_prior(trainloader)
+weights = make_rebalancing_weights(prior, alpha=0.5)
+criterion = RebalanceLoss(cluster_centers, weights, coeff=trial.params['coeff'])
 early_stopping = EarlyStopping()
 train_RMSEs, train_PSNRs, train_SSIMs, train_PCCs, train_losses = [], [], [], [], []
 test_RMSEs, test_PSNRs, test_SSIMs, test_PCCs, test_losses = [], [], [], [], []
@@ -309,19 +379,20 @@ last_checkpoint = None
 prog_bar = tqdm(range(50), total=50, desc='Training', position=0)
 
 fig, ax = plt.subplots()
-line1, = ax.plot([], [], label='Test Loss')
+line1, = ax.plot([], [], label='Train Loss')
+line2, = ax.plot([], [], label='Test Loss')
 ax.legend()
 
 torch.cuda.empty_cache()
 scaler = torch.cuda.amp.GradScaler()
 for epoch in prog_bar:
-    train_loss, train_RMSE, train_PSNR, train_SSIM, train_PCC = fit(net, trainloader, optimizer, coeff=trial.params['coeff'])
+    train_loss, train_RMSE, train_PSNR, train_SSIM, train_PCC = fit(net, trainloader, optimizer, criterion)
     train_losses.append(train_loss)
     train_RMSEs.append(train_RMSE)
     train_PSNRs.append(train_PSNR)
     train_SSIMs.append(train_SSIM)
     train_PCCs.append(train_PCC)
-    ins, preds, truths, test_loss, test_RMSE, test_PSNR, test_SSIM, test_PCC = predict(net, testloader, coeff=trial.params['coeff'])
+    ins, preds, truths, test_loss, test_RMSE, test_PSNR, test_SSIM, test_PCC = predict(net, testloader, criterion)
     del ins, preds, truths
     test_losses.append(test_loss)
     test_RMSEs.append(test_RMSE)
@@ -349,19 +420,6 @@ net.load_state_dict(torch.load('../models/checkpoint.pth'))
 ins, preds, truths, test_loss, test_RMSE, test_PSNR, test_SSIM, test_PCC = predict(net, testloader)
 net.load_state_dict(torch.load('../models/lastcheck.pth'))
 ins2, preds2, truths2, loss2, rmse2, psnr2, ssim2, pcc2 = predict(net, testloader)
-#%%
-def unstandardize(tensor, mean, std):
-    unnorm = transforms.Normalize(mean=[-m/s for m, s in zip(mean, std)], std=[1/s for s in std])
-    return unnorm(tensor).clamp(0, 1)
-
-def lab_to_rgb(x):
-    lab = x.permute(1, 2, 0).cpu().numpy()
-    L = (lab[:, :, 0] * 255).astype(np.uint8)
-    a = (lab[:, :, 1] * 255).astype(np.uint8)
-    b = (lab[:, :, 2] * 255).astype(np.uint8)
-    lab_cv = np.stack([L, a, b], axis=2)
-    rgb = cv2.cvtColor(lab_cv, cv2.COLOR_LAB2RGB)
-    return rgb
 #%%
 ins = torch.cat(ins, dim=0)
 preds = torch.cat(preds, dim=0)
