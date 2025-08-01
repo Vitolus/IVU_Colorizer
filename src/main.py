@@ -9,7 +9,6 @@ import torch
 from torch import nn, optim
 from torch.utils.data import DataLoader, SubsetRandomSampler
 from torch.utils.tensorboard import SummaryWriter
-from torchmetrics.functional.image import structural_similarity_index_measure
 from torchvision import transforms
 from torchinfo import summary
 from sklearn.model_selection import KFold, train_test_split
@@ -34,8 +33,8 @@ for file in tqdm(folder, desc='Loading color images'):
     img = cv2.imread(os.path.join(path, file), 1)
     img = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
     img = cv2.resize(img, (SIZE, SIZE))
-    L = img[:, :, 0:1] / 255.0 # (H, W, 1)
-    ab = img[:, :, 1:3] / 255.0 # (H, W, 2)
+    L = img[:, :, 0:1] / 255.0 # (H, W, 1) [0..1]
+    ab = img[:, :, 1:3] / 255.0 # (H, W, 2) [0..1]
     input_L.append(L)
     target_ab.append(ab)
 input_L = np.array(input_L).astype(np.float32) # (N, H, W, 1)
@@ -62,7 +61,7 @@ for _ in range(5):
 #%%
 input_L = np.transpose(input_L, (0, 3, 1, 2)) # (N, 1, H, W)
 target_ab = np.transpose(target_ab, (0, 3, 1, 2)) # (N, 2, H, W)
-L_train, L_test, ab_train, ab_test = train_test_split(input_L, target_ab, train_size=6000, random_state=42)
+L_train, L_test, ab_train, ab_test = train_test_split(input_L, target_ab, test_size=0.2, random_state=42)
 L_train = torch.tensor(L_train, dtype=torch.float32)
 ab_train = torch.tensor(ab_train, dtype=torch.float32)
 L_test = torch.tensor(L_test, dtype=torch.float32)
@@ -70,10 +69,10 @@ ab_test = torch.tensor(ab_test, dtype=torch.float32)
 print(L_train.shape, ab_train.shape)
 print(L_test.shape, ab_test.shape)
 #%%
-L_mean = L_train.mean(dim=(0, 2, 3))
-L_std = L_train.std(dim=(0, 2, 3))
-ab_mean = ab_train.mean(dim=(0, 2, 3))
-ab_std = ab_train.std(dim=(0, 2, 3))
+L_mean = L_train.mean(dim=(0, 2, 3)).to(device)
+L_std = L_train.std(dim=(0, 2, 3)).to(device)
+ab_mean = ab_train.mean(dim=(0, 2, 3)).to(device)
+ab_std = ab_train.std(dim=(0, 2, 3)).to(device)
 print(L_mean, L_std)
 print(ab_mean, ab_std)
 #%%
@@ -95,24 +94,35 @@ del L_train, L_test, ab_train, ab_test # release memory
 #%%
 cluster_path = '../data/pts_in_hull.npy'
 assert os.path.exists(cluster_path), "Download pts_in_hull.npy and place next to this script"
-cluster_centers = torch.from_numpy(np.load(cluster_path)).float() # (313, 2)
+cluster_centers = torch.from_numpy(np.load(cluster_path)).float().to(device) # (313, 2) [-128..127]
 cc_l2 = (cluster_centers ** 2).sum(dim=1) # (313,)
-lut_coords  = ((torch.stack(torch.meshgrid(torch.arange(256), torch.arange(256)), -1).float()) - 128.0).reshape(-1, 2) # (65536, 2)
-d2 = (lut_coords ** 2).sum(dim=1, keepdim=True) + cc_l2.reshape(1, -1) - torch.matmul(2 * lut_coords, cluster_centers.t())
-lut = d2.argmin(1) # (65536,)
+lut_coords  = (((torch.stack(torch.meshgrid(torch.arange(256), torch.arange(256)), dim=-1).float()) - 128.0)
+               .reshape(-1, 2).to(device)) # (65536, 2) [-128..127]
+
+def compute_dist(tensor):
+    dists = ((tensor ** 2).sum(dim=1, keepdim=True) # (B*H*W, 1)
+             + cc_l2.reshape(1, -1) # (1, 313)
+             - 2 * torch.matmul(tensor, cluster_centers.t())) # (B*H*W, 313)
+    return dists
+
+dists = compute_dist(lut_coords)
+lut = torch.argmin(dists, dim=1).long().to(device) # (65536,) [0..312] LUT for mapping (a, b) to cluster index
 #%%
+def unstandardize(tensor, mean, std):
+    og_shape = tensor.shape
+    C, H, W = og_shape[-3:]
+    tensor = (tensor.reshape(-1, C, H, W) * std.reshape(1, C, 1, 1) + mean.reshape(1, C, 1, 1)).clamp(0, 1)  # unnormalize to [0, 1]
+    return tensor.reshape(og_shape)  # restore original shape
+
 def compute_ab_prior(dataloader):
     hist = torch.zeros(313, device=device)
     total = 0
     for _, ab in dataloader:
-        ab = ab.to(device)
-        ab = ab * 255.0 - 128.0
+        ab = unstandardize(ab, ab_mean, ab_std) * 255 - 128 # (B, 2, H, W) [-128..127]
         B, _, H, W = ab.shape
-        ab = ab.permute(0, 2, 3, 1).reshape(-1, 2)
-        ab_l2 = (ab ** 2).sum(dim=1, keepdim=True)  # (B*H*W, 1)
-        cross = torch.matmul(ab, cluster_centers.t())  # (B*H*W, 313)
-        d2 = ab_l2 + cc_l2 - 2 * cross  # (B*H*W, 313)
-        labels = d2.argmin(dim=1)
+        ab = ab.permute(0, 2, 3, 1).reshape(-1, 2) # (B*H*W, 2) [-128..127]
+        dists = compute_dist(ab)
+        labels = dists.argmin(dim=1)
         hist += torch.bincount(labels, minlength=313).to(device)  # accumulate histogram
         total += labels.numel()
     return hist / total # p(c)
@@ -121,23 +131,14 @@ def make_rebalancing_weights(priors, alpha=0.5):
     C = priors.size(0)
     uniform = torch.full_like(priors, 1.0 / C, device=device)
     smoothed = (1.0 - alpha) * uniform + alpha * priors
-    weights = 1.0 / smoothed
+    weights = 1.0 / smoothed # inverse of smoothed priors (Cross entropies) [0..inf]
     return weights / weights.mean()
 
-def image_gradients(tensors):
-    dh = tensors[:, :, :, 1:] - tensors[:, :, :, :-1]  # horizontal gradient
-    dv = tensors[:, :, 1:, :] - tensors[:, :, :-1, :]  # vertical gradient
-    return dh, dv
-
-def unstandardize(tensor, mean, std):
-    unnorm = transforms.Normalize(mean=[-m/s for m, s in zip(mean, std)], std=[1/s for s in std])
-    return unnorm(tensor).clamp(0, 1)
-
 def lab_to_rgb(x):
-    lab = x.permute(1, 2, 0).cpu().numpy()
-    L = (lab[:, :, 0] * 255).astype(np.uint8)
-    a = (lab[:, :, 1] * 255).astype(np.uint8)
-    b = (lab[:, :, 2] * 255).astype(np.uint8)
+    lab = x.permute(1, 2, 0)
+    L = (lab[:, :, 0] * 255).cpu().numpy().astype(np.uint8)
+    a = (lab[:, :, 1] * 255).cpu().numpy().astype(np.uint8)
+    b = (lab[:, :, 2] * 255).cpu().numpy().astype(np.uint8)
     lab_cv = np.stack([L, a, b], axis=2)
     rgb = cv2.cvtColor(lab_cv, cv2.COLOR_LAB2RGB)
     return rgb
@@ -164,88 +165,68 @@ class EarlyStopping:
                 self.early_stop = True
 #%% Loss functions
 class RebalanceLoss(nn.Module):
-    def __init__(self, weight_lut, coeff=0.5):
+    def __init__(self, lut, weights):
         super(RebalanceLoss, self).__init__()
-        self.register_buffer('weight_lut', weight_lut)
-        self.register_buffer('mean', ab_mean.reshape(1, 2, 1, 1))
-        self.register_buffer('std', ab_std.reshape(1, 2, 1, 1))
-        self.coeff = coeff
-        self.l2 = nn.MSELoss(reduction='none')  # L2 loss for ab channels
+        self.register_buffer('lut', lut)
+        self.register_buffer('class_weights', weights)
+        self.register_buffer('mean', ab_mean)
+        self.register_buffer('std', ab_std)
 
-    def forward(self, inputs, targets):
-        B, C, H, W = inputs.shape
-        targets = (targets * self.std + self.mean) * 255.0 - 128.0 # unnormalize to [-128, 127]
-        a = (targets[:, 0, :, :].long() + 128.0)
-        b = (targets[:, 1, :, :].long() + 128.0)
+    def forward(self, preds, targets):
+        B, C, H, W = preds.shape
+        assert C == 313, "Input channels must be 313 for the classifier"
+        assert preds.shape == targets.shape, "preds and targets must have the same shape"
+        targets = unstandardize(targets, self.mean, self.std) * 255.0 - 128.0 # unnormalize to [-128, 127]
+        a = (targets[:, 0, :, :].long() + 128) # quantized channel (B, H, W)
+        b = (targets[:, 1, :, :].long() + 128)
         idx = a * 256 + b  # (B, H, W)
-        weight = self.weight_lut[idx].reshape(B, 1, H, W)  # (B*H*W) -> (B, H, W) -> (B, 1, H, W)
-        mse_map = self.l2(inputs, targets)
-        weighted_mse = (mse_map * weight).sum()
-        dh_i, dv_i = image_gradients(inputs) # (B, C, H, W-1), (B, C, H-1, W)
-        dh_t, dv_t = image_gradients(targets) # (B, C, H, W-1), (B, C, H-1, W)
-        weighted_h = weight[..., :, :-1]
-        weighted_v = weight[..., :-1, :]
-        grad_h = ((dh_i - dh_t) ** 2 * weighted_h.expand_as(dh_i)).sum()
-        grad_v = ((dv_i - dv_t) ** 2 * weighted_v.expand_as(dv_i)).sum()
-        weighted_grad = grad_h + grad_v
-        return (self.coeff * weighted_mse + (1 - self.coeff) * weighted_grad) / float(B * C * H * W)
+        labels = self.lut[idx]  # (B, H, W)
+        loss = nn.CrossEntropyLoss(weight=self.class_weights, reduction='mean')
+        return loss(preds, labels), labels
 #%%
-def compute_pcc(pred, targets):
-    pred_flat = pred.reshape(pred.size(0), -1)
-    target_flat = targets.reshape(targets.size(0), -1)
-    vx = pred_flat - pred_flat.mean(dim=1, keepdim=True)
-    vy = target_flat - target_flat.mean(dim=1, keepdim=True)
-    numerator = (vx * vy).sum(dim=1) # covariance
-    denominator = torch.sqrt((vx**2).sum(dim=1) * (vy**2).sum(dim=1)) # standard deviation
-    return (numerator / denominator).mean()
-
 def fit(net, trainloader, optimizer, loss_fn):
     net.train()
-    total_loss, total_rmse, total_psnr, total_ssim, total_pcc, count = 0, 0, 0, 0, 0, 0
+    total_loss, total_acc, total_topk_acc, count = 0, 0, 0, 0
     for L, ab in trainloader:
         L, ab = L.to(device), ab.to(device)
         optimizer.zero_grad()
         with torch.cuda.amp.autocast():
             out = net(L)
-            loss = loss_fn(out, ab)
+            loss, labels = loss_fn(out, ab)
         scaler.scale(loss).backward()
         scaler.step(optimizer)
         scaler.update()
         total_loss += loss.item()
-        count += len(ab)
         with torch.no_grad():
-            batch_rmse = torch.sqrt(nn.MSELoss()(out, ab))
-            batch_psnr = (20 * torch.log10(1.0 / batch_rmse))
-            total_rmse += batch_rmse.item() * len(ab)
-            total_psnr += batch_psnr.item() * len(ab)
-            total_ssim += structural_similarity_index_measure(out, ab).item() * len(ab)
-            total_pcc += compute_pcc(out, ab).item() * len(ab)
+            topk = out.topk(3, dim=1).indices  # (B, 3)
+            total_topk_acc += (topk == labels.unsqueeze(1)).any(dim=1).sum().item()
+            total_acc += (out.argmax(dim=1) == labels).sum().item()
+            count += labels.numel()
         del out, L, ab, loss
-    return total_loss / count, total_rmse / count, total_psnr / count, total_ssim / count, total_pcc / count
+    return total_loss / count, total_acc / count, total_topk_acc / count
 
 def predict(net, testloader, loss_fn):
     net.eval()
-    total_loss, total_rmse, total_psnr, total_ssim, total_pcc, count = 0, 0, 0, 0, 0, 0
+    total_loss, total_acc, total_topk_acc, count = 0, 0, 0, 0
     ins, preds, truths = [], [], []
     with torch.no_grad():
         for L, ab in testloader:
             L, ab = L.to(device), ab.to(device)
             with torch.cuda.amp.autocast():
                 out = net(L)
+                loss, labels = loss_fn(out, ab)
                 ins.append(L.cpu())
-                preds.append(out.cpu())
+                preds.append(ab_pred.cpu())
                 truths.append(ab.cpu())
             total_loss += loss_fn(out, ab).item()
-            count += len(ab)
-            batch_rmse = torch.sqrt(nn.MSELoss()(out, ab))
-            batch_psnr = (20 * torch.log10(1.0 / batch_rmse))
-            total_rmse += batch_rmse.item() * len(ab)
-            total_psnr += batch_psnr.item() * len(ab)
-            total_ssim += structural_similarity_index_measure(out, ab).item() * len(ab)
-            total_pcc += compute_pcc(out, ab).item() * len(ab)
+            topk = out.topk(3, dim=1).indices  # (B, 3)
+            total_topk_acc += (topk == labels.unsqueeze(1)).any(dim=1).sum().item()
+            total_acc += (out.argmax(dim=1) == labels).sum().item()
+            count += labels.numel()
             del out, L, ab
-    return ins, preds, truths, total_loss / count, total_rmse / count, total_psnr / count, total_ssim / count, total_pcc / count
+    return ins, preds, truths, total_loss / count, total_acc / count, total_topk_acc / count
 #%%
+# TODO: missing fix with new logic
 def objective(trial, trainset, X):
     lr = trial.suggest_float('lr', 1e-5, 1e-1, log=True)
     batch_size = trial.suggest_categorical('batch_size', [64,256, 512, 1024])
@@ -262,17 +243,16 @@ def objective(trial, trainset, X):
         valloader = DataLoader(trainset, batch_size=batch_size, sampler=SubsetRandomSampler(val_idx), num_workers=4, pin_memory=True, prefetch_factor=2)
         prior = compute_ab_prior(trainloader)
         weights = make_rebalancing_weights(prior, alpha=0.5)
-        weight_lut = weights[lut].to(device)  # (65536,)
-        criterion = RebalanceLoss(weight_lut, coeff=coeff)
-        del train_idx, val_idx, prior, weights, weight_lut
+        criterion = RebalanceLoss(lut, weights)
+        del train_idx, val_idx, prior, weights
         net = Net().to(device)
         optimizer = optim.Adam(net.parameters(), lr=lr)
-        scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.05, patience=2)
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5)
         for epoch in range(50):
             train_loss, train_rmse, train_psnr, train_ssim, train_pcc = fit(net, trainloader, optimizer, criterion)
             ins, preds, truths, val_loss, val_rmse, val_psnr, val_ssim, val_pcc = predict(net, valloader, criterion)
             del ins, preds, truths
-            scheduler.step(val_ssim)
+            scheduler.step(val_loss)
             prog_bar.set_description(
                 f"Split {split_n} - Epoch {epoch + 1} |\nlr={lr:.3e}, batch size={batch_size:.3e}, coeff={coeff:.3e} |\n"
                 f"Metrics train/val: RMSE={train_rmse:.3e}/{val_rmse:.3e}, "
@@ -307,7 +287,7 @@ class Net(nn.Module):
         self.bnorm2 = nn.BatchNorm2d(512)
         self.dropout = nn.Dropout(0.2)
         self.lrelu = nn.LeakyReLU()
-        self.final = nn.Conv2d(3, 2, 1, 1)  # concat u5 + x = (2+1)=3 → 2 (ab)
+        self.classifier = nn.Conv2d(3, 313, 1, 1)  # concat u5 + x = (2+1)=3 -> 313 channels
 
     def forward(self, x): # x is (B, 1, H, W) => L channel
         d1 = self.lrelu(self.conv1(x)) # (B, 128, 80, 80)
@@ -325,8 +305,8 @@ class Net(nn.Module):
         u4 = torch.cat([u4, d1], dim=1) # (B, 256, 80, 80)
         u5 = self.lrelu(self.convt5(u4)) # (B, 2, 160, 160) — ab prediction
         u5 = torch.cat([u5, x], dim=1) # (B, 3, 160, 160)
-        x = self.final(u5) # (B, 2, 160, 160)
-        return x # predicted ab
+        x = self.final(u5) # (B, 313, 160, 160)
+        return x
 #%%
 writer = SummaryWriter('../runs')
 net = Net().to(device)
@@ -358,16 +338,11 @@ for key, value in trial.params.items():
 trainloader = DataLoader(trainset, batch_size=trial.params['batch_size'], shuffle=True, num_workers=4, pin_memory=True, prefetch_factor=2)
 testloader = DataLoader(testset, batch_size=trial.params['batch_size'], shuffle=False, num_workers=4, pin_memory=True, prefetch_factor=2)
 optimizer = optim.Adam(net.parameters(), lr=trial.params['lr'])
-scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.05, patience=5)
+scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5)
 prior = compute_ab_prior(trainloader)
 weights = make_rebalancing_weights(prior, alpha=0.5)
-weight_lut = weights[lut].to(device) # (65536,)
-criterion = RebalanceLoss(weight_lut, coeff=trial.params['coeff'])
-del cluster_centers, cc_l2, lut_coords, d2, lut, prior, weights
-early_stopping = EarlyStopping()
-train_RMSEs, train_PSNRs, train_SSIMs, train_PCCs, train_losses = [], [], [], [], []
-test_RMSEs, test_PSNRs, test_SSIMs, test_PCCs, test_losses = [], [], [], [], []
-last_checkpoint = None
+criterion = RebalanceLoss(lut, weights)
+del prior
 #%%
 # %matplotlib notebook
 
@@ -378,6 +353,11 @@ def update_plot():
     ax.autoscale_view()
     fig.canvas.draw()
 #%%
+# TODO: missing fix with new logic
+early_stopping = EarlyStopping()
+train_RMSEs, train_PSNRs, train_SSIMs, train_PCCs, train_losses = [], [], [], [], []
+test_RMSEs, test_PSNRs, test_SSIMs, test_PCCs, test_losses = [], [], [], [], []
+last_checkpoint = None
 prog_bar = tqdm(range(50), total=50, desc='Training', position=0)
 
 fig, ax = plt.subplots()
@@ -401,7 +381,7 @@ for epoch in prog_bar:
     test_PSNRs.append(test_PSNR)
     test_SSIMs.append(test_SSIM)
     test_PCCs.append(test_PCC)
-    scheduler.step(test_SSIM)
+    scheduler.step(test_loss)
     early_stopping(test_loss, net)
     current_lr = optimizer.param_groups[0]['lr']
     prog_bar.set_description(f"Epoch {epoch + 1} | lr={current_lr:.3e} |\n"
@@ -428,10 +408,10 @@ class ModelWithLoss(nn.Module):
         preds = self.net(x)
         return self.loss_fn(preds, y)
 #%% final evaluation
+# TODO: correct the manipulation of preds, now are labels not ab channels
 net.load_state_dict(torch.load('../models/checkpoint.pth'))
 ins, preds, truths, test_loss, test_RMSE, test_PSNR, test_SSIM, test_PCC = predict(net, testloader, criterion)
-net_script = ModelWithLoss(net, RebalanceLoss(weight_lut, coeff=0.5))
-del weight_lut
+net_script = ModelWithLoss(net, RebalanceLoss(lut, weights))
 net_script = torch.jit.script(net_script)
 net_script.save("model_and_loss.pt")
 net.load_state_dict(torch.load('../models/lastcheck.pth'))
