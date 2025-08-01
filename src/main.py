@@ -97,17 +97,24 @@ del L_train, L_test, ab_train, ab_test # release memory
 cluster_path = '../data/pts_in_hull.npy'
 assert os.path.exists(cluster_path), "Download pts_in_hull.npy and place next to this script"
 cluster_centers = torch.from_numpy(np.load(cluster_path)).float() # (313, 2)
+cc_l2 = (cluster_centers ** 2).sum(dim=1) # (313,)
+lut_coords  = ((torch.stack(torch.meshgrid(torch.arange(256), torch.arange(256)), -1).float()) - 128.0).reshape(-1, 2) # (65536, 2)
+d2 = (lut_coords ** 2).sum(dim=1, keepdim=True) + cc_l2.reshape(1, -1) - torch.matmult(2 * lut_coords, cluster_centers.t())
+lut = d2.argmin(1) # (65536,)
 
 def compute_ab_prior(dataloader):
     hist = torch.zeros(313, device=device)
     total = 0
     for _, ab in dataloader:
+        ab = ab.to(device)
         ab = ab * 255.0 - 128.0
         B, _, H, W = ab.shape
         ab = ab.permute(0, 2, 3, 1).reshape(-1, 2)
-        d2 = torch.cdist(ab, cluster_centers, p=2) ** 2 # (B*H*W, 313)
+        ab_l2 = (ab ** 2).sum(dim=1, keepdim=True)  # (B*H*W, 1)
+        cross = torch.matmul(ab, cluster_centers.t())  # (B*H*W, 313)
+        d2 = ab_l2 + cc_l2 - 2 * cross  # (B*H*W, 313)
         labels = d2.argmin(dim=1)
-        hist.scatter_add_(0, labels, torch.ones_like(labels, dtype=torch.float32, device=device))
+        hist += torch.bincount(labels, minlength=313).to(device)  # accumulate histogram
         total += labels.numel()
     return hist / total # p(c)
 
@@ -136,11 +143,11 @@ def lab_to_rgb(x):
     rgb = cv2.cvtColor(lab_cv, cv2.COLOR_LAB2RGB)
     return rgb
 #%%
+@torch.jit.script
 class RebalanceLoss(nn.Module):
-    def __init__(self, cluster_centers, weights, coeff=0.5):
+    def __init__(self, weight_lut, coeff=0.5):
         super(RebalanceLoss, self).__init__()
-        self.register_buffer('cluster_centers', cluster_centers)
-        self.register_buffer('weights', weights)
+        self.register_buffer('weight_lut', weight_lut)
         self.register_buffer('mean', ab_mean.reshape(1, 2, 1, 1))
         self.register_buffer('std', ab_std.reshape(1, 2, 1, 1))
         self.coeff = coeff
@@ -149,20 +156,20 @@ class RebalanceLoss(nn.Module):
     def forward(self, inputs, targets):
         B, C, H, W = inputs.shape
         targets = (targets * self.std + self.mean) * 255.0 - 128.0 # unnormalize to [-128, 127]
-        targets_flat = targets.permute(0, 2, 3, 1).reshape(-1, 2)  # (B*H*W, 2)
-        d2 = torch.cdist(targets_flat, self.cluster_centers, p=2) ** 2  # (B*H*W, 313)
-        labels = d2.argmin(dim=1)
-        w = self.weights[labels].reshape(B, 1, H, W)  # (B*H*W,) -> (B, 1, H, W)
+        a = (targets[:, 0, :, :].long() + 128.0)
+        b = (targets[:, 1, :, :].long() + 128.0)
+        idx = a * 256 + b  # (B, H, W)
+        weight = self.weight_lut[idx].reshape(B, 1, H, W)  # (B*H*W) -> (B, H, W) -> (B, 1, H, W)
         mse_map = self.l2(inputs, targets)
-        weighted_mse = (mse_map * w).sum()
+        weighted_mse = (mse_map * weight).sum()
         dh_i, dv_i = image_gradients(inputs) # (B, C, H, W-1), (B, C, H-1, W)
         dh_t, dv_t = image_gradients(targets) # (B, C, H, W-1), (B, C, H-1, W)
-        grad_map = (dh_i -dh_t) ** 2 + (dv_i - dv_t) ** 2
-        weighted_grad = w[..., :, :-1]
-        weighted_grad = weighted_grad.expand_as(grad_map)
-        weighted_grad = (grad_map * weighted_grad).sum()
-        total = float(B * C * H * W)
-        return (self.coeff * weighted_mse + (1 - self.coeff) * weighted_grad) / total
+        weighted_h = weight[..., :, :-1]
+        weighted_v = weight[..., :-1, :]
+        grad_h = ((dh_i - dh_t) ** 2 * weighted_h.expand_as(dh_i)).sum()
+        grad_v = ((dv_i - dv_t) ** 2 * weighted_v.expand_as(dv_i)).sum()
+        weighted_grad = grad_h + grad_v
+        return (self.coeff * weighted_mse + (1 - self.coeff) * weighted_grad) / float(B * C * H * W)
 #%% Loss functions
 def save_checkpoint(model, name='checkpoint'):
     torch.save(model.state_dict(), f"../models/{name}.pth")
@@ -349,6 +356,20 @@ print("  Params: ")
 for key, value in trial.params.items():
     print("    {}: {}".format(key, value))
 #%%
+trainloader = DataLoader(trainset, batch_size=trial.params['batch_size'], shuffle=True, num_workers=4, pin_memory=True, prefetch_factor=2)
+testloader = DataLoader(testset, batch_size=trial.params['batch_size'], shuffle=False, num_workers=4, pin_memory=True, prefetch_factor=2)
+optimizer = optim.Adam(net.parameters(), lr=trial.params['lr'])
+scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.05, patience=5)
+prior = compute_ab_prior(trainloader)
+weights = make_rebalancing_weights(prior, alpha=0.5)
+weight_lut = weights[lut].to(device) # (65536,)
+criterion = RebalanceLoss(weight_lut, coeff=trial.params['coeff'])
+del cluster_centers, cc_l2, lut_coords, d2, lut, prior, weights, weight_lut
+early_stopping = EarlyStopping()
+train_RMSEs, train_PSNRs, train_SSIMs, train_PCCs, train_losses = [], [], [], [], []
+test_RMSEs, test_PSNRs, test_SSIMs, test_PCCs, test_losses = [], [], [], [], []
+last_checkpoint = None
+#%%
 # %matplotlib notebook
 
 def update_plot():
@@ -358,17 +379,6 @@ def update_plot():
     ax.autoscale_view()
     fig.canvas.draw()
 #%%
-trainloader = DataLoader(trainset, batch_size=trial.params['batch_size'], shuffle=True, num_workers=4, pin_memory=True, prefetch_factor=2)
-testloader = DataLoader(testset, batch_size=trial.params['batch_size'], shuffle=False, num_workers=4, pin_memory=True, prefetch_factor=2)
-optimizer = optim.Adam(net.parameters(), lr=trial.params['lr'])
-scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.05, patience=2)
-prior = compute_ab_prior(trainloader)
-weights = make_rebalancing_weights(prior, alpha=0.5)
-criterion = RebalanceLoss(cluster_centers, weights, coeff=trial.params['coeff'])
-early_stopping = EarlyStopping()
-train_RMSEs, train_PSNRs, train_SSIMs, train_PCCs, train_losses = [], [], [], [], []
-test_RMSEs, test_PSNRs, test_SSIMs, test_PCCs, test_losses = [], [], [], [], []
-last_checkpoint = None
 prog_bar = tqdm(range(50), total=50, desc='Training', position=0)
 
 fig, ax = plt.subplots()
