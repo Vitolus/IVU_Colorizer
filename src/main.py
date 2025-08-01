@@ -16,7 +16,6 @@ from sklearn.model_selection import KFold, train_test_split
 import numpy as np
 import matplotlib.pyplot as plt
 #%%
-path = '../data'
 SIZE = 160
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 print("Using device: ", device)
@@ -63,7 +62,7 @@ for _ in range(5):
 #%%
 input_L = np.transpose(input_L, (0, 3, 1, 2)) # (N, 1, H, W)
 target_ab = np.transpose(target_ab, (0, 3, 1, 2)) # (N, 2, H, W)
-L_train, L_test, ab_train, ab_test = train_test_split(input_L, target_ab, test_size=0.2, random_state=42)
+L_train, L_test, ab_train, ab_test = train_test_split(input_L, target_ab, train_size=6000, random_state=42)
 L_train = torch.tensor(L_train, dtype=torch.float32)
 ab_train = torch.tensor(ab_train, dtype=torch.float32)
 L_test = torch.tensor(L_test, dtype=torch.float32)
@@ -101,7 +100,7 @@ cc_l2 = (cluster_centers ** 2).sum(dim=1) # (313,)
 lut_coords  = ((torch.stack(torch.meshgrid(torch.arange(256), torch.arange(256)), -1).float()) - 128.0).reshape(-1, 2) # (65536, 2)
 d2 = (lut_coords ** 2).sum(dim=1, keepdim=True) + cc_l2.reshape(1, -1) - torch.matmul(2 * lut_coords, cluster_centers.t())
 lut = d2.argmin(1) # (65536,)
-
+#%%
 def compute_ab_prior(dataloader):
     hist = torch.zeros(313, device=device)
     total = 0
@@ -143,7 +142,27 @@ def lab_to_rgb(x):
     rgb = cv2.cvtColor(lab_cv, cv2.COLOR_LAB2RGB)
     return rgb
 #%%
-@torch.jit.script
+def save_checkpoint(model, name='checkpoint'):
+    torch.save(model.state_dict(), f"../models/{name}.pth")
+
+class EarlyStopping:
+    def __init__(self, patience=10, delta=5e-6):
+        self.patience = patience
+        self.counter = 0
+        self.best_score = np.Inf
+        self.early_stop = False
+        self.delta = delta
+
+    def __call__(self, val_loss, net):
+        if self.best_score > val_loss:
+            self.best_score = val_loss
+            self.counter = 0
+            save_checkpoint(net)
+        elif self.best_score + self.delta < val_loss:
+            self.counter += 1
+            if self.counter >= self.patience:
+                self.early_stop = True
+#%% Loss functions
 class RebalanceLoss(nn.Module):
     def __init__(self, weight_lut, coeff=0.5):
         super(RebalanceLoss, self).__init__()
@@ -170,28 +189,7 @@ class RebalanceLoss(nn.Module):
         grad_v = ((dv_i - dv_t) ** 2 * weighted_v.expand_as(dv_i)).sum()
         weighted_grad = grad_h + grad_v
         return (self.coeff * weighted_mse + (1 - self.coeff) * weighted_grad) / float(B * C * H * W)
-#%% Loss functions
-def save_checkpoint(model, name='checkpoint'):
-    torch.save(model.state_dict(), f"../models/{name}.pth")
-
-class EarlyStopping:
-    def __init__(self, patience=10, delta=5e-6):
-        self.patience = patience
-        self.counter = 0
-        self.best_score = np.Inf
-        self.early_stop = False
-        self.delta = delta
-
-    def __call__(self, val_loss, net):
-        if self.best_score > val_loss:
-            self.best_score = val_loss
-            self.counter = 0
-            save_checkpoint(net)
-        elif self.best_score + self.delta < val_loss:
-            self.counter += 1
-            if self.counter >= self.patience:
-                self.early_stop = True
-
+#%%
 def compute_pcc(pred, targets):
     pred_flat = pred.reshape(pred.size(0), -1)
     target_flat = targets.reshape(targets.size(0), -1)
@@ -262,13 +260,14 @@ def objective(trial, trainset, X):
         split_n += 1
         trainloader = DataLoader(trainset, batch_size=batch_size, sampler=SubsetRandomSampler(train_idx), num_workers=4, pin_memory=True, prefetch_factor=2)
         valloader = DataLoader(trainset, batch_size=batch_size, sampler=SubsetRandomSampler(val_idx), num_workers=4, pin_memory=True, prefetch_factor=2)
-        del train_idx, val_idx
+        prior = compute_ab_prior(trainloader)
+        weights = make_rebalancing_weights(prior, alpha=0.5)
+        weight_lut = weights[lut].to(device)  # (65536,)
+        criterion = RebalanceLoss(weight_lut, coeff=coeff)
+        del train_idx, val_idx, prior, weights, weight_lut
         net = Net().to(device)
         optimizer = optim.Adam(net.parameters(), lr=lr)
         scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.05, patience=2)
-        prior = compute_ab_prior(trainloader)
-        weights = make_rebalancing_weights(prior, alpha=0.5)
-        criterion = RebalanceLoss(cluster_centers, weights, coeff=coeff)
         for epoch in range(50):
             train_loss, train_rmse, train_psnr, train_ssim, train_pcc = fit(net, trainloader, optimizer, criterion)
             ins, preds, truths, val_loss, val_rmse, val_psnr, val_ssim, val_pcc = predict(net, valloader, criterion)
@@ -364,7 +363,7 @@ prior = compute_ab_prior(trainloader)
 weights = make_rebalancing_weights(prior, alpha=0.5)
 weight_lut = weights[lut].to(device) # (65536,)
 criterion = RebalanceLoss(weight_lut, coeff=trial.params['coeff'])
-del cluster_centers, cc_l2, lut_coords, d2, lut, prior, weights, weight_lut
+del cluster_centers, cc_l2, lut_coords, d2, lut, prior, weights
 early_stopping = EarlyStopping()
 train_RMSEs, train_PSNRs, train_SSIMs, train_PCCs, train_losses = [], [], [], [], []
 test_RMSEs, test_PSNRs, test_SSIMs, test_PCCs, test_losses = [], [], [], [], []
@@ -418,11 +417,25 @@ for epoch in prog_bar:
         break
 save_checkpoint(net, 'lastcheck')
 writer.flush()
+#%%
+class ModelWithLoss(nn.Module):
+    def __init__(self, net, loss_fn):
+        super().__init__()
+        self.net = net
+        self.loss_fn = loss_fn
+
+    def forward(self, x, y):
+        preds = self.net(x)
+        return self.loss_fn(preds, y)
 #%% final evaluation
 net.load_state_dict(torch.load('../models/checkpoint.pth'))
-ins, preds, truths, test_loss, test_RMSE, test_PSNR, test_SSIM, test_PCC = predict(net, testloader)
+ins, preds, truths, test_loss, test_RMSE, test_PSNR, test_SSIM, test_PCC = predict(net, testloader, criterion)
+net_script = ModelWithLoss(net, RebalanceLoss(weight_lut, coeff=0.5))
+del weight_lut
+net_script = torch.jit.script(net_script)
+net_script.save("model_and_loss.pt")
 net.load_state_dict(torch.load('../models/lastcheck.pth'))
-ins2, preds2, truths2, loss2, rmse2, psnr2, ssim2, pcc2 = predict(net, testloader)
+ins2, preds2, truths2, loss2, rmse2, psnr2, ssim2, pcc2 = predict(net, testloader, criterion)
 #%%
 ins = torch.cat(ins, dim=0)
 preds = torch.cat(preds, dim=0)
