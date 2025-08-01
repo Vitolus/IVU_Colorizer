@@ -99,7 +99,7 @@ assert os.path.exists(cluster_path), "Download pts_in_hull.npy and place next to
 cluster_centers = torch.from_numpy(np.load(cluster_path)).float() # (313, 2)
 cc_l2 = (cluster_centers ** 2).sum(dim=1) # (313,)
 lut_coords  = ((torch.stack(torch.meshgrid(torch.arange(256), torch.arange(256)), -1).float()) - 128.0).reshape(-1, 2) # (65536, 2)
-d2 = (lut_coords ** 2).sum(dim=1, keepdim=True) + cc_l2.reshape(1, -1) - torch.matmult(2 * lut_coords, cluster_centers.t())
+d2 = (lut_coords ** 2).sum(dim=1, keepdim=True) + cc_l2.reshape(1, -1) - torch.matmul(2 * lut_coords, cluster_centers.t())
 lut = d2.argmin(1) # (65536,)
 
 def compute_ab_prior(dataloader):
