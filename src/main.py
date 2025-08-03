@@ -175,14 +175,13 @@ class RebalanceLoss(nn.Module):
     def forward(self, preds, targets):
         B, C, H, W = preds.shape
         assert C == 313, "Input channels must be 313 for the classifier"
-        assert preds.shape == targets.shape, "preds and targets must have the same shape"
         targets = unstandardize(targets, self.mean, self.std) * 255.0 - 128.0 # unnormalize to [-128, 127]
         a = (targets[:, 0, :, :].long() + 128) # quantized channel (B, H, W)
         b = (targets[:, 1, :, :].long() + 128)
-        idx = a * 256 + b  # (B, H, W)
-        labels = self.lut[idx]  # (B, H, W)
+        idx = a * 256 + b
+        true_labels = self.lut[idx] # (B, H, W) [0..312]
         loss = nn.CrossEntropyLoss(weight=self.class_weights, reduction='mean')
-        return loss(preds, labels), labels
+        return loss(preds, true_labels), true_labels
 #%%
 def fit(net, trainloader, optimizer, loss_fn):
     net.train()
@@ -216,25 +215,23 @@ def predict(net, testloader, loss_fn):
                 out = net(L)
                 loss, labels = loss_fn(out, ab)
                 ins.append(L.cpu())
-                preds.append(ab_pred.cpu())
+                preds.append(out.cpu())
                 truths.append(ab.cpu())
-            total_loss += loss_fn(out, ab).item()
-            topk = out.topk(3, dim=1).indices  # (B, 3)
-            total_topk_acc += (topk == labels.unsqueeze(1)).any(dim=1).sum().item()
+            total_loss += loss.item()
+            total_topk_acc += (out.topk(3, dim=1).indices == labels.unsqueeze(1)).any(dim=1).sum().item()
             total_acc += (out.argmax(dim=1) == labels).sum().item()
             count += labels.numel()
             del out, L, ab
     return ins, preds, truths, total_loss / count, total_acc / count, total_topk_acc / count
 #%%
-# TODO: missing fix with new logic
 def objective(trial, trainset, X):
     lr = trial.suggest_float('lr', 1e-5, 1e-1, log=True)
     batch_size = trial.suggest_categorical('batch_size', [64,256, 512, 1024])
     coeff = trial.suggest_float('coeff', 0.0, 1.0, log=False)
     kf = KFold(n_splits=5, shuffle=True, random_state=42)
     val_losses, mean_loss = [], 0
-    train_loss, train_rmse, train_psnr, train_ssim, train_pcc = 0, 0, 0, 0, 0
-    val_loss, val_rmse, val_psnr, val_ssim, val_pcc = 0, 0, 0, 0, 0
+    train_loss, train_acc, train_topk_acc = 0, 0, 0
+    val_loss, val_acc, val_topk_acc = 0, 0, 0
     split_n = 0
     prog_bar = tqdm(kf.split(X), desc="Splits", position=0)
     for train_idx, val_idx in prog_bar:
@@ -249,15 +246,14 @@ def objective(trial, trainset, X):
         optimizer = optim.Adam(net.parameters(), lr=lr)
         scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5)
         for epoch in range(50):
-            train_loss, train_rmse, train_psnr, train_ssim, train_pcc = fit(net, trainloader, optimizer, criterion)
-            ins, preds, truths, val_loss, val_rmse, val_psnr, val_ssim, val_pcc = predict(net, valloader, criterion)
+            train_loss, train_acc, train_topk_acc = fit(net, trainloader, optimizer, criterion)
+            ins, preds, truths, val_loss, val_acc, val_topk_acc = predict(net, valloader, criterion)
             del ins, preds, truths
             scheduler.step(val_loss)
             prog_bar.set_description(
                 f"Split {split_n} - Epoch {epoch + 1} |\nlr={lr:.3e}, batch size={batch_size:.3e}, coeff={coeff:.3e} |\n"
-                f"Metrics train/val: RMSE={train_rmse:.3e}/{val_rmse:.3e}, "
-                f"PSNR={train_psnr:.3e}/{val_psnr:.3e}, SSIM={train_ssim:.3e}/{val_ssim:.3e}, "
-                f"PCC={train_pcc:.3e}/{val_pcc:.3e} | Loss: {train_loss:.3e}/{val_loss:.3e}")
+                f"Metrics train/val: Acc={train_acc:.3e}/{val_acc:.3e}, "
+                f"Topk acc={train_topk_acc:.3e}/{val_topk_acc:.3e} |\nLoss: {train_loss:.3e}/{val_loss:.3e}")
             torch.cuda.empty_cache()
         del net, optimizer, scheduler
         val_losses.append(val_loss)
@@ -305,7 +301,7 @@ class Net(nn.Module):
         u4 = torch.cat([u4, d1], dim=1) # (B, 256, 80, 80)
         u5 = self.lrelu(self.convt5(u4)) # (B, 2, 160, 160) — ab prediction
         u5 = torch.cat([u5, x], dim=1) # (B, 3, 160, 160)
-        x = self.final(u5) # (B, 313, 160, 160)
+        x = self.classifier(u5) # (B, 313, 160, 160)
         return x
 #%%
 writer = SummaryWriter('../runs')
@@ -353,10 +349,9 @@ def update_plot():
     ax.autoscale_view()
     fig.canvas.draw()
 #%%
-# TODO: missing fix with new logic
 early_stopping = EarlyStopping()
-train_RMSEs, train_PSNRs, train_SSIMs, train_PCCs, train_losses = [], [], [], [], []
-test_RMSEs, test_PSNRs, test_SSIMs, test_PCCs, test_losses = [], [], [], [], []
+train_losses, train_accs, train_topk_accs = [], [], []
+test_losses, test_accs, test_topk_accs = [], [], []
 last_checkpoint = None
 prog_bar = tqdm(range(50), total=50, desc='Training', position=0)
 
@@ -368,26 +363,20 @@ ax.legend()
 torch.cuda.empty_cache()
 scaler = torch.cuda.amp.GradScaler()
 for epoch in prog_bar:
-    train_loss, train_RMSE, train_PSNR, train_SSIM, train_PCC = fit(net, trainloader, optimizer, criterion)
+    train_loss, train_acc, train_topk_acc = fit(net, trainloader, optimizer, criterion)
     train_losses.append(train_loss)
-    train_RMSEs.append(train_RMSE)
-    train_PSNRs.append(train_PSNR)
-    train_SSIMs.append(train_SSIM)
-    train_PCCs.append(train_PCC)
-    ins, preds, truths, test_loss, test_RMSE, test_PSNR, test_SSIM, test_PCC = predict(net, testloader, criterion)
+    train_accs.append(train_acc)
+    train_topk_accs.append(train_topk_acc)
+    ins, preds, truths, test_loss, test_acc, test_topk_acc = predict(net, testloader, criterion)
     del ins, preds, truths
     test_losses.append(test_loss)
-    test_RMSEs.append(test_RMSE)
-    test_PSNRs.append(test_PSNR)
-    test_SSIMs.append(test_SSIM)
-    test_PCCs.append(test_PCC)
+    test_accs.append(test_acc)
+    test_topk_accs.append(test_topk_acc)
     scheduler.step(test_loss)
     early_stopping(test_loss, net)
     current_lr = optimizer.param_groups[0]['lr']
-    prog_bar.set_description(f"Epoch {epoch + 1} | lr={current_lr:.3e} |\n"
-                             f"Metrics train/test: RMSE={train_RMSE:.3e}/{test_RMSE:.3e}, "
-                             f"PSNR={train_PSNR:.3e}/{test_PSNR:.3e}, SSIM={train_SSIM:.3e}/{test_SSIM:.3e}, "
-                             f"PCC={train_PCC:.3e}/{test_PCC:.3e} | Loss: {train_loss:.3e}/{test_loss:.3e}")
+    prog_bar.set_description(f"Epoch {epoch + 1} | Metrics train/val: Acc={train_acc:.3e}/{test_acc:.3e}, "
+                             f"Topk acc={train_topk_acc:.3e}/{test_topk_acc:.3e} | Loss: {train_loss:.3e}/{test_loss:.3e}")
     writer.add_scalar('Loss/train', train_loss, epoch)
     writer.add_scalar('Loss/test', test_loss, epoch)
     update_plot()
@@ -408,89 +397,57 @@ class ModelWithLoss(nn.Module):
         preds = self.net(x)
         return self.loss_fn(preds, y)
 #%% final evaluation
-# TODO: correct the manipulation of preds, now are labels not ab channels
 net.load_state_dict(torch.load('../models/checkpoint.pth'))
-ins, preds, truths, test_loss, test_RMSE, test_PSNR, test_SSIM, test_PCC = predict(net, testloader, criterion)
+ins, preds, truths, test_loss, test_acc, test_topk_acc = predict(net, testloader, criterion)
 net_script = ModelWithLoss(net, RebalanceLoss(lut, weights))
 net_script = torch.jit.script(net_script)
-net_script.save("model_and_loss.pt")
+net_script.save('../models/model_and_loss.pt')
 net.load_state_dict(torch.load('../models/lastcheck.pth'))
-ins2, preds2, truths2, loss2, rmse2, psnr2, ssim2, pcc2 = predict(net, testloader, criterion)
+ins2, preds2, truths2, loss2, acc2, topk_acc2 = predict(net, testloader, criterion)
 #%%
 ins = torch.cat(ins, dim=0)
-preds = torch.cat(preds, dim=0)
+preds = torch.cat([cluster_centers[torch.argmax(pred, dim=1).reshape(-1)]
+                  .reshape(pred.shape[0], pred.shape[2], pred.shape[3], 2)
+                  .permute(0, 3, 1, 2) for pred in preds], dim=0)
 truths = torch.cat(truths, dim=0)
+
 ins = [unstandardize(x, L_mean, L_std)for x in ins]
 preds = [unstandardize(x, ab_mean, ab_std)for x in preds]
 truths = [unstandardize(x, ab_mean, ab_std) for x in truths]
-preds_rgb = []
-truths_rgb = []
-for L, ab_pred, ab_true in zip(ins, preds, truths):
-    lab_pred = torch.cat([L, ab_pred], dim=0)  # [3, H, W]
-    lab_true = torch.cat([L, ab_true], dim=0)
-    preds_rgb.append(lab_to_rgb(lab_pred))
-    truths_rgb.append(lab_to_rgb(lab_true))
-preds = preds_rgb
-truths = truths_rgb
+
+preds_rgb = [lab_to_rgb(torch.cat([L, ab], dim=0)) for L, ab in zip(ins, preds)]
+truths_rgb = [lab_to_rgb(torch.cat([L, ab], dim=0)) for L, ab in zip(ins, truths)]
+
 ins2 = torch.cat(ins2, dim=0)
 preds2 = torch.cat(preds2, dim=0)
 truths2 = torch.cat(truths2, dim=0)
 ins2 = [unstandardize(x, L_mean, L_std)for x in ins2]
 preds2 = [unstandardize(x, ab_mean, ab_std)for x in preds2]
 truths2 = [unstandardize(x, ab_mean, ab_std) for x in truths2]
-preds_rgb = []
-truths_rgb = []
-for L, ab_pred, ab_true in zip(ins2, preds2, truths2):
-    lab_pred = torch.cat([L, ab_pred], dim=0)
-    lab_true = torch.cat([L, ab_true], dim=0)
-    preds_rgb.append(lab_to_rgb(lab_pred))
-    truths_rgb.append(lab_to_rgb(lab_true))
-preds2 = preds_rgb
-truths2 = truths_rgb
-print(test_loss, test_RMSE, test_PSNR, test_SSIM, test_PCC)
-print(loss2, rmse2, psnr2, ssim2, pcc2)
+preds_rgb2 = [lab_to_rgb(torch.cat([L, ab], dim=0)) for L, ab in zip(ins2, preds2)]
+truths_rgb2 = [lab_to_rgb(torch.cat([L, ab], dim=0)) for L, ab in zip(ins2, truths2)]
+print(test_loss, test_acc, test_topk_acc)
+print(loss2, acc2, topk_acc2)
 #%%
 # %matplotlib inline
 
 plt.figure()
-plt.plot(train_RMSEs, label='Train RMSE')
-plt.plot(test_RMSEs, label='Test RMSE')
-plt.axhline(y=test_RMSE, color='g', linestyle='--')
-plt.axhline(y=rmse2, color='r', linestyle='--')
+plt.plot(train_accs, label='Train accuracy')
+plt.plot(test_accs, label='Test accuracy')
+plt.axhline(y=test_acc, color='g', linestyle='--')
+plt.axhline(y=acc2, color='r', linestyle='--')
 plt.xlabel('Epoch')
-plt.ylabel('RMSE')
+plt.ylabel('Accuracy')
 plt.legend()
 plt.show()
 
 plt.figure()
-plt.plot(train_PSNRs, label='Train PSNR')
-plt.plot(test_PSNRs, label='Test PSNR')
-plt.axhline(y=test_PSNR, color='g', linestyle='--')
-plt.axhline(y=psnr2, color='r', linestyle='--')
+plt.plot(train_topk_accs, label='Train topk accuracy')
+plt.plot(test_topk_accs, label='Test topk accuracy')
+plt.axhline(y=test_topk_acc, color='g', linestyle='--')
+plt.axhline(y=topk_acc2, color='r', linestyle='--')
 plt.xlabel('Epoch')
-plt.ylabel('PSNR')
-plt.legend()
-plt.show()
-
-plt.figure()
-plt.plot(train_SSIMs, label='Train SSIM')
-plt.plot(test_SSIMs, label='Test SSIM')
-plt.axhline(y=test_SSIM, color='g', linestyle='--')
-plt.axhline(y=ssim2, color='r', linestyle='--')
-plt.xlabel('Epoch')
-plt.ylabel('SSIM')
-plt.ylim(0, 1)
-plt.legend()
-plt.show()
-
-plt.figure()
-plt.plot(train_PCCs, label='Train PCC')
-plt.plot(test_PCCs, label='Test PCC')
-plt.axhline(y=test_PCC, color='g', linestyle='--')
-plt.axhline(y=pcc2, color='r', linestyle='--')
-plt.xlabel('Epoch')
-plt.ylabel('PCC')
-plt.ylim(0, 1)
+plt.ylabel('topk Accuracy')
 plt.legend()
 plt.show()
 
@@ -514,10 +471,10 @@ for _ in range(5):
     plt.axis('off')
     plt.subplot(1, 3, 2)
     plt.title('Predicted Image', fontsize=20)
-    plt.imshow(preds[idx])  # Already a [H, W, 3] NumPy RGB image
+    plt.imshow(preds_rgb[idx])  # Already a [H, W, 3] NumPy RGB image
     plt.axis('off')
     plt.subplot(1, 3, 3)
     plt.title('Groundtruth Image', fontsize=20)
-    plt.imshow(truths[idx])  # Already a [H, W, 3] NumPy RGB image
+    plt.imshow(truths_rgb[idx])  # Already a [H, W, 3] NumPy RGB image
     plt.axis('off')
     plt.show()
