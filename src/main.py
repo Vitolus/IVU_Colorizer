@@ -81,10 +81,7 @@ print(L_test.shape, ab_test.shape)
 #%%
 L_mean = L_train.mean(dim=(0, 2, 3))
 L_std = L_train.std(dim=(0, 2, 3))
-ab_mean = ab_train.mean(dim=(0, 2, 3))
-ab_std = ab_train.std(dim=(0, 2, 3))
 print(L_mean, L_std)
-print(ab_mean, ab_std)
 #%%
 def unstandardize(tensor, mean, std):
     og_shape = tensor.shape
@@ -127,7 +124,7 @@ class MyDataset(torch.utils.data.Dataset):
             idx = (a * 256 + b).reshape(a.size(0), -1)
             labels = lut[idx]
             self.labels = labels.reshape_as(a)
-        del ab_data, ab, a, b, idx, labels, lut, ab_mean, ab_std
+        del ab_data, ab, a, b, idx, labels, lut
     def __len__(self):
         return self.L_data.size(0)
 
