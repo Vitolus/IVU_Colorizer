@@ -124,7 +124,7 @@ class MyDataset(torch.utils.data.Dataset):
             idx = (a * 256 + b).reshape(a.size(0), -1)
             labels = lut[idx]
             self.labels = labels.reshape_as(a)
-        del ab_data, ab, a, b, idx, labels, lut
+        del ab_data, a, b, idx, labels, lut
     def __len__(self):
         return self.L_data.size(0)
 
@@ -496,6 +496,7 @@ class ModelWithLoss(nn.Module):
         preds = self.net(x)
         return self.loss_fn(preds, y)
 #%%
+#TODO: add a progress bar to the final evaluation
 @torch.inference_mode()
 def final_predict(net, testloader, loss_fn, micro_size=64):
     net.eval()
@@ -550,6 +551,9 @@ net_script.save('../models/model_and_loss.pt')
 net.load_state_dict(torch.load('../models/lastcheck.pth'))
 ins2, preds_soft2, preds_hard2, truths2, loss2, pix_acc2, img_acc2 = final_predict(net, testloader, criterion)
 #%%
+#TODO: ----> 9 preds_rgb_hard = [lab_to_rgb(torch.cat([L, ab], dim=0)) for L, ab in zip(ins, preds_hard)]
+# RuntimeError: Sizes of tensors must match except in dimension 0. Expected size 160 but got size 2 for tensor number 1 in the list.
+#TODO: check why predicted are pink, maybe normalization issue
 ins = torch.cat(ins, dim=0)
 preds_soft = torch.cat(preds_soft, dim=0)
 preds_hard = torch.cat(preds_hard, dim=0)
