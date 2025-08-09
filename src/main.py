@@ -39,16 +39,16 @@ for file in tqdm(folder, desc='Loading color images'):
     img = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
     img = cv2.resize(img, (SIZE, SIZE))
     L = img[:, :, 0:1] / 255.0 # (H, W, 1) [0..1]
-    ab = img[:, :, 1:3] / 255.0 # (H, W, 2) [0..1]
+    ab = img[:, :, 1:3] # (H, W, 2) [0..255]
     input_L.append(L)
     target_ab.append(ab)
 input_L = np.array(input_L).astype(np.float32) # (N, H, W, 1)
-target_ab = np.array(target_ab).astype(np.float32) # (N, H, W, 2)
+target_ab = np.array(target_ab).astype(np.uint8) # (N, H, W, 2)
 print(input_L.shape, target_ab.shape)
 #%%
 for _ in range(5):
     idx = np.random.randint(0, len(input_L) - 1)
-    color_img = np.concatenate([input_L[idx] * 255, target_ab[idx] * 255], axis=2).astype(np.uint8)
+    color_img = np.concatenate([input_L[idx] * 255, target_ab[idx]], axis=2).astype(np.uint8)
     plt.figure(figsize=(15, 15))
     plt.subplot(1, 3, 1)
     plt.title('RGB Color Image', fontsize=20)
@@ -66,13 +66,17 @@ for _ in range(5):
 #%%
 input_L = np.transpose(input_L, (0, 3, 1, 2)) # (N, 1, H, W)
 target_ab = np.transpose(target_ab, (0, 3, 1, 2)) # (N, 2, H, W)
-L_train, L_test, ab_train, ab_test = train_test_split(input_L, target_ab, test_size=0.2, random_state=42)
+L_train, L_test, ab_train, ab_test = train_test_split(input_L, target_ab, test_size=0.3, random_state=42)
+L_val, L_test, ab_val, ab_test = train_test_split(L_test, ab_test, test_size=0.3, random_state=42)
 del input_L, target_ab
 L_train = torch.tensor(L_train, dtype=torch.float32)
-ab_train = torch.tensor(ab_train, dtype=torch.float32)
+ab_train = torch.tensor(ab_train, dtype=torch.uint8)
+L_val = torch.tensor(L_val, dtype=torch.float32)
+ab_val = torch.tensor(ab_val, dtype=torch.uint8)
 L_test = torch.tensor(L_test, dtype=torch.float32)
-ab_test = torch.tensor(ab_test, dtype=torch.float32)
+ab_test = torch.tensor(ab_test, dtype=torch.uint8)
 print(L_train.shape, ab_train.shape)
+print(L_val.shape, ab_val.shape)
 print(L_test.shape, ab_test.shape)
 #%%
 L_mean = L_train.mean(dim=(0, 2, 3))
@@ -114,16 +118,12 @@ def lab_to_rgb(x):
     return rgb
 #%%
 class MyDataset(torch.utils.data.Dataset):
-    def __init__(self, L_data, ab_data, lut, ab_mean, ab_std, L_transform=None, ab_transform=None):
+    def __init__(self, L_data, ab_data, lut, L_transform=None):
         self.L_data = L_transform(L_data) if L_transform else L_data
-        ab_data = ab_transform(ab_data) if ab_transform else ab_data
         lut = lut.cpu()
-        ab_mean = ab_mean.cpu().reshape(2, 1, 1)
-        ab_std = ab_std.cpu().reshape(2, 1, 1)
         with torch.no_grad():
-            ab = unstandardize(ab_data, ab_mean, ab_std) * 255.0
-            a = ab[:, 0, :, :].long()
-            b = ab[:, 1, :, :].long()
+            a = ab_data[:, 0, :, :].long()
+            b = ab_data[:, 1, :, :].long()
             idx = (a * 256 + b).reshape(a.size(0), -1)
             labels = lut[idx]
             self.labels = labels.reshape_as(a)
@@ -178,10 +178,9 @@ soft_lut_probs = torch.softmax(-dists, dim=1)  # shape: (65536, 313)
 lut = torch.argmax(soft_lut_probs, dim=1).long()  # shape: (65536,)
 del dists
 #%%
-trainset = MyDataset(L_train, ab_train, lut, ab_mean, ab_std, L_transform=transforms.Normalize(mean=L_mean, std=L_std),
-                     ab_transform=transforms.Normalize(mean=ab_mean, std=ab_std))
-testset = MyDataset(L_test, ab_test, lut, ab_mean, ab_std, L_transform=transforms.Normalize(mean=L_mean, std=L_std),
-                     ab_transform=transforms.Normalize(mean=ab_mean, std=ab_std))
+trainset = MyDataset(L_train, ab_train, lut, L_transform=transforms.Normalize(mean=L_mean, std=L_std))
+valset = MyDataset(L_val, ab_val, lut, L_transform=transforms.Normalize(mean=L_mean, std=L_std))
+testset = MyDataset(L_test, ab_test, lut, L_transform=transforms.Normalize(mean=L_mean, std=L_std))
 del L_train, L_test, ab_train, ab_test # release memory
 #%%
 def save_checkpoint(model, name='checkpoint'):
@@ -216,63 +215,115 @@ class RebalanceLoss(nn.Module):
 #%%
 def fit(net, trainloader, optimizer, scaler, loss_fn, micro_size=64, acc_steps=4):
     net.train()
-    total_loss, total_acc, count = torch.zeros(1, device=device), torch.zeros(1, device=device), 0
+    loss_sum = torch.zeros(1, device=device) # sum of per-pixel losses
+    pixel_acc = torch.zeros(1, device=device) # total correct pixels
+    pixel_total = torch.zeros(1, device=device) # total valid pixels
+    image_acc = torch.zeros(1, device=device) # sum of per-image accuracies
+    image_count = torch.zeros(1, device=device) # count of images contributing to per-image metric
     optimizer.zero_grad(set_to_none=True)
     prefetcher = CUDAPrefetcher(trainloader)
     inputs, targets = prefetcher.next()
-    micro_iter = 0
+    accum_in_window = 0
     while inputs is not None:
-        for inp_mb, tar_mb in zip(inputs.chunk((inputs.size(0) + micro_size - 1) // micro_size, dim=0),
-                                  targets.chunk((targets.size(0) + micro_size - 1) // micro_size,dim=0)):
-            with torch.cuda.amp.autocast():
-                out_mb = net(inp_mb)
-                loss_mb = loss_fn(out_mb, tar_mb) # this goes OOM
-                loss_scaled = loss_mb / acc_steps
-            scaler.scale(loss_scaled).backward() # Error OOM because of ^
-            with torch.no_grad():
-                batch_size = tar_mb.size(0)
-                total_loss += loss_mb.detach() * batch_size
-                total_acc += out_mb.argmax(1).eq(tar_mb).sum()
-                count += batch_size
-            micro_iter += 1
-            if micro_iter % acc_steps == 0:
-                scaler.step(optimizer)
-                scaler.update()
-                optimizer.zero_grad(set_to_none=True)
-        inputs, targets = prefetcher.next()
-    if micro_iter % acc_steps != 0:
-        scaler.step(optimizer)
-        scaler.update()
-        optimizer.zero_grad(set_to_none=True)
-    return (total_loss / count).item(), (total_acc / count).item()
-
-@torch.inference_mode()
-def predict(net, testloader, loss_fn, micro_size=64):
-    net.eval()
-    total_loss, total_acc, count = 0, 0, 0
-    prefetcher = CUDAPrefetcher(testloader)
-    inputs, targets = prefetcher.next()
-    while inputs is not None:
-        for inp_mb, tar_mb in zip(inputs.chunk((inputs.size(0) + micro_size - 1) // micro_size, dim=0),
-                                  targets.chunk((targets.size(0) + micro_size - 1) // micro_size,dim=0)):
+        num_chunks = (inputs.size(0) + micro_size - 1) // micro_size
+        for inp_mb, tar_mb in zip(inputs.chunk(num_chunks, dim=0), targets.chunk(num_chunks, dim=0)):
             with torch.cuda.amp.autocast():
                 out_mb = net(inp_mb)
                 loss_mb = loss_fn(out_mb, tar_mb)
-            batch_size = tar_mb.size(0)
-            total_loss += loss_mb.item() * batch_size
-            total_acc += (out_mb.argmax(1) == tar_mb).sum().item()
-            count += batch_size
-        del inputs, targets
+            loss_scaled = loss_mb / acc_steps
+            scaler.scale(loss_scaled).backward()
+            accum_in_window += 1
+            with torch.no_grad():
+                pred = out_mb.argmax(1) # predicted label for each pixel [B, H, W]
+                valid = torch.ones_like(tar_mb, dtype=torch.bool)
+                # Pixel accuracy
+                correct = (pred == tar_mb) & valid
+                pixel_acc += correct.sum()
+                batch_valid_pixels = valid.sum()
+                pixel_total += batch_valid_pixels
+                # Mean per-image accuracy
+                # For each image: correct_i / valid_i (skip images with 0 valid pixels)
+                B = tar_mb.size(0)
+                correct_per = correct.view(B, -1).sum(dim=1)
+                valid_per = valid.view(B, -1).sum(dim=1)
+                valid_imgs = valid_per > 0
+                if valid_imgs.any():
+                    image_acc += (correct_per[valid_imgs].float() / valid_per[valid_imgs].float()).sum()
+                    image_count += valid_imgs.sum()
+                # Loss averaging across epoch:
+                # If loss_fn is mean over valid pixels, convert back to sum by multiplying to valid count.
+                if batch_valid_pixels.item() > 0:
+                    loss_sum += loss_mb.detach() * batch_valid_pixels
+            # Step on full accumulation window
+            if accum_in_window == acc_steps:
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad(set_to_none=True)
+                accum_in_window = 0
         inputs, targets = prefetcher.next()
-    return total_loss / count, total_acc / count
+    # Handle a final partial accumulation window properly (to keep the same effective loss scale)
+    if accum_in_window > 0:
+        # We divided each micro-batch by acc_steps; adjust grads by acc_steps/accum_in_window
+        # so the step uses the average over the actual number of micro-batches accumulated.
+        scaler.unscale_(optimizer)
+        adjust = acc_steps / float(accum_in_window)
+        for p in net.parameters():
+            if p.grad is not None:
+                p.grad.mul_(adjust)
+        scaler.step(optimizer)
+        scaler.update()
+        optimizer.zero_grad(set_to_none=True)
+    # Safeguards against division by zero
+    total_valid_pixels = pixel_total.clamp_min(1)
+    total_valid_images = image_count.clamp_min(1)
+    return (loss_sum / total_valid_pixels).item(), (pixel_acc / total_valid_pixels).item(), (image_acc / total_valid_images).item()
+
+@torch.inference_mode()
+def predict(net, valloader, loss_fn, micro_size=64):
+    net.eval()
+    loss_sum = torch.zeros(1, device=device)
+    pixel_correct = torch.zeros(1, device=device)
+    pixel_total = torch.zeros(1, device=device)
+    per_image_acc_sum = torch.zeros(1, device=device)
+    image_count = torch.zeros(1, device=device)
+    prefetcher = CUDAPrefetcher(valloader)
+    inputs, targets = prefetcher.next()
+    while inputs is not None:
+        num_chunks = (inputs.size(0) + micro_size - 1) // micro_size
+        for inp_mb, tar_mb in zip(inputs.chunk(num_chunks, dim=0), targets.chunk(num_chunks, dim=0)):
+            with torch.cuda.amp.autocast():
+                out_mb = net(inp_mb)
+                loss_mb = loss_fn(out_mb, tar_mb)  # scalar loss over valid pixels
+            pred = out_mb.argmax(1)  # [B, H, W]
+            valid = torch.ones_like(tar_mb, dtype=torch.bool)
+            # Pixel-wise
+            correct = (pred == tar_mb) & valid
+            pixel_correct += correct.sum()
+            pixel_total += valid.sum()
+            # Per-image accuracy
+            B = tar_mb.size(0)
+            correct_per = correct.view(B, -1).sum(dim=1)
+            valid_per = valid.view(B, -1).sum(dim=1)
+            valid_imgs = (valid_per > 0)
+            if valid_imgs.any():
+                per_image_acc = (correct_per[valid_imgs].float() / valid_per[valid_imgs].float()).sum()
+                per_image_acc_sum += per_image_acc
+                image_count += valid_imgs.sum()
+            # Loss: if reduced by valid pixels, scale back to total loss
+            valid_pixels = valid.sum()
+            if valid_pixels.item() > 0:
+                loss_sum += loss_mb.detach() * valid_pixels
+        inputs, targets = prefetcher.next()
+    # Avoid division by zero
+    pixel_total = pixel_total.clamp_min(1)
+    image_count = image_count.clamp_min(1)
+    return (loss_sum / pixel_total).item(), (pixel_correct / pixel_total).item(), (per_image_acc_sum / image_count).item()
 #%%
 def objective(trial, trainset, scaler, X):
     lr = trial.suggest_float('lr', 1e-5, 1e-1, log=True)
     batch_size = trial.suggest_categorical('batch_size', [32, 64, 128])
-    coeff = trial.suggest_float('coeff', 0.0, 1.0, log=False)
     kf = KFold(n_splits=5, shuffle=True, random_state=42)
-    val_losses, mean_loss = [], 0
-    val_loss, val_acc, val_topk_acc = 0, 0, 0
+    val_losses, mean_loss = [], 0.0
     split_n = 0
     prog_bar = tqdm(kf.split(X), desc="Splits", position=0)
     for train_idx, val_idx in prog_bar:
@@ -281,26 +332,23 @@ def objective(trial, trainset, scaler, X):
         valloader = DataLoader(trainset, batch_size=batch_size, sampler=SubsetRandomSampler(val_idx), num_workers=4, pin_memory=True, prefetch_factor=2)
         prior = compute_ab_prior(trainloader)
         weights = make_rebalancing_weights(prior, alpha=0.5)
-        criterion = RebalanceLoss(lut, weights)
-        del train_idx, val_idx, prior, weights
+        criterion = RebalanceLoss(weights).to(device, memory_format=torch.channels_last)
         net = Net().to(device, memory_format=torch.channels_last)
         optimizer = optim.Adam(net.parameters(), lr=lr)
         scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5)
         for epoch in range(50):
-            train_loss, train_acc = fit(net, trainloader, optimizer, scaler, criterion)
-            val_loss, val_acc = predict(net, valloader, criterion)
-            del ins, preds, truths
+            train_loss, train_pix_acc, train_img_acc = fit(net, trainloader, optimizer, scaler, criterion)
+            val_loss, val_pix_acc, val_img_acc = predict(net, valloader, criterion)
+            train_losses.append(train_loss)
+            val_losses.append(val_loss)
             scheduler.step(val_loss)
             prog_bar.set_description(
-                f"Split {split_n} - Epoch {epoch + 1} |\nlr={lr:.3e}, batch size={batch_size:.3e}, coeff={coeff:.3e} |\n"
-                f"Metrics train/val: Acc={train_acc:.3e}/{val_acc:.3e}, "
-                f"Topk acc={val_topk_acc:.3e} |\nLoss: {train_loss:.3e}/{val_loss:.3e}")
-            torch.cuda.empty_cache()
+                f"Split {split_n} - Epoch {epoch + 1}, lr {lr:.3e}, batch size {batch_size:.3e} |\n"
+                f"Metrics train/val: Pixel Acc={train_pix_acc:.3e}/{val_pix_acc:.3e}, "
+                f"Img Acc={train_img_acc:.3e}/{val_img_acc:.3e} | Loss: {train_loss:.3e}/{val_loss:.3e}")
         del net, optimizer, scheduler
-        val_losses.append(val_loss)
         mean_loss = np.mean(val_losses)
         trial.report(mean_loss, split_n)
-        torch.cuda.empty_cache()
         if trial.should_prune():
             raise optuna.exceptions.TrialPruned()
     return mean_loss
@@ -369,7 +417,7 @@ X = np.zeros(len(trainset))
 torch.cuda.empty_cache()
 scaler = torch.cuda.amp.GradScaler()
 study = optuna.create_study(direction='minimize', pruner=optuna.pruners.MedianPruner())
-study.optimize(lambda trial: objective(trial, trainset, X), n_trials=5)
+study.optimize(lambda trial: objective(trial, trainset, scaler, X), n_trials=5)
 #%%
 pruned_trials = study.get_trials(deepcopy=False, states=[TrialState.PRUNED])
 complete_trials = study.get_trials(deepcopy=False, states=[TrialState.COMPLETE])
@@ -386,7 +434,8 @@ print("  Params: ")
 for key, value in trial.params.items():
     print("    {}: {}".format(key, value))
 #%%
-trainloader = DataLoader(trainset, batch_size=64, shuffle=True, num_workers=0, pin_memory=True, prefetch_factor=None)
+trainloader = DataLoader(trainset, batch_size=64, shuffle=True, num_workers=4, pin_memory=True, prefetch_factor=2)
+valloader = DataLoader(valset, batch_size=64, shuffle=False, num_workers=4, pin_memory=True, prefetch_factor=2)
 testloader = DataLoader(testset, batch_size=64, shuffle=False, num_workers=4, pin_memory=True, prefetch_factor=2)
 optimizer = optim.AdamW(net.parameters(), lr=1e-3, fused=True)
 scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5)
@@ -400,39 +449,40 @@ torch.cuda.empty_cache()
 # %matplotlib notebook
 def update_plot():
     line1.set_data(range(len(train_losses)), train_losses)
-    line2.set_data(range(len(test_losses)), test_losses)
+    line2.set_data(range(len(val_losses)), val_losses)
     ax.relim()
     ax.autoscale_view()
     fig.canvas.draw()
-#%%
+#%% Train entire dataset
 early_stopping = EarlyStopping()
-train_losses, train_accs = [], []
-test_losses, test_accs, test_topk_accs = [], [], []
+train_losses, train_pix_accs, train_img_accs = [], [], []
+val_losses, val_pix_accs, val_img_accs = [], [], []
 last_checkpoint = None
 prog_bar = tqdm(range(50), total=50, desc='Training', position=0)
 
 fig, ax = plt.subplots()
 line1, = ax.plot([], [], label='Train Loss')
-line2, = ax.plot([], [], label='Test Loss')
+line2, = ax.plot([], [], label='Val Loss')
 ax.legend()
 
 scaler = torch.cuda.amp.GradScaler()
 for epoch in prog_bar:
-    train_loss, train_acc = fit(net, trainloader, optimizer, scaler, criterion)
+    train_loss, train_pix_acc, train_img_acc = fit(net, trainloader, optimizer, scaler, criterion)
     train_losses.append(train_loss)
-    train_accs.append(train_acc)
-    test_loss, test_acc = predict(net, testloader, criterion)
-    test_losses.append(test_loss)
-    test_accs.append(test_acc)
-    scheduler.step(test_loss)
-    early_stopping(test_loss, net)
+    train_pix_accs.append(train_pix_acc)
+    train_img_accs.append(train_img_acc)
+    val_loss, val_pix_acc, val_img_acc = predict(net, valloader, criterion)
+    val_losses.append(val_loss)
+    val_pix_accs.append(val_pix_acc)
+    val_img_accs.append(val_img_acc)
+    scheduler.step(val_loss)
+    early_stopping(val_loss, net)
     current_lr = optimizer.param_groups[0]['lr']
-    prog_bar.set_description(f"Epoch {epoch + 1}, lr {current_lr} | Metrics train/val: Acc={train_acc:.3e}/{test_acc:.3e}, "
-                             f"| Loss: {train_loss:.3e}/{test_loss:.3e}")
+    prog_bar.set_description(f"Epoch {epoch + 1}, lr {current_lr} | Metrics train/val: Pixel Acc={train_pix_acc:.3e}/{val_pix_acc:.3e}, "
+                             f"{train_img_acc:.3e}/{val_img_acc:.3e} | Loss: {train_loss:.3e}/{val_loss:.3e}")
     writer.add_scalar('Loss/train', train_loss, epoch)
-    writer.add_scalar('Loss/test', test_loss, epoch)
+    writer.add_scalar('Loss/val', val_loss, epoch)
     update_plot()
-    torch.cuda.empty_cache()
     if early_stopping.early_stop:
         print("Early stopping")
         break
@@ -452,68 +502,95 @@ class ModelWithLoss(nn.Module):
 @torch.inference_mode()
 def final_predict(net, testloader, loss_fn, micro_size=64):
     net.eval()
-    total_loss, total_acc, count = 0, 0, 0
-    ins, preds, truths = [], [], []
+    loss_sum = torch.zeros(1, device=device)
+    pixel_correct = torch.zeros(1, device=device)
+    pixel_total = torch.zeros(1, device=device)
+    per_image_acc_sum = torch.zeros(1, device=device)
+    image_count = torch.zeros(1, device=device)
+    ins, preds_soft, preds_hard, truths = [], [], [], []
     prefetcher = CUDAPrefetcher(testloader)
     inputs, targets = prefetcher.next()
     while inputs is not None:
-        for inp_mb, tar_mb in zip(inputs.chunk((inputs.size(0) + micro_size - 1) // micro_size, dim=0),
-                                  targets.chunk((targets.size(0) + micro_size - 1) // micro_size,dim=0)):
+        num_chunks = (inputs.size(0) + micro_size - 1) // micro_size
+        for inp_mb, tar_mb in zip(inputs.chunk(num_chunks, dim=0), targets.chunk(num_chunks, dim=0)):
             with torch.cuda.amp.autocast():
                 out_mb = net(inp_mb)
                 loss_mb = loss_fn(out_mb, tar_mb)
-            if len(ins) <=1:
-                ins.append(inp_mb.cpu())
-                preds.append(out_mb.cpu())
-                truths.append(tar_mb.cpu())
-            batch_size = tar_mb.size(0)
-            total_loss += loss_mb.item() * batch_size
-            total_acc += (out_mb.argmax(1) == tar_mb).sum().item()
-            count += batch_size
-        del inputs, targets
+            pred = out_mb.argmax(1)
+            valid = torch.ones_like(tar_mb, dtype=torch.bool)
+            correct = (pred == tar_mb) & valid
+            pixel_correct += correct.sum()
+            pixel_total += valid.sum()
+            B = tar_mb.size(0)
+            correct_per = correct.view(B, -1).sum(dim=1)
+            valid_per = valid.view(B, -1).sum(dim=1)
+            valid_imgs = (valid_per > 0)
+            if valid_imgs.any():
+                per_image_acc = (correct_per[valid_imgs].float() / valid_per[valid_imgs].float()).sum()
+                per_image_acc_sum += per_image_acc
+                image_count += valid_imgs.sum()
+            valid_pixels = valid.sum()
+            if valid_pixels.item() > 0:
+                loss_sum += loss_mb.detach() * valid_pixels
+            ins.append(inp_mb.cpu())
+            # Soft prediction (media pesata)
+            ab_pred_soft = torch.einsum('bchw,cd->bdhw', torch.softmax(out_mb.float(), dim=1), cluster_centers)
+            preds_soft.append(ab_pred_soft.cpu())
+            # Hard prediction (cluster più probabile)
+            ab_pred_hard = cluster_centers[out_mb.argmax(1)]
+            preds_hard.append(ab_pred_hard.cpu())
+            truths.append(tar_mb.cpu())
         inputs, targets = prefetcher.next()
-    return ins, preds, truths, total_loss / count, total_acc / count
+    pixel_total = pixel_total.clamp_min(1)
+    image_count = image_count.clamp_min(1)
+    return ins, preds_soft, preds_hard, truths, (loss_sum / pixel_total).item(), (pixel_correct / pixel_total).item(), (per_image_acc_sum / image_count).item()
 #%% final evaluation
 net.load_state_dict(torch.load('../models/checkpoint.pth'))
-ins, preds, truths, test_loss, test_acc = final_predict(net, testloader, criterion)
+ins, preds_soft, preds_hard, truths, test_loss, test_pix_acc, test_img_acc = final_predict(net, testloader, criterion)
 net_script = ModelWithLoss(net, RebalanceLoss(weights))
 net_script = torch.jit.script(net_script)
 net_script.save('../models/model_and_loss.pt')
 net.load_state_dict(torch.load('../models/lastcheck.pth'))
-ins2, preds2, truths2, loss2, acc2 = final_predict(net, testloader, criterion)
+ins2, preds_soft2, preds_hard2, truths2, loss2, pix_acc2, img_acc2 = final_predict(net, testloader, criterion)
 #%%
 ins = torch.cat(ins, dim=0)
-# preds = torch.cat([cluster_centers[torch.argmax(pred, dim=1).reshape(-1)]
-#                   .reshape(pred.shape[0], pred.shape[2], pred.shape[3], 2)
-#                   .permute(0, 3, 1, 2) for pred in preds], dim=0)
-preds = torch.cat([torch.einsum('bchw,cd->bdhw', torch.softmax(pred.float(), dim=1), cluster_centers)for pred in preds], dim=0)
+preds_soft = torch.cat(preds_soft, dim=0)
+preds_hard = torch.cat(preds_hard, dim=0)
 truths = torch.cat([(cluster_centers[truth] + 128).permute(0, 3, 1, 2)for truth in truths], dim=0)
 
 ins = [unstandardize(x, L_mean, L_std)for x in ins]
-preds = [unstandardize(x, ab_mean, ab_std)for x in preds]
 
-preds_rgb = [lab_to_rgb(torch.cat([L, ab], dim=0)) for L, ab in zip(ins, preds)]
+preds_rgb_soft = [lab_to_rgb(torch.cat([L, ab], dim=0)) for L, ab in zip(ins, preds_soft)]
+preds_rgb_hard = [lab_to_rgb(torch.cat([L, ab], dim=0)) for L, ab in zip(ins, preds_hard)]
 truths_rgb = [lab_to_rgb(torch.cat([L, ab], dim=0)) for L, ab in zip(ins, truths)]
 
 ins2 = torch.cat(ins2, dim=0)
-preds2 = torch.cat([cluster_centers[torch.argmax(pred, dim=1).reshape(-1)]
-                  .reshape(pred.shape[0], pred.shape[2], pred.shape[3], 2)
-                  .permute(0, 3, 1, 2) for pred in preds2], dim=0)
-truths = torch.cat([(cluster_centers[truth] + 128).permute(0, 3, 1, 2)for truth in truths2], dim=0)
+preds_soft2 = torch.cat(preds_soft2, dim=0)
+preds_hard2 = torch.cat(preds_hard2, dim=0)
 ins2 = [unstandardize(x, L_mean, L_std)for x in ins2]
-preds2 = [unstandardize(x, ab_mean, ab_std)for x in preds2]
-preds_rgb2 = [lab_to_rgb(torch.cat([L, ab], dim=0)) for L, ab in zip(ins2, preds2)]
+preds_rgb_soft2 = [lab_to_rgb(torch.cat([L, ab], dim=0)) for L, ab in zip(ins2, preds_soft2)]
+preds_rgb_hard2 = [lab_to_rgb(torch.cat([L, ab], dim=0)) for L, ab in zip(ins2, preds_hard2)]
 truths_rgb2 = [lab_to_rgb(torch.cat([L, ab], dim=0)) for L, ab in zip(ins2, truths2)]
-print(test_loss, test_acc)
-print(loss2, acc2)
+print(test_loss, test_pix_acc, test_img_acc)
+print(loss2, pix_acc2, img_acc2)
 #%%
 # %matplotlib inline
 
 plt.figure()
-plt.plot(train_accs, label='Train accuracy')
-plt.plot(test_accs, label='Test accuracy')
-plt.axhline(y=test_acc, color='g', linestyle='--')
-plt.axhline(y=acc2, color='r', linestyle='--')
+plt.plot(train_pix_accs, label='Train pixel accuracy')
+plt.plot(val_pix_accs, label='Val pixel accuracy')
+plt.axhline(y=test_pix_acc, color='g', linestyle='--')
+plt.axhline(y=pix_acc2, color='r', linestyle='--')
+plt.xlabel('Epoch')
+plt.ylabel('Accuracy')
+plt.legend()
+plt.show()
+
+plt.figure()
+plt.plot(train_img_accs, label='Train per image accuracy')
+plt.plot(val_img_accs, label='Test per image accuracy')
+plt.axhline(y=test_img_acc, color='g', linestyle='--')
+plt.axhline(y=img_acc2, color='r', linestyle='--')
 plt.xlabel('Epoch')
 plt.ylabel('Accuracy')
 plt.legend()
@@ -521,7 +598,7 @@ plt.show()
 
 plt.figure()
 plt.plot(train_losses, label='Train loss')
-plt.plot(test_losses, label='Test loss')
+plt.plot(val_losses, label='Val loss')
 plt.axhline(y=test_loss, color='g', linestyle='--')
 plt.axhline(y=loss2, color='r', linestyle='--')
 plt.xlabel('Epoch')
@@ -538,8 +615,25 @@ for _ in range(5):
     plt.imshow(ins[idx].squeeze().cpu().numpy() , cmap='gray')
     plt.axis('off')
     plt.subplot(1, 3, 2)
-    plt.title('Predicted Image', fontsize=20)
-    plt.imshow(preds_rgb[idx])  # Already a [H, W, 3] NumPy RGB image
+    plt.title('Predicted Image (Soft)', fontsize=20)
+    plt.imshow(preds_rgb_soft[idx])  # Already a [H, W, 3] NumPy RGB image
+    plt.axis('off')
+    plt.subplot(1, 3, 3)
+    plt.title('Groundtruth Image', fontsize=20)
+    plt.imshow(truths_rgb[idx])  # Already a [H, W, 3] NumPy RGB image
+    plt.axis('off')
+    plt.show()
+
+for _ in range(5):
+    idx = np.random.randint(0, len(ins))
+    plt.figure(figsize=(15, 15))
+    plt.subplot(1, 3, 1)
+    plt.title('Gray Image', fontsize=20)
+    plt.imshow(ins[idx].squeeze().cpu().numpy() , cmap='gray')
+    plt.axis('off')
+    plt.subplot(1, 3, 2)
+    plt.title('Predicted Image (Hard)', fontsize=20)
+    plt.imshow(preds_rgb_hard[idx])  # Already a [H, W, 3] NumPy RGB image
     plt.axis('off')
     plt.subplot(1, 3, 3)
     plt.title('Groundtruth Image', fontsize=20)
