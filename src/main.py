@@ -536,19 +536,18 @@ def final_predict(net, testloader, loss_fn, micro_size=64):
             # Hard prediction, most probable
             ab_pred_hard = cluster_centers[out_mb.argmax(1)].permute(0, 3, 1, 2)
             preds_hard.append(ab_pred_hard.cpu())
-            truths.append((cluster_centers[tar_mb] + 128).permute(0, 3, 1, 2))
+            truths.append((cluster_centers[tar_mb] + 128).permute(0, 3, 1, 2).cpu())
         inputs, targets = prefetcher.next()
     pixel_total = pixel_total.clamp_min(1)
     image_count = image_count.clamp_min(1)
     return ins, preds_soft, preds_hard, truths, (loss_sum / pixel_total).item(), (pixel_correct / pixel_total).item(), (per_image_acc_sum / image_count).item()
 #%% final evaluation
+cluster_centers = cluster_centers.to(device)
 net.load_state_dict(torch.load('../models/checkpoint.pth'))
 ins, preds_soft, preds_hard, truths, test_loss, test_pix_acc, test_img_acc = final_predict(net, testloader, criterion)
 net_script = ModelWithLoss(net, RebalanceLoss(weights))
 net_script = torch.jit.script(net_script)
 net_script.save('../models/model_and_loss.pt')
-net.load_state_dict(torch.load('../models/lastcheck.pth'))
-ins2, preds_soft2, preds_hard2, truths2, loss2, pix_acc2, img_acc2 = final_predict(net, testloader, criterion)
 #%%
 ins = unstandardize(torch.cat(ins, dim=0), L_mean, L_std)
 preds_soft = torch.cat(preds_soft, dim=0)
@@ -558,16 +557,7 @@ truths = torch.cat(truths, dim=0)
 preds_rgb_soft = [lab_to_rgb(torch.cat([L, ab], dim=0)) for L, ab in zip(ins, preds_soft)]
 preds_rgb_hard = [lab_to_rgb(torch.cat([L, ab], dim=0)) for L, ab in zip(ins, preds_hard)]
 truths_rgb = [lab_to_rgb(torch.cat([L, ab], dim=0)) for L, ab in zip(ins, truths)]
-
-ins2 = unstandardize(torch.cat(ins2, dim=0), L_mean, L_std)
-preds_soft2 = torch.cat(preds_soft2, dim=0)
-preds_hard2 = torch.cat(preds_hard2, dim=0)
-truths2 = torch.cat(truths2, dim=0)
-preds_rgb_soft2 = [lab_to_rgb(torch.cat([L, ab], dim=0)) for L, ab in zip(ins2, preds_soft2)]
-preds_rgb_hard2 = [lab_to_rgb(torch.cat([L, ab], dim=0)) for L, ab in zip(ins2, preds_hard2)]
-truths_rgb2 = [lab_to_rgb(torch.cat([L, ab], dim=0)) for L, ab in zip(ins2, truths2)]
 print(test_loss, test_pix_acc, test_img_acc)
-print(loss2, pix_acc2, img_acc2)
 #%%
 # %matplotlib inline
 
@@ -575,7 +565,6 @@ plt.figure()
 plt.plot(train_pix_accs, label='Train pixel accuracy')
 plt.plot(val_pix_accs, label='Val pixel accuracy')
 plt.axhline(y=test_pix_acc, color='g', linestyle='--')
-plt.axhline(y=pix_acc2, color='r', linestyle='--')
 plt.xlabel('Epoch')
 plt.ylabel('Accuracy')
 plt.legend()
@@ -585,7 +574,6 @@ plt.figure()
 plt.plot(train_img_accs, label='Train per image accuracy')
 plt.plot(val_img_accs, label='Test per image accuracy')
 plt.axhline(y=test_img_acc, color='g', linestyle='--')
-plt.axhline(y=img_acc2, color='r', linestyle='--')
 plt.xlabel('Epoch')
 plt.ylabel('Accuracy')
 plt.legend()
@@ -595,7 +583,6 @@ plt.figure()
 plt.plot(train_losses, label='Train loss')
 plt.plot(val_losses, label='Val loss')
 plt.axhline(y=test_loss, color='g', linestyle='--')
-plt.axhline(y=loss2, color='r', linestyle='--')
 plt.xlabel('Epoch')
 plt.ylabel('Loss')
 plt.ylim(bottom=0)
@@ -605,33 +592,20 @@ plt.show()
 for _ in range(5):
     idx = np.random.randint(0, len(ins))
     plt.figure(figsize=(15, 15))
-    plt.subplot(1, 3, 1)
-    plt.title('Gray Image', fontsize=20)
+    plt.subplot(1, 4, 1)
+    plt.title('Gray', fontsize=20)
     plt.imshow(ins[idx].squeeze().cpu().numpy() , cmap='gray')
     plt.axis('off')
-    plt.subplot(1, 3, 2)
-    plt.title('Predicted Image (Soft)', fontsize=20)
-    plt.imshow(preds_rgb_soft[idx])  # Already a [H, W, 3] NumPy RGB image
+    plt.subplot(1, 4, 2)
+    plt.title('Predicted (Soft)', fontsize=20)
+    plt.imshow(preds_rgb_soft[idx])
     plt.axis('off')
-    plt.subplot(1, 3, 3)
-    plt.title('Groundtruth Image', fontsize=20)
-    plt.imshow(truths_rgb[idx])  # Already a [H, W, 3] NumPy RGB image
+    plt.subplot(1, 4, 3)
+    plt.title('Predicted (Hard)', fontsize=20)
+    plt.imshow(preds_rgb_hard[idx])
     plt.axis('off')
-    plt.show()
-
-for _ in range(5):
-    idx = np.random.randint(0, len(ins))
-    plt.figure(figsize=(15, 15))
-    plt.subplot(1, 3, 1)
-    plt.title('Gray Image', fontsize=20)
-    plt.imshow(ins[idx].squeeze().cpu().numpy() , cmap='gray')
-    plt.axis('off')
-    plt.subplot(1, 3, 2)
-    plt.title('Predicted Image (Hard)', fontsize=20)
-    plt.imshow(preds_rgb_hard[idx])  # Already a [H, W, 3] NumPy RGB image
-    plt.axis('off')
-    plt.subplot(1, 3, 3)
-    plt.title('Groundtruth Image', fontsize=20)
-    plt.imshow(truths_rgb[idx])  # Already a [H, W, 3] NumPy RGB image
+    plt.subplot(1, 4, 4)
+    plt.title('Groundtruth', fontsize=20)
+    plt.imshow(truths_rgb[idx])
     plt.axis('off')
     plt.show()
