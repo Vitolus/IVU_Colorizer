@@ -496,7 +496,6 @@ class ModelWithLoss(nn.Module):
         preds = self.net(x)
         return self.loss_fn(preds, y)
 #%%
-#TODO: add a progress bar to the final evaluation
 @torch.inference_mode()
 def final_predict(net, testloader, loss_fn, micro_size=64):
     net.eval()
@@ -531,13 +530,13 @@ def final_predict(net, testloader, loss_fn, micro_size=64):
             if valid_pixels.item() > 0:
                 loss_sum += loss_mb.detach() * valid_pixels
             ins.append(inp_mb.cpu())
-            # Soft prediction (media pesata)
+            # Soft prediction, weighted mean
             ab_pred_soft = torch.einsum('bchw,cd->bdhw', torch.softmax(out_mb.float(), dim=1), cluster_centers)
             preds_soft.append(ab_pred_soft.cpu())
-            # Hard prediction (cluster più probabile)
-            ab_pred_hard = cluster_centers[out_mb.argmax(1)]
+            # Hard prediction, most probable
+            ab_pred_hard = cluster_centers[out_mb.argmax(1)].permute(0, 3, 1, 2)
             preds_hard.append(ab_pred_hard.cpu())
-            truths.append(tar_mb.cpu())
+            truths.append((cluster_centers[tar_mb] + 128).permute(0, 3, 1, 2))
         inputs, targets = prefetcher.next()
     pixel_total = pixel_total.clamp_min(1)
     image_count = image_count.clamp_min(1)
@@ -551,24 +550,19 @@ net_script.save('../models/model_and_loss.pt')
 net.load_state_dict(torch.load('../models/lastcheck.pth'))
 ins2, preds_soft2, preds_hard2, truths2, loss2, pix_acc2, img_acc2 = final_predict(net, testloader, criterion)
 #%%
-#TODO: ----> 9 preds_rgb_hard = [lab_to_rgb(torch.cat([L, ab], dim=0)) for L, ab in zip(ins, preds_hard)]
-# RuntimeError: Sizes of tensors must match except in dimension 0. Expected size 160 but got size 2 for tensor number 1 in the list.
-#TODO: check why predicted are pink, maybe normalization issue
-ins = torch.cat(ins, dim=0)
+ins = unstandardize(torch.cat(ins, dim=0), L_mean, L_std)
 preds_soft = torch.cat(preds_soft, dim=0)
 preds_hard = torch.cat(preds_hard, dim=0)
-truths = torch.cat([(cluster_centers[truth] + 128).permute(0, 3, 1, 2)for truth in truths], dim=0)
-
-ins = [unstandardize(x, L_mean, L_std)for x in ins]
+truths = torch.cat(truths, dim=0)
 
 preds_rgb_soft = [lab_to_rgb(torch.cat([L, ab], dim=0)) for L, ab in zip(ins, preds_soft)]
 preds_rgb_hard = [lab_to_rgb(torch.cat([L, ab], dim=0)) for L, ab in zip(ins, preds_hard)]
 truths_rgb = [lab_to_rgb(torch.cat([L, ab], dim=0)) for L, ab in zip(ins, truths)]
 
-ins2 = torch.cat(ins2, dim=0)
+ins2 = unstandardize(torch.cat(ins2, dim=0), L_mean, L_std)
 preds_soft2 = torch.cat(preds_soft2, dim=0)
 preds_hard2 = torch.cat(preds_hard2, dim=0)
-ins2 = [unstandardize(x, L_mean, L_std)for x in ins2]
+truths2 = torch.cat(truths2, dim=0)
 preds_rgb_soft2 = [lab_to_rgb(torch.cat([L, ab], dim=0)) for L, ab in zip(ins2, preds_soft2)]
 preds_rgb_hard2 = [lab_to_rgb(torch.cat([L, ab], dim=0)) for L, ab in zip(ins2, preds_hard2)]
 truths_rgb2 = [lab_to_rgb(torch.cat([L, ab], dim=0)) for L, ab in zip(ins2, truths2)]
