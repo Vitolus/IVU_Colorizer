@@ -18,10 +18,16 @@ import numpy as np
 import matplotlib.pyplot as plt
 #%%
 SIZE = 160
+seed = 42
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
-torch.backends.cudnn.benchmark = True
-torch.backends.cuda.matmul.allow_tf32 = True
-torch.backends.cudnn.allow_tf32  = True
+np.random.seed(seed)
+torch.manual_seed(seed) # if using CPU
+torch.cuda.manual_seed(seed) # if using single-GPU
+torch.cuda.manual_seed_all(seed) # if using multi-GPU
+torch.backends.cudnn.deterministic = True # deterministic mode
+torch.backends.cudnn.benchmark = False # disable auto-tuner to find the best algorithm to use for your hardware
+torch.backends.cuda.matmul.allow_tf32 = True # allow TensorFloat-32 on matmul operations
+torch.backends.cudnn.allow_tf32  = True # allow TensorFloat-32 on convolution operations
 print("Using device: ", device)
 #%%
 def sort_files(folder):
@@ -210,27 +216,24 @@ class RebalanceLoss(nn.Module):
     def forward(self, preds, labels):
         return self.loss_fn(preds, labels)
 #%%
-def fit(net, trainloader, optimizer, scaler, loss_fn, accum_steps=4):
+def fit(net, trainloader, optimizer, scaler, loss_fn):
     net.train()
     loss_sum = torch.zeros(1, device=device) # sum of per-pixel losses
     pixel_acc = torch.zeros(1, device=device) # total correct pixels
     pixel_total = torch.zeros(1, device=device) # total valid pixels
     image_acc = torch.zeros(1, device=device) # sum of per-image accuracies
     image_count = torch.zeros(1, device=device) # count of images contributing to per-image metric
-    optimizer.zero_grad(set_to_none=True)
     prefetcher = CUDAPrefetcher(trainloader)
     inputs, targets = prefetcher.next()
     batch_idx = 0
     while inputs is not None:
+        optimizer.zero_grad(set_to_none=True)
         with torch.cuda.amp.autocast():
             out = net(inputs)
             loss = loss_fn(out, targets)
-            accum_loss = loss / accum_steps
-        scaler.scale(accum_loss).backward()
-        if (batch_idx + 1) % accum_steps == 0:
-            scaler.step(optimizer)
-            scaler.update()
-            optimizer.zero_grad(set_to_none=True)
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
         with torch.no_grad():
             valid = torch.ones_like(targets, dtype=torch.bool)
             # Pixel accuracy
@@ -251,11 +254,6 @@ def fit(net, trainloader, optimizer, scaler, loss_fn, accum_steps=4):
                 loss_sum += loss.detach() * batch_valid_pixels
         # Get the next batch from the prefetcher
         inputs, targets = prefetcher.next()
-        batch_idx += 1
-    if batch_idx % accum_steps != 0:
-        scaler.step(optimizer)
-        scaler.update()
-        optimizer.zero_grad(set_to_none=True)
     # Safeguards against division by zero
     total_valid_pixels = pixel_total.clamp_min(1)
     total_valid_images = image_count.clamp_min(1)
@@ -294,7 +292,7 @@ def predict(net, valloader, loss_fn):
         if batch_valid_pixels.item() > 0:
             loss_sum += loss.detach() * batch_valid_pixels
         # Get the next batch from the prefetcher
-    inputs, targets = prefetcher.next()
+        inputs, targets = prefetcher.next()
     # Safeguards against division by zero
     total_valid_pixels = pixel_total.clamp_min(1)
     total_valid_images = image_count.clamp_min(1)
@@ -491,6 +489,7 @@ def final_predict(net, valloader, loss_fn):
     ins, preds_soft, preds_hard, truths = [], [], [], []
     prefetcher = CUDAPrefetcher(valloader)
     inputs, targets = prefetcher.next()
+    batch_bar = tqdm(total=len(valloader), desc='Final Predicting', leave=False)
     while inputs is not None:
         with torch.cuda.amp.autocast():
             out = net(inputs)
@@ -519,6 +518,8 @@ def final_predict(net, valloader, loss_fn):
         preds_hard.append(ab_pred_hard.cpu())
         truths.append((cluster_centers[targets] + 128).permute(0, 3, 1, 2).cpu())
         inputs, targets = prefetcher.next()
+        batch_bar.update(1)
+    batch_bar.close()
     # Safeguards against division by zero
     total_valid_pixels = pixel_total.clamp_min(1)
     total_valid_images = image_count.clamp_min(1)
