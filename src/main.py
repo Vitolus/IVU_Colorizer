@@ -210,111 +210,87 @@ class RebalanceLoss(nn.Module):
     def forward(self, preds, labels):
         return self.loss_fn(preds, labels)
 #%%
-def fit(net, trainloader, optimizer, scaler, loss_fn, micro_size=64, acc_steps=4):
+def fit(net, trainloader, optimizer, scaler, loss_fn):
     net.train()
     loss_sum = torch.zeros(1, device=device) # sum of per-pixel losses
     pixel_acc = torch.zeros(1, device=device) # total correct pixels
     pixel_total = torch.zeros(1, device=device) # total valid pixels
     image_acc = torch.zeros(1, device=device) # sum of per-image accuracies
     image_count = torch.zeros(1, device=device) # count of images contributing to per-image metric
-    optimizer.zero_grad(set_to_none=True)
     prefetcher = CUDAPrefetcher(trainloader)
     inputs, targets = prefetcher.next()
-    accum_in_window = 0
     while inputs is not None:
-        num_chunks = (inputs.size(0) + micro_size - 1) // micro_size
-        for inp_mb, tar_mb in zip(inputs.chunk(num_chunks, dim=0), targets.chunk(num_chunks, dim=0)):
-            with torch.cuda.amp.autocast():
-                out_mb = net(inp_mb)
-                loss_mb = loss_fn(out_mb, tar_mb)
-            loss_scaled = loss_mb / acc_steps
-            scaler.scale(loss_scaled).backward()
-            accum_in_window += 1
-            with torch.no_grad():
-                pred = out_mb.argmax(1) # predicted label for each pixel [B, H, W]
-                valid = torch.ones_like(tar_mb, dtype=torch.bool)
-                # Pixel accuracy
-                correct = (pred == tar_mb) & valid
-                pixel_acc += correct.sum()
-                batch_valid_pixels = valid.sum()
-                pixel_total += batch_valid_pixels
-                # Mean per-image accuracy
-                # For each image: correct_i / valid_i (skip images with 0 valid pixels)
-                B = tar_mb.size(0)
-                correct_per = correct.view(B, -1).sum(dim=1)
-                valid_per = valid.view(B, -1).sum(dim=1)
-                valid_imgs = valid_per > 0
-                if valid_imgs.any():
-                    image_acc += (correct_per[valid_imgs].float() / valid_per[valid_imgs].float()).sum()
-                    image_count += valid_imgs.sum()
-                # Loss averaging across epoch:
-                # If loss_fn is mean over valid pixels, convert back to sum by multiplying to valid count.
-                if batch_valid_pixels.item() > 0:
-                    loss_sum += loss_mb.detach() * batch_valid_pixels
-            # Step on full accumulation window
-            if accum_in_window == acc_steps:
-                scaler.step(optimizer)
-                scaler.update()
-                optimizer.zero_grad(set_to_none=True)
-                accum_in_window = 0
-        inputs, targets = prefetcher.next()
-    # Handle a final partial accumulation window properly (to keep the same effective loss scale)
-    if accum_in_window > 0:
-        # We divided each micro-batch by acc_steps; adjust grads by acc_steps/accum_in_window
-        # so the step uses the average over the actual number of micro-batches accumulated.
-        scaler.unscale_(optimizer)
-        adjust = acc_steps / float(accum_in_window)
-        for p in net.parameters():
-            if p.grad is not None:
-                p.grad.mul_(adjust)
+        optimizer.zero_grad(set_to_none=True)
+        with torch.cuda.amp.autocast():
+            out = net(inputs)
+            loss = loss_fn(out, targets)
+        scaler.scale(loss).backward()
         scaler.step(optimizer)
         scaler.update()
-        optimizer.zero_grad(set_to_none=True)
+        with torch.no_grad():
+            valid = torch.ones_like(targets, dtype=torch.bool)
+            # Pixel accuracy
+            correct = (out.argmax(1) == targets) & valid
+            pixel_acc += correct.sum()
+            batch_valid_pixels = valid.sum()
+            pixel_total += batch_valid_pixels
+            # Mean per-image accuracy
+            B = targets.size(0)
+            correct_per = correct.reshape(B, -1).sum(dim=1)
+            valid_per = valid.reshape(B, -1).sum(dim=1)
+            valid_imgs = valid_per > 0
+            if valid_imgs.any():
+                image_acc += (correct_per[valid_imgs].float() / valid_per[valid_imgs].float()).sum()
+                image_count += valid_imgs.sum()
+            # Loss averaging across epoch
+            if batch_valid_pixels.item() > 0:
+                loss_sum += loss.detach() * batch_valid_pixels
+        # Get the next batch from the prefetcher
+        inputs, targets = prefetcher.next()
     # Safeguards against division by zero
     total_valid_pixels = pixel_total.clamp_min(1)
     total_valid_images = image_count.clamp_min(1)
-    return (loss_sum / total_valid_pixels).item(), (pixel_acc / total_valid_pixels).item(), (image_acc / total_valid_images).item()
+    return ((loss_sum / total_valid_pixels).item(), (pixel_acc / total_valid_pixels).item(),
+            (image_acc / total_valid_images).item())
 
 @torch.inference_mode()
-def predict(net, valloader, loss_fn, micro_size=64):
+def predict(net, valloader, loss_fn):
     net.eval()
     loss_sum = torch.zeros(1, device=device)
-    pixel_correct = torch.zeros(1, device=device)
+    pixel_acc = torch.zeros(1, device=device)
     pixel_total = torch.zeros(1, device=device)
-    per_image_acc_sum = torch.zeros(1, device=device)
+    image_acc = torch.zeros(1, device=device)
     image_count = torch.zeros(1, device=device)
     prefetcher = CUDAPrefetcher(valloader)
     inputs, targets = prefetcher.next()
     while inputs is not None:
-        num_chunks = (inputs.size(0) + micro_size - 1) // micro_size
-        for inp_mb, tar_mb in zip(inputs.chunk(num_chunks, dim=0), targets.chunk(num_chunks, dim=0)):
-            with torch.cuda.amp.autocast():
-                out_mb = net(inp_mb)
-                loss_mb = loss_fn(out_mb, tar_mb)  # scalar loss over valid pixels
-            pred = out_mb.argmax(1)  # [B, H, W]
-            valid = torch.ones_like(tar_mb, dtype=torch.bool)
-            # Pixel-wise
-            correct = (pred == tar_mb) & valid
-            pixel_correct += correct.sum()
-            pixel_total += valid.sum()
-            # Per-image accuracy
-            B = tar_mb.size(0)
-            correct_per = correct.view(B, -1).sum(dim=1)
-            valid_per = valid.view(B, -1).sum(dim=1)
-            valid_imgs = (valid_per > 0)
-            if valid_imgs.any():
-                per_image_acc = (correct_per[valid_imgs].float() / valid_per[valid_imgs].float()).sum()
-                per_image_acc_sum += per_image_acc
-                image_count += valid_imgs.sum()
-            # Loss: if reduced by valid pixels, scale back to total loss
-            valid_pixels = valid.sum()
-            if valid_pixels.item() > 0:
-                loss_sum += loss_mb.detach() * valid_pixels
-        inputs, targets = prefetcher.next()
-    # Avoid division by zero
-    pixel_total = pixel_total.clamp_min(1)
-    image_count = image_count.clamp_min(1)
-    return (loss_sum / pixel_total).item(), (pixel_correct / pixel_total).item(), (per_image_acc_sum / image_count).item()
+        with torch.cuda.amp.autocast():
+            out = net(inputs)
+            loss = loss_fn(out, targets)
+        valid = torch.ones_like(targets, dtype=torch.bool)
+        # Pixel accuracy
+        correct = (out.argmax(1) == targets) & valid
+        pixel_acc += correct.sum()
+        batch_valid_pixels = valid.sum()
+        pixel_total += batch_valid_pixels
+        # Mean per-image accuracy
+        B = targets.size(0)
+        correct_per = correct.reshape(B, -1).sum(dim=1)
+        valid_per = valid.reshape(B, -1).sum(dim=1)
+        valid_imgs = valid_per > 0
+        if valid_imgs.any():
+            image_acc += (correct_per[valid_imgs].float() / valid_per[valid_imgs].float()).sum()
+            image_count += valid_imgs.sum()
+        # Loss averaging across epoch
+        if batch_valid_pixels.item() > 0:
+            loss_sum += loss.detach() * batch_valid_pixels
+        # Get the next batch from the prefetcher
+    inputs, targets = prefetcher.next()
+    # Safeguards against division by zero
+    total_valid_pixels = pixel_total.clamp_min(1)
+    total_valid_images = image_count.clamp_min(1)
+    return ((loss_sum / total_valid_pixels).item(), (pixel_acc / total_valid_pixels).item(),
+            (image_acc / total_valid_images).item())
 #%%
 def objective(trial, trainset, scaler, X):
     lr = trial.suggest_float('lr', 1e-5, 1e-1, log=True)
@@ -472,11 +448,11 @@ for epoch in prog_bar:
     val_losses.append(val_loss)
     val_pix_accs.append(val_pix_acc)
     val_img_accs.append(val_img_acc)
-    scheduler.step(val_loss)
+    #scheduler.step(val_img_acc)
     early_stopping(val_loss, net)
     current_lr = optimizer.param_groups[0]['lr']
-    prog_bar.set_description(f"Epoch {epoch + 1}, lr {current_lr} | Metrics train/val: Pixel Acc={train_pix_acc:.3e}/{val_pix_acc:.3e}, "
-                             f"{train_img_acc:.3e}/{val_img_acc:.3e} | Loss: {train_loss:.3e}/{val_loss:.3e}")
+    prog_bar.set_description(f"Epoch {epoch + 1}, lr={current_lr} | Metrics train/val: Pixel Acc={train_pix_acc:.3e}/{val_pix_acc:.3e}, "
+                             f"Image Acc={train_img_acc:.3e}/{val_img_acc:.3e} | Loss: {train_loss:.3e}/{val_loss:.3e}")
     writer.add_scalar('Loss/train', train_loss, epoch)
     writer.add_scalar('Loss/val', val_loss, epoch)
     update_plot()
@@ -496,51 +472,49 @@ class ModelWithLoss(nn.Module):
         preds = self.net(x)
         return self.loss_fn(preds, y)
 #%%
-@torch.inference_mode()
-def final_predict(net, testloader, loss_fn, micro_size=64):
+def final_predict(net, valloader, loss_fn):
     net.eval()
     loss_sum = torch.zeros(1, device=device)
-    pixel_correct = torch.zeros(1, device=device)
+    pixel_acc = torch.zeros(1, device=device)
     pixel_total = torch.zeros(1, device=device)
-    per_image_acc_sum = torch.zeros(1, device=device)
+    image_acc = torch.zeros(1, device=device)
     image_count = torch.zeros(1, device=device)
     ins, preds_soft, preds_hard, truths = [], [], [], []
-    prefetcher = CUDAPrefetcher(testloader)
+    prefetcher = CUDAPrefetcher(valloader)
     inputs, targets = prefetcher.next()
     while inputs is not None:
-        num_chunks = (inputs.size(0) + micro_size - 1) // micro_size
-        for inp_mb, tar_mb in zip(inputs.chunk(num_chunks, dim=0), targets.chunk(num_chunks, dim=0)):
-            with torch.cuda.amp.autocast():
-                out_mb = net(inp_mb)
-                loss_mb = loss_fn(out_mb, tar_mb)
-            pred = out_mb.argmax(1)
-            valid = torch.ones_like(tar_mb, dtype=torch.bool)
-            correct = (pred == tar_mb) & valid
-            pixel_correct += correct.sum()
-            pixel_total += valid.sum()
-            B = tar_mb.size(0)
-            correct_per = correct.view(B, -1).sum(dim=1)
-            valid_per = valid.view(B, -1).sum(dim=1)
-            valid_imgs = (valid_per > 0)
-            if valid_imgs.any():
-                per_image_acc = (correct_per[valid_imgs].float() / valid_per[valid_imgs].float()).sum()
-                per_image_acc_sum += per_image_acc
-                image_count += valid_imgs.sum()
-            valid_pixels = valid.sum()
-            if valid_pixels.item() > 0:
-                loss_sum += loss_mb.detach() * valid_pixels
-            ins.append(inp_mb.cpu())
-            # Soft prediction, weighted mean
-            ab_pred_soft = torch.einsum('bchw,cd->bdhw', torch.softmax(out_mb.float(), dim=1), cluster_centers)
-            preds_soft.append(ab_pred_soft.cpu())
-            # Hard prediction, most probable
-            ab_pred_hard = cluster_centers[out_mb.argmax(1)].permute(0, 3, 1, 2)
-            preds_hard.append(ab_pred_hard.cpu())
-            truths.append((cluster_centers[tar_mb] + 128).permute(0, 3, 1, 2).cpu())
+        with torch.cuda.amp.autocast():
+            out = net(inputs)
+            loss = loss_fn(out, targets)
+        valid = torch.ones_like(targets, dtype=torch.bool)
+        # Pixel accuracy
+        correct = (out.argmax(1) == targets) & valid
+        pixel_acc += correct.sum()
+        batch_valid_pixels = valid.sum()
+        pixel_total += batch_valid_pixels
+        # Mean per-image accuracy
+        B = targets.size(0)
+        correct_per = correct.reshape(B, -1).sum(dim=1)
+        valid_per = valid.reshape(B, -1).sum(dim=1)
+        valid_imgs = valid_per > 0
+        if valid_imgs.any():
+            image_acc += (correct_per[valid_imgs].float() / valid_per[valid_imgs].float()).sum()
+            image_count += valid_imgs.sum()
+        # Loss averaging across epoch
+        if batch_valid_pixels.item() > 0:
+            loss_sum += loss.detach() * batch_valid_pixels
+        ins.append(inputs.cpu())
+        ab_pred_soft = torch.einsum('bchw,cd->bdhw', torch.softmax(out.float(), dim=1), cluster_centers)
+        preds_soft.append(ab_pred_soft.cpu())
+        ab_pred_hard = cluster_centers[out.argmax(1)].permute(0, 3, 1, 2)
+        preds_hard.append(ab_pred_hard.cpu())
+        truths.append((cluster_centers[targets] + 128).permute(0, 3, 1, 2).cpu())
         inputs, targets = prefetcher.next()
-    pixel_total = pixel_total.clamp_min(1)
-    image_count = image_count.clamp_min(1)
-    return ins, preds_soft, preds_hard, truths, (loss_sum / pixel_total).item(), (pixel_correct / pixel_total).item(), (per_image_acc_sum / image_count).item()
+    # Safeguards against division by zero
+    total_valid_pixels = pixel_total.clamp_min(1)
+    total_valid_images = image_count.clamp_min(1)
+    return (ins, preds_soft, preds_hard, truths, (loss_sum / total_valid_pixels).item(),
+            (pixel_acc / total_valid_pixels).item(), (image_acc / total_valid_images).item())
 #%% final evaluation
 cluster_centers = cluster_centers.to(device)
 net.load_state_dict(torch.load('../models/checkpoint.pth'))
