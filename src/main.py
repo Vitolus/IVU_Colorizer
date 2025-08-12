@@ -210,23 +210,27 @@ class RebalanceLoss(nn.Module):
     def forward(self, preds, labels):
         return self.loss_fn(preds, labels)
 #%%
-def fit(net, trainloader, optimizer, scaler, loss_fn):
+def fit(net, trainloader, optimizer, scaler, loss_fn, accum_steps=4):
     net.train()
     loss_sum = torch.zeros(1, device=device) # sum of per-pixel losses
     pixel_acc = torch.zeros(1, device=device) # total correct pixels
     pixel_total = torch.zeros(1, device=device) # total valid pixels
     image_acc = torch.zeros(1, device=device) # sum of per-image accuracies
     image_count = torch.zeros(1, device=device) # count of images contributing to per-image metric
+    optimizer.zero_grad(set_to_none=True)
     prefetcher = CUDAPrefetcher(trainloader)
     inputs, targets = prefetcher.next()
+    batch_idx = 0
     while inputs is not None:
-        optimizer.zero_grad(set_to_none=True)
         with torch.cuda.amp.autocast():
             out = net(inputs)
             loss = loss_fn(out, targets)
-        scaler.scale(loss).backward()
-        scaler.step(optimizer)
-        scaler.update()
+            accum_loss = loss / accum_steps
+        scaler.scale(accum_loss).backward()
+        if (batch_idx + 1) % accum_steps == 0:
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad(set_to_none=True)
         with torch.no_grad():
             valid = torch.ones_like(targets, dtype=torch.bool)
             # Pixel accuracy
@@ -247,6 +251,11 @@ def fit(net, trainloader, optimizer, scaler, loss_fn):
                 loss_sum += loss.detach() * batch_valid_pixels
         # Get the next batch from the prefetcher
         inputs, targets = prefetcher.next()
+        batch_idx += 1
+    if batch_idx % accum_steps != 0:
+        scaler.step(optimizer)
+        scaler.update()
+        optimizer.zero_grad(set_to_none=True)
     # Safeguards against division by zero
     total_valid_pixels = pixel_total.clamp_min(1)
     total_valid_images = image_count.clamp_min(1)
