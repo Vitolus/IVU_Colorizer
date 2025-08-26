@@ -50,6 +50,7 @@ for file in tqdm(folder, desc='Loading color images'):
     target_ab.append(ab)
 input_L = np.array(input_L).astype(np.float32) # (N, H, W, 1)
 target_ab = np.array(target_ab).astype(np.uint8) # (N, H, W, 2)
+# TODO: change ground truth to be quantized instead of true ab values
 print(input_L.shape, target_ab.shape)
 #%%
 for _ in range(5):
@@ -72,8 +73,8 @@ for _ in range(5):
 #%%
 input_L = np.transpose(input_L, (0, 3, 1, 2)) # (N, 1, H, W)
 target_ab = np.transpose(target_ab, (0, 3, 1, 2)) # (N, 2, H, W)
-L_train, L_test, ab_train, ab_test = train_test_split(input_L, target_ab, test_size=0.3, random_state=42)
-L_val, L_test, ab_val, ab_test = train_test_split(L_test, ab_test, test_size=0.3, random_state=42)
+L_train, L_test, ab_train, ab_test = train_test_split(input_L, target_ab, test_size=0.3, random_state=seed)
+L_val, L_test, ab_val, ab_test = train_test_split(L_test, ab_test, test_size=0.3, random_state=seed)
 del input_L, target_ab
 L_train = torch.tensor(L_train, dtype=torch.float32)
 ab_train = torch.tensor(ab_train, dtype=torch.uint8)
@@ -130,7 +131,7 @@ class MyDataset(torch.utils.data.Dataset):
             idx = (a * 256 + b).reshape(a.size(0), -1)
             labels = lut[idx]
             self.labels = labels.reshape_as(a)
-        del ab_data, a, b, idx, labels, lut
+        del a, b, idx, labels, lut
     def __len__(self):
         return self.L_data.size(0)
 
@@ -184,7 +185,7 @@ del dists
 trainset = MyDataset(L_train, ab_train, lut, L_transform=transforms.Normalize(mean=L_mean, std=L_std))
 valset = MyDataset(L_val, ab_val, lut, L_transform=transforms.Normalize(mean=L_mean, std=L_std))
 testset = MyDataset(L_test, ab_test, lut, L_transform=transforms.Normalize(mean=L_mean, std=L_std))
-del L_train, L_test, ab_train, ab_test # release memory
+del L_train, L_test, ab_train, ab_test
 #%%
 def save_checkpoint(model, name='checkpoint'):
     torch.save(model.state_dict(), f"../models/{name}.pth")
@@ -206,17 +207,8 @@ class EarlyStopping:
             self.counter += 1
             if self.counter >= self.patience:
                 self.early_stop = True
-#%% Loss functions
-class RebalanceLoss(nn.Module):
-    def __init__(self, weights):
-        super(RebalanceLoss, self).__init__()
-        self.register_buffer('class_weights', weights)
-        self.loss_fn = nn.CrossEntropyLoss(weight=self.class_weights, reduction='mean')
-
-    def forward(self, preds, labels):
-        return self.loss_fn(preds, labels)
 #%%
-def fit(net, trainloader, optimizer, scaler, loss_fn):
+def fit(net, trainloader, optimizer, scaler, loss_fn, beta=0.5):
     net.train()
     loss_sum = torch.zeros(1, device=device) # sum of per-pixel losses
     pixel_acc = torch.zeros(1, device=device) # total correct pixels
@@ -225,13 +217,16 @@ def fit(net, trainloader, optimizer, scaler, loss_fn):
     image_count = torch.zeros(1, device=device) # count of images contributing to per-image metric
     prefetcher = CUDAPrefetcher(trainloader)
     inputs, targets = prefetcher.next()
-    batch_idx = 0
     while inputs is not None:
         optimizer.zero_grad(set_to_none=True)
         with torch.cuda.amp.autocast():
-            out = net(inputs)
-            loss = loss_fn(out, targets)
+            out, mu, logvar = net(inputs)
+            loss_clf = loss_fn(out, targets)
+            loss_kld = ((-0.5 * torch.mean(1 + logvar - mu ** 2 - logvar.exp())) /
+                        (inputs.size(0) * inputs.size(2) * inputs.size(3))) # normalize by batch*H*W
+            loss = loss_clf + beta * loss_kld
         scaler.scale(loss).backward()
+        nn.utils.clip_grad_norm_(net.parameters(), 3)
         scaler.step(optimizer)
         scaler.update()
         with torch.no_grad():
@@ -261,7 +256,7 @@ def fit(net, trainloader, optimizer, scaler, loss_fn):
             (image_acc / total_valid_images).item())
 
 @torch.inference_mode()
-def predict(net, valloader, loss_fn):
+def predict(net, valloader, loss_fn, beta=0.5):
     net.eval()
     loss_sum = torch.zeros(1, device=device)
     pixel_acc = torch.zeros(1, device=device)
@@ -272,8 +267,11 @@ def predict(net, valloader, loss_fn):
     inputs, targets = prefetcher.next()
     while inputs is not None:
         with torch.cuda.amp.autocast():
-            out = net(inputs)
-            loss = loss_fn(out, targets)
+            out, mu, logvar = net(inputs)
+            loss_clf = loss_fn(out, targets)
+            loss_kld = ((-0.5 * torch.mean(1 + logvar - mu ** 2 - logvar.exp())) /
+                        (inputs.size(0) * inputs.size(2) * inputs.size(3)))  # normalize by batch*H*W
+            loss = loss_clf + beta * loss_kld
         valid = torch.ones_like(targets, dtype=torch.bool)
         # Pixel accuracy
         correct = (out.argmax(1) == targets) & valid
@@ -312,7 +310,7 @@ def objective(trial, trainset, scaler, X):
         valloader = DataLoader(trainset, batch_size=batch_size, sampler=SubsetRandomSampler(val_idx), num_workers=4, pin_memory=True, prefetch_factor=2)
         prior = compute_ab_prior(trainloader)
         weights = make_rebalancing_weights(prior, alpha=0.5)
-        criterion = RebalanceLoss(weights).to(device, memory_format=torch.channels_last)
+        criterion = nn.CrossEntropyLoss(weight=weights, reduction='mean').to(device, memory_format=torch.channels_last)
         net = Net().to(device, memory_format=torch.channels_last)
         optimizer = optim.Adam(net.parameters(), lr=lr)
         scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5)
@@ -334,7 +332,7 @@ def objective(trial, trainset, scaler, X):
     return mean_loss
 #%%
 class Net(nn.Module):
-    def __init__(self):
+    def __init__(self, latent_dim=256):
         super(Net, self).__init__()
         self.conv1 = nn.Conv2d(1, 128, 4, 2, 1)  # input is L only
         self.conv2 = nn.Conv2d(128, 128, 4, 2, 1)
@@ -342,18 +340,22 @@ class Net(nn.Module):
         self.conv4 = nn.Conv2d(256, 512, 4, 2, 1)
         self.conv5 = nn.Conv2d(512, 512, 4, 2, 1)
 
+        self.fc_mu = nn.Linear(512 * 5 * 5, latent_dim)
+        self.fc_logvar = nn.Linear(512 * 5 * 5, latent_dim)
+        self.fc_decode = nn.Linear(latent_dim, 512 * 5 * 5)
+
         self.convt1 = nn.ConvTranspose2d(512, 512, 4, 2, 1)
         self.convt2 = nn.ConvTranspose2d(1024, 256, 4, 2, 1)
         self.convt3 = nn.ConvTranspose2d(512, 128, 4, 2, 1)
         self.convt4 = nn.ConvTranspose2d(256, 128, 4, 2, 1)
-        self.convt5 = nn.ConvTranspose2d(256, 2, 4, 2, 1)  # output is ab (2 channels)
+        self.convt5 = nn.ConvTranspose2d(256, 128, 4, 2, 1)
 
         self.bnorm1 = nn.BatchNorm2d(256)
         self.bnorm2 = nn.BatchNorm2d(512)
         self.bnorm3 = nn.BatchNorm2d(512)
         self.dropout = nn.Dropout(0.2)
         self.lrelu = nn.LeakyReLU(inplace=True)
-        self.classifier = nn.Conv2d(3, 313, 1, 1)  # concat u5 + x = (2+1)=3 -> 313 channels
+        self.classifier = nn.Conv2d(128, 313, 1, 1)
 
     def forward(self, x): # x is (B, 1, H, W) => L channel
         d1 = self.lrelu(self.conv1(x)) # (B, 128, 80, 80)
@@ -361,6 +363,16 @@ class Net(nn.Module):
         d3 = self.lrelu(self.bnorm1(self.conv3(d2))) # (B, 256, 20, 20)
         d4 = self.lrelu(self.bnorm2(self.conv4(d3))) # (B, 512, 10, 10)
         d5 = self.lrelu(self.bnorm3(self.conv5(d4))) # (B, 512, 5, 5)
+
+        flat = torch.flatten(d5, start_dim=1) # (B, 512*5*5)
+        mu = self.fc_mu(flat) # (B, latent_dim)
+        logvar = self.fc_logvar(flat) # (B, latent_dim)
+        std = torch.exp(0.5 * logvar)
+        eps = torch.randn_like(std)
+        z = mu + eps * std # reparameterization trick
+        decode = self.fc_decode(z) # (B, 512*5*5)
+        d5 = decode.reshape(-1, 512, 5, 5)
+
         u1 = self.lrelu(self.convt1(d5)) # (B, 512, 10, 10)
         u1 = torch.cat([u1, d4], dim=1) # (B, 1024, 10, 10)
         u2 = self.lrelu(self.convt2(u1)) # (B, 256, 20, 20)
@@ -369,10 +381,9 @@ class Net(nn.Module):
         u3 = torch.cat([u3, d2], dim=1) # (B, 256, 40, 40)
         u4 = self.lrelu(self.convt4(u3)) # (B, 128, 80, 80)
         u4 = torch.cat([u4, d1], dim=1) # (B, 256, 80, 80)
-        u5 = self.lrelu(self.convt5(u4)) # (B, 2, 160, 160) — ab prediction
-        u5 = torch.cat([u5, x], dim=1) # (B, 3, 160, 160)
+        u5 = self.lrelu(self.convt5(u4)) # (B, 128, 160, 160)
         x = self.classifier(u5) # (B, 313, 160, 160)
-        return x
+        return x, mu, logvar
 #%%
 writer = SummaryWriter('../runs')
 net = Net().eval()
@@ -421,7 +432,7 @@ optimizer = optim.AdamW(net.parameters(), lr=1e-3, fused=True)
 scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5)
 prior = compute_ab_prior(trainloader).to(device)
 weights = make_rebalancing_weights(prior, alpha=0.5)
-criterion = RebalanceLoss(weights).to(device, memory_format=torch.channels_last)
+criterion = nn.CrossEntropyLoss(weight=weights, reduction='mean').to(device, memory_format=torch.channels_last)
 del prior, dummy
 gc.collect()
 torch.cuda.empty_cache()
@@ -529,7 +540,7 @@ def final_predict(net, valloader, loss_fn):
 cluster_centers = cluster_centers.to(device)
 net.load_state_dict(torch.load('../models/checkpoint.pth'))
 ins, preds_soft, preds_hard, truths, test_loss, test_pix_acc, test_img_acc = final_predict(net, testloader, criterion)
-net_script = ModelWithLoss(net, RebalanceLoss(weights))
+net_script = ModelWithLoss(net, nn.CrossEntropyLoss(weight=weights, reduction='mean'))
 net_script = torch.jit.script(net_script)
 net_script.save('../models/model_and_loss.pt')
 #%%
