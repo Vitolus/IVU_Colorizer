@@ -50,7 +50,6 @@ for file in tqdm(folder, desc='Loading color images'):
     target_ab.append(ab)
 input_L = np.array(input_L).astype(np.float32) # (N, H, W, 1)
 target_ab = np.array(target_ab).astype(np.uint8) # (N, H, W, 2)
-# TODO: change ground truth to be quantized instead of true ab values
 print(input_L.shape, target_ab.shape)
 #%%
 for _ in range(5):
@@ -71,28 +70,20 @@ for _ in range(5):
     plt.axis('off')
     plt.show()
 #%%
-input_L = np.transpose(input_L, (0, 3, 1, 2)) # (N, 1, H, W)
-target_ab = np.transpose(target_ab, (0, 3, 1, 2)) # (N, 2, H, W)
-L_train, L_test, ab_train, ab_test = train_test_split(input_L, target_ab, test_size=0.3, random_state=seed)
-L_val, L_test, ab_val, ab_test = train_test_split(L_test, ab_test, test_size=0.3, random_state=seed)
 del input_L, target_ab
-L_train = torch.tensor(L_train, dtype=torch.float32)
-ab_train = torch.tensor(ab_train, dtype=torch.uint8)
-L_val = torch.tensor(L_val, dtype=torch.float32)
-ab_val = torch.tensor(ab_val, dtype=torch.uint8)
-L_test = torch.tensor(L_test, dtype=torch.float32)
-ab_test = torch.tensor(ab_test, dtype=torch.uint8)
-print(L_train.shape, ab_train.shape)
-print(L_val.shape, ab_val.shape)
-print(L_test.shape, ab_test.shape)
-#%%
-L_mean = L_train.mean(dim=(0, 2, 3))
-L_std = L_train.std(dim=(0, 2, 3))
-print(L_mean, L_std)
+all_filepaths = np.array([os.path.join(path, file) for file in folder])
+train_data, test_data = train_test_split(all_filepaths, test_size=0.3, random_state=seed)
+val_data, test_data = train_test_split(test_data, test_size=0.3, random_state=seed)
+print(train_data.shape, val_data.shape, test_data.shape)
 #%%
 def unstandardize(tensor, mean, std):
     og_shape = tensor.shape
     C, H, W = og_shape[-3:]
+    if not torch.is_tensor(mean):
+        mean = torch.tensor(mean, dtype=tensor.dtype, device=tensor.device)
+    if not torch.is_tensor(std):
+        std = torch.tensor(std, dtype=tensor.dtype, device=tensor.device)
+
     tensor = (tensor.reshape(-1, C, H, W) * std.reshape(1, C, 1, 1) + mean.reshape(1, C, 1, 1)).clamp(0, 1)  # unnormalize to [0, 1]
     return tensor.reshape(og_shape)  # restore original shape
 
@@ -122,21 +113,48 @@ def lab_to_rgb(x):
     return rgb
 #%%
 class MyDataset(torch.utils.data.Dataset):
-    def __init__(self, L_data, ab_data, lut, L_transform=None):
-        self.L_data = L_transform(L_data) if L_transform else L_data
-        lut = lut.cpu()
-        with torch.no_grad():
-            a = ab_data[:, 0, :, :].long()
-            b = ab_data[:, 1, :, :].long()
-            idx = (a * 256 + b).reshape(a.size(0), -1)
-            labels = lut[idx]
-            self.labels = labels.reshape_as(a)
-        del a, b, idx, labels, lut
+    def __init__(self, filepaths, lut, L_transform=None):
+        self.filepaths = filepaths
+        self.lut = lut.cpu()
+        self.L_transform = L_transform
+
     def __len__(self):
-        return self.L_data.size(0)
+        return len(self.filepaths)
 
     def __getitem__(self, idx):
-        return self.L_data[idx], self.labels[idx]
+        img_path = self.filepaths[idx]
+        img = cv2.imread(img_path, 1)
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
+        img = cv2.resize(img, (SIZE, SIZE))
+        L = (img[:, :, 0:1].astype(np.float32) / 255.0).transpose(2, 0, 1) # (1, H, W) [0..1]
+        ab = (img[:, :, 1:3].astype(np.uint8)).transpose(2, 0, 1) # (2, H, W) [0..255]
+        L_data = torch.from_numpy(L)
+        ab_data = torch.from_numpy(ab).long()
+        if self.L_transform:
+            L_data = self.L_transform(L_data)
+        with torch.no_grad():
+            a = ab_data[0, :, :]
+            b = ab_data[1, :, :]
+            idx = a * 256 + b
+            label = self.lut[idx]
+        return L_data, label
+
+# class MyDataset(torch.utils.data.Dataset):
+#     def __init__(self, L_data, ab_data, lut, L_transform=None):
+#         self.L_data = L_transform(L_data) if L_transform else L_data
+#         lut = lut.cpu()
+#         with torch.no_grad():
+#             a = ab_data[:, 0, :, :].long()
+#             b = ab_data[:, 1, :, :].long()
+#             idx = (a * 256 + b).reshape(a.size(0), -1)
+#             labels = lut[idx]
+#             self.labels = labels.reshape_as(a)
+#         del a, b, idx, labels, lut
+#     def __len__(self):
+#         return self.L_data.size(0)
+#
+#     def __getitem__(self, idx):
+#         return self.L_data[idx], self.labels[idx]
 #%%
 class CUDAPrefetcher:
     def __init__(self, loader):
@@ -182,10 +200,25 @@ soft_lut_probs = torch.softmax(-dists, dim=1)  # shape: (65536, 313)
 lut = torch.argmax(soft_lut_probs, dim=1).long()  # shape: (65536,)
 del dists
 #%%
-trainset = MyDataset(L_train, ab_train, lut, L_transform=transforms.Normalize(mean=L_mean, std=L_std))
-valset = MyDataset(L_val, ab_val, lut, L_transform=transforms.Normalize(mean=L_mean, std=L_std))
-testset = MyDataset(L_test, ab_test, lut, L_transform=transforms.Normalize(mean=L_mean, std=L_std))
-del L_train, L_test, ab_train, ab_test
+temp_dataset = MyDataset(train_data, lut)
+temp_loader = DataLoader(temp_dataset, batch_size=64, shuffle=False, num_workers=4, pin_memory=True, prefetch_factor=2)
+pixel_count, sum, sum_sq = 0, 0.0, 0.0
+for ins, _ in tqdm(temp_loader, desc='Computing L channel mean and std'):
+    ins = ins.float()
+    sum += torch.sum(ins)
+    sum_sq += torch.sum(ins ** 2)
+    pixel_count += ins.numel()
+mean = sum / pixel_count
+std = torch.sqrt((sum_sq / pixel_count) - (mean ** 2))
+L_mean = mean.item()
+L_std = std.item()
+del temp_dataset, temp_loader, sum, sum_sq, pixel_count, mean, std
+print(L_mean, L_std)
+#%%
+trainset = MyDataset(train_data, lut, L_transform=transforms.Normalize(mean=L_mean, std=L_std))
+valset = MyDataset(val_data, lut, L_transform=transforms.Normalize(mean=L_mean, std=L_std))
+testset = MyDataset(test_data, lut, L_transform=transforms.Normalize(mean=L_mean, std=L_std))
+del train_data, val_data, test_data
 #%%
 def save_checkpoint(model, name='checkpoint'):
     torch.save(model.state_dict(), f"../models/{name}.pth")
@@ -222,8 +255,7 @@ def fit(net, trainloader, optimizer, scaler, loss_fn, beta=0.5):
         with torch.cuda.amp.autocast():
             out, mu, logvar = net(inputs)
             loss_clf = loss_fn(out, targets)
-            loss_kld = ((-0.5 * torch.mean(1 + logvar - mu ** 2 - logvar.exp())) /
-                        (inputs.size(0) * inputs.size(2) * inputs.size(3))) # normalize by batch*H*W
+            loss_kld = -0.5 * torch.sum(1 + logvar - mu ** 2 - logvar.exp(), dim=1).mean()
             loss = loss_clf + beta * loss_kld
         scaler.scale(loss).backward()
         nn.utils.clip_grad_norm_(net.parameters(), 3)
@@ -298,6 +330,9 @@ def predict(net, valloader, loss_fn, beta=0.5):
             (image_acc / total_valid_images).item())
 #%%
 def objective(trial, trainset, scaler, X):
+    num_cycles = trial.suggest_int('num_cycles', 4, 10)
+    cycle_length = num_epochs // num_cycles
+    final_beta = 0.5
     lr = trial.suggest_float('lr', 1e-5, 1e-1, log=True)
     batch_size = trial.suggest_categorical('batch_size', [32, 64, 128])
     kf = KFold(n_splits=5, shuffle=True, random_state=42)
@@ -315,15 +350,16 @@ def objective(trial, trainset, scaler, X):
         optimizer = optim.Adam(net.parameters(), lr=lr)
         scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5)
         for epoch in range(50):
-            train_loss, train_pix_acc, train_img_acc = fit(net, trainloader, optimizer, scaler, criterion)
-            val_loss, val_pix_acc, val_img_acc = predict(net, valloader, criterion)
+            cycle_pos = epoch % cycle_length
+            beta = final_beta * (0.5 * (1 + np.cos(np.pi * (1 - cycle_pos / cycle_length))))
+            train_loss, train_pix_acc, train_img_acc = fit(net, trainloader, optimizer, scaler, criterion, beta)
+            val_loss, val_pix_acc, val_img_acc = predict(net, valloader, criterion, beta)
             train_losses.append(train_loss)
             val_losses.append(val_loss)
             scheduler.step(val_loss)
-            prog_bar.set_description(
-                f"Split {split_n} - Epoch {epoch + 1}, lr {lr:.3e}, batch size {batch_size:.3e} |\n"
-                f"Metrics train/val: Pixel Acc={train_pix_acc:.3e}/{val_pix_acc:.3e}, "
-                f"Img Acc={train_img_acc:.3e}/{val_img_acc:.3e} | Loss: {train_loss:.3e}/{val_loss:.3e}")
+            prog_bar.set_description(f"Epoch {epoch + 1}, lr={current_lr}, beta={beta:.3f} | "
+                                     f"Metrics train/val: Pixel Acc={train_pix_acc:.3f}/{val_pix_acc:.3f}, "
+                                     f"Image Acc={train_img_acc:.3f}/{val_img_acc:.3f} | Loss: {train_loss:.3f}/{val_loss:.3f}")
         del net, optimizer, scheduler
         mean_loss = np.mean(val_losses)
         trial.report(mean_loss, split_n)
@@ -449,7 +485,11 @@ early_stopping = EarlyStopping()
 train_losses, train_pix_accs, train_img_accs = [], [], []
 val_losses, val_pix_accs, val_img_accs = [], [], []
 last_checkpoint = None
-prog_bar = tqdm(range(50), total=50, desc='Training', position=0)
+num_epochs = 50
+num_cycles = 4
+cycle_length = num_epochs // num_cycles
+final_beta = 0.5
+prog_bar = tqdm(range(num_epochs), total=num_epochs, desc='Training', position=0)
 
 fig, ax = plt.subplots()
 line1, = ax.plot([], [], label='Train Loss')
@@ -458,25 +498,28 @@ ax.legend()
 
 scaler = torch.cuda.amp.GradScaler()
 for epoch in prog_bar:
-    train_loss, train_pix_acc, train_img_acc = fit(net, trainloader, optimizer, scaler, criterion)
+    cycle_pos = epoch % cycle_length
+    beta = final_beta * (0.5 * (1 + np.cos(np.pi * (1 - cycle_pos / cycle_length))))
+    train_loss, train_pix_acc, train_img_acc = fit(net, trainloader, optimizer, scaler, criterion, beta)
     train_losses.append(train_loss)
     train_pix_accs.append(train_pix_acc)
     train_img_accs.append(train_img_acc)
-    val_loss, val_pix_acc, val_img_acc = predict(net, valloader, criterion)
+    val_loss, val_pix_acc, val_img_acc = predict(net, valloader, criterion, beta)
     val_losses.append(val_loss)
     val_pix_accs.append(val_pix_acc)
     val_img_accs.append(val_img_acc)
-    #scheduler.step(val_img_acc)
-    early_stopping(val_loss, net)
+    #scheduler.step(val_img_acc) TODO: find the correct factor/scheduling method
+    #early_stopping(val_loss, net)
     current_lr = optimizer.param_groups[0]['lr']
-    prog_bar.set_description(f"Epoch {epoch + 1}, lr={current_lr} | Metrics train/val: Pixel Acc={train_pix_acc:.3e}/{val_pix_acc:.3e}, "
-                             f"Image Acc={train_img_acc:.3e}/{val_img_acc:.3e} | Loss: {train_loss:.3e}/{val_loss:.3e}")
+    prog_bar.set_description(f"Epoch {epoch + 1}, lr={current_lr}, beta={beta:.3f} | "
+                             f"Metrics train/val: Pixel Acc={train_pix_acc:.3f}/{val_pix_acc:.3f}, "
+                             f"Image Acc={train_img_acc:.3f}/{val_img_acc:.3f} | Loss: {train_loss:.3f}/{val_loss:.3f}")
     writer.add_scalar('Loss/train', train_loss, epoch)
     writer.add_scalar('Loss/val', val_loss, epoch)
     update_plot()
-    if early_stopping.early_stop:
-        print("Early stopping")
-        break
+    # if early_stopping.early_stop:
+    #     print("Early stopping")
+    #     break
 save_checkpoint(net, 'lastcheck')
 writer.flush()
 #%%
@@ -490,7 +533,8 @@ class ModelWithLoss(nn.Module):
         preds = self.net(x)
         return self.loss_fn(preds, y)
 #%%
-def final_predict(net, valloader, loss_fn):
+@torch.inference_mode()
+def final_predict(net, valloader, loss_fn, beta=0.5):
     net.eval()
     loss_sum = torch.zeros(1, device=device)
     pixel_acc = torch.zeros(1, device=device)
@@ -503,8 +547,11 @@ def final_predict(net, valloader, loss_fn):
     batch_bar = tqdm(total=len(valloader), desc='Final Predicting', leave=False)
     while inputs is not None:
         with torch.cuda.amp.autocast():
-            out = net(inputs)
-            loss = loss_fn(out, targets)
+            out, mu, logvar = net(inputs)
+            loss_clf = loss_fn(out, targets)
+            loss_kld = ((-0.5 * torch.mean(1 + logvar - mu ** 2 - logvar.exp())) /
+                        (inputs.size(0) * inputs.size(2) * inputs.size(3)))  # normalize by batch*H*W
+            loss = loss_clf + beta * loss_kld
         valid = torch.ones_like(targets, dtype=torch.bool)
         # Pixel accuracy
         correct = (out.argmax(1) == targets) & valid
@@ -539,7 +586,7 @@ def final_predict(net, valloader, loss_fn):
 #%% final evaluation
 cluster_centers = cluster_centers.to(device)
 net.load_state_dict(torch.load('../models/checkpoint.pth'))
-ins, preds_soft, preds_hard, truths, test_loss, test_pix_acc, test_img_acc = final_predict(net, testloader, criterion)
+ins, preds_soft, preds_hard, truths, test_loss, test_pix_acc, test_img_acc = final_predict(net, testloader, criterion, beta)
 net_script = ModelWithLoss(net, nn.CrossEntropyLoss(weight=weights, reduction='mean'))
 net_script = torch.jit.script(net_script)
 net_script.save('../models/model_and_loss.pt')
