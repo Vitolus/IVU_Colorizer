@@ -11,13 +11,14 @@ from torch import nn, optim
 from torch.utils.checkpoint import checkpoint
 from torch.utils.data import DataLoader, SubsetRandomSampler
 from torch.utils.tensorboard import SummaryWriter
+from torchmetrics.functional.image import structural_similarity_index_measure
 from torchvision import transforms
 from torchinfo import summary
 from sklearn.model_selection import KFold, train_test_split
 import numpy as np
 import matplotlib.pyplot as plt
 #%%
-SIZE = 160
+SIZE = 224
 seed = 42
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 np.random.seed(seed)
@@ -44,12 +45,12 @@ for file in tqdm(folder, desc='Loading color images'):
     img = cv2.imread(os.path.join(path, file), 1)
     img = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
     img = cv2.resize(img, (SIZE, SIZE))
-    L = img[:, :, 0:1] / 255.0 # (H, W, 1) [0..1]
-    ab = img[:, :, 1:3] # (H, W, 2) [0..255]
+    L = img[:, :, 0:1] / 255.0 # (H, W, 1)
+    ab = img[:, :, 1:3] / 255.0 # (H, W, 2)
     input_L.append(L)
     target_ab.append(ab)
 input_L = np.array(input_L).astype(np.float32) # (N, H, W, 1)
-target_ab = np.array(target_ab).astype(np.uint8) # (N, H, W, 2)
+target_ab = np.array(target_ab).astype(np.float32) # (N, H, W, 2)
 print(input_L.shape, target_ab.shape)
 #%%
 for _ in range(5):
@@ -70,11 +71,26 @@ for _ in range(5):
     plt.axis('off')
     plt.show()
 #%%
-del input_L, target_ab
-all_filepaths = np.array([os.path.join(path, file) for file in folder])
-train_data, test_data = train_test_split(all_filepaths, test_size=0.3, random_state=seed)
-val_data, test_data = train_test_split(test_data, test_size=0.3, random_state=seed)
-print(train_data.shape, val_data.shape, test_data.shape)
+input_L = np.transpose(input_L, (0, 3, 1, 2)) # (N, 1, H, W)
+target_ab = np.transpose(target_ab, (0, 3, 1, 2)) # (N, 2, H, W)
+L_train, L_test, ab_train, ab_test = train_test_split(input_L, target_ab, test_size=0.3, random_state=seed)
+L_val, L_test, ab_val, ab_test = train_test_split(L_test, ab_test, test_size=0.3, random_state=seed)
+L_train = torch.tensor(L_train, dtype=torch.float32)
+ab_train = torch.tensor(ab_train, dtype=torch.float32)
+L_val = torch.tensor(L_val, dtype=torch.float32)
+ab_val = torch.tensor(ab_val, dtype=torch.float32)
+L_test = torch.tensor(L_test, dtype=torch.float32)
+ab_test = torch.tensor(ab_test, dtype=torch.float32)
+print(L_train.shape, ab_train.shape)
+print(L_val.shape, ab_val.shape)
+print(L_test.shape, ab_test.shape)
+#%%
+L_mean = L_train.mean(dim=(0, 2, 3))
+L_std = L_train.std(dim=(0, 2, 3))
+ab_mean = ab_train.mean(dim=(0, 2, 3))
+ab_std = ab_train.std(dim=(0, 2, 3))
+print(L_mean, L_std)
+print(ab_mean, ab_std)
 #%%
 def unstandardize(tensor, mean, std):
     og_shape = tensor.shape
@@ -87,21 +103,31 @@ def unstandardize(tensor, mean, std):
     tensor = (tensor.reshape(-1, C, H, W) * std.reshape(1, C, 1, 1) + mean.reshape(1, C, 1, 1)).clamp(0, 1)  # unnormalize to [0, 1]
     return tensor.reshape(og_shape)  # restore original shape
 
-def compute_ab_prior(dataloader):
-    hist = torch.zeros(313)
-    total = 0
-    for _, labels in dataloader:
-        hist += torch.bincount(labels.reshape(-1), minlength=313)  # accumulate histogram
-        total += labels.numel()
-        del labels
-    return hist / total # p(c)
+def compute_pcc_components(pred, targets):
+    pred_flat = pred.reshape(pred.size(0), -1)
+    target_flat = targets.reshape(targets.size(0), -1)
+    vx = pred_flat - pred_flat.mean(dim=1, keepdim=True)
+    vy = target_flat - target_flat.mean(dim=1, keepdim=True)
+    numerator = (vx * vy).sum(dim=1) # covariance
+    denominator1 = (vx ** 2).sum(dim=1)
+    denominator2 = (vy ** 2).sum(dim=1)
+    return numerator, denominator1, denominator2
 
-def make_rebalancing_weights(priors, alpha=0.5):
-    C = priors.size(0)
-    uniform = torch.full_like(priors, 1.0 / C, device=device)
-    smoothed = (1.0 - alpha) * uniform + alpha * priors
-    weights = 1.0 / smoothed # inverse of smoothed priors (Cross entropies) [0..inf]
-    return weights / weights.mean()
+# def compute_ab_prior(dataloader):
+#     hist = torch.zeros(313)
+#     total = 0
+#     for _, labels in dataloader:
+#         hist += torch.bincount(labels.reshape(-1), minlength=313)  # accumulate histogram
+#         total += labels.numel()
+#         del labels
+#     return hist / total # p(c)
+#
+# def make_rebalancing_weights(priors, alpha=0.5):
+#     C = priors.size(0)
+#     uniform = torch.full_like(priors, 1.0 / C, device=device)
+#     smoothed = (1.0 - alpha) * uniform + alpha * priors
+#     weights = 1.0 / smoothed # inverse of smoothed priors (Cross entropies) [0..inf]
+#     return weights / weights.mean()
 
 def lab_to_rgb(x):
     lab = x.permute(1, 2, 0)
@@ -113,112 +139,135 @@ def lab_to_rgb(x):
     return rgb
 #%%
 class MyDataset(torch.utils.data.Dataset):
-    def __init__(self, filepaths, lut, L_transform=None):
-        self.filepaths = filepaths
-        self.lut = lut.cpu()
-        self.L_transform = L_transform
-
+    def __init__(self, L_data, ab_data, L_transform=None, ab_transform=None):
+        self.L_data = L_transform(L_data) if L_transform else L_data
+        self.ab_data = ab_transform(ab_data) if ab_transform else ab_data
     def __len__(self):
-        return len(self.filepaths)
+        return len(self.L_data)
 
     def __getitem__(self, idx):
-        img_path = self.filepaths[idx]
-        img = cv2.imread(img_path, 1)
-        img = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
-        img = cv2.resize(img, (SIZE, SIZE))
-        L = (img[:, :, 0:1].astype(np.float32) / 255.0).transpose(2, 0, 1) # (1, H, W) [0..1]
-        ab = (img[:, :, 1:3].astype(np.uint8)).transpose(2, 0, 1) # (2, H, W) [0..255]
-        L_data = torch.from_numpy(L)
-        ab_data = torch.from_numpy(ab).long()
-        if self.L_transform:
-            L_data = self.L_transform(L_data)
-        with torch.no_grad():
-            a = ab_data[0, :, :]
-            b = ab_data[1, :, :]
-            idx = a * 256 + b
-            label = self.lut[idx]
-        return L_data, label
+        return self.L_data[idx], self.ab_data[idx]
 
 # class MyDataset(torch.utils.data.Dataset):
-#     def __init__(self, L_data, ab_data, lut, L_transform=None):
-#         self.L_data = L_transform(L_data) if L_transform else L_data
-#         lut = lut.cpu()
-#         with torch.no_grad():
-#             a = ab_data[:, 0, :, :].long()
-#             b = ab_data[:, 1, :, :].long()
-#             idx = (a * 256 + b).reshape(a.size(0), -1)
-#             labels = lut[idx]
-#             self.labels = labels.reshape_as(a)
-#         del a, b, idx, labels, lut
+#     def __init__(self, filepaths, lut, L_transform=None):
+#         self.filepaths = filepaths
+#         self.lut = lut.cpu()
+#         self.L_transform = L_transform
+#
 #     def __len__(self):
-#         return self.L_data.size(0)
+#         return len(self.filepaths)
 #
 #     def __getitem__(self, idx):
-#         return self.L_data[idx], self.labels[idx]
+#         img_path = self.filepaths[idx]
+#         img = cv2.imread(img_path, 1)
+#         img = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
+#         img = cv2.resize(img, (SIZE, SIZE))
+#         L = (img[:, :, 0:1].astype(np.float32) / 255.0).transpose(2, 0, 1) # (1, H, W) [0..1]
+#         ab = (img[:, :, 1:3].astype(np.uint8)).transpose(2, 0, 1) # (2, H, W) [0..255]
+#         L_data = torch.from_numpy(L)
+#         ab_data = torch.from_numpy(ab).long()
+#         if self.L_transform:
+#             L_data = self.L_transform(L_data)
+#         with torch.no_grad():
+#             a = ab_data[0, :, :]
+#             b = ab_data[1, :, :]
+#             idx = a * 256 + b
+#             label = self.lut[idx]
+#         return L_data, label
 #%%
 class CUDAPrefetcher:
     def __init__(self, loader):
         self.loader = iter(loader)
         self.stream = torch.cuda.Stream()
         self.next_L = None
-        self.next_labels = None
+        self.next_ab = None
         self._preload()
 
     def _preload(self):
         try:
-            self.next_L, self.next_labels = next(self.loader)
+            self.next_L, self.next_ab = next(self.loader)
         except StopIteration:
             self.next_L = None
             return
         with torch.cuda.stream(self.stream):
             self.next_L = self.next_L.to(device, memory_format=torch.channels_last, non_blocking=True)
-            self.next_labels = self.next_labels.to(device, non_blocking=True)
+            self.next_ab = self.next_ab.to(device, non_blocking=True)
 
     def next(self):
         torch.cuda.current_stream().wait_stream(self.stream)
-        L, labels = self.next_L, self.next_labels
+        L, ab = self.next_L, self.next_ab
         self._preload()
-        return L, labels
-#%%
-cluster_path = '../data/pts_in_hull.npy'
-assert os.path.exists(cluster_path), "Download pts_in_hull.npy and place next to this script"
-cluster_centers = torch.from_numpy(np.load(cluster_path)).float() # (313, 2) [-128..127]
-cc_l2 = (cluster_centers ** 2).sum(dim=1) # (313,)
-lut_coords  = (((torch.stack(torch.meshgrid(torch.arange(256), torch.arange(256), indexing='xy'), dim=-1).float()) - 128.0)
-               .reshape(-1, 2)) # (65536, 2) [-128..127]
+        return L, ab
 
-def compute_dist(tensor):
-    dists = ((tensor ** 2).sum(dim=1, keepdim=True) # (B*H*W, 1)
-             + cc_l2.reshape(1, -1) # (1, 313)
-             - 2 * torch.matmul(tensor, cluster_centers.t())) # (B*H*W, 313)
-    return dists
-
-dists = compute_dist(lut_coords)
-del lut_coords
-# lut = torch.argmin(dists, dim=1).long() # (65536,) [0..312] LUT for mapping (a, b) to cluster index
-soft_lut_probs = torch.softmax(-dists, dim=1)  # shape: (65536, 313)
-lut = torch.argmax(soft_lut_probs, dim=1).long()  # shape: (65536,)
-del dists
+# class CUDAPrefetcher:
+#     def __init__(self, loader):
+#         self.loader = iter(loader)
+#         self.stream = torch.cuda.Stream()
+#         self.next_L = None
+#         self.next_labels = None
+#         self._preload()
+#
+#     def _preload(self):
+#         try:
+#             self.next_L, self.next_labels = next(self.loader)
+#         except StopIteration:
+#             self.next_L = None
+#             return
+#         with torch.cuda.stream(self.stream):
+#             self.next_L = self.next_L.to(device, memory_format=torch.channels_last, non_blocking=True)
+#             self.next_labels = self.next_labels.to(device, non_blocking=True)
+#
+#     def next(self):
+#         torch.cuda.current_stream().wait_stream(self.stream)
+#         L, labels = self.next_L, self.next_labels
+#         self._preload()
+#         return L, labels
 #%%
-temp_dataset = MyDataset(train_data, lut)
-temp_loader = DataLoader(temp_dataset, batch_size=64, shuffle=False, num_workers=4, pin_memory=True, prefetch_factor=2)
-pixel_count, sum, sum_sq = 0, 0.0, 0.0
-for ins, _ in tqdm(temp_loader, desc='Computing L channel mean and std'):
-    ins = ins.float()
-    sum += torch.sum(ins)
-    sum_sq += torch.sum(ins ** 2)
-    pixel_count += ins.numel()
-mean = sum / pixel_count
-std = torch.sqrt((sum_sq / pixel_count) - (mean ** 2))
-L_mean = mean.item()
-L_std = std.item()
-del temp_dataset, temp_loader, sum, sum_sq, pixel_count, mean, std
-print(L_mean, L_std)
+# cluster_path = '../data/pts_in_hull.npy'
+# assert os.path.exists(cluster_path), "Download pts_in_hull.npy and place next to this script"
+# cluster_centers = torch.from_numpy(np.load(cluster_path)).float() # (313, 2) [-128..127]
+# cc_l2 = (cluster_centers ** 2).sum(dim=1) # (313,)
+# lut_coords  = (((torch.stack(torch.meshgrid(torch.arange(256), torch.arange(256), indexing='xy'), dim=-1).float()) - 128.0)
+#                .reshape(-1, 2)) # (65536, 2) [-128..127]
+#
+# def compute_dist(tensor):
+#     dists = ((tensor ** 2).sum(dim=1, keepdim=True) # (B*H*W, 1)
+#              + cc_l2.reshape(1, -1) # (1, 313)
+#              - 2 * torch.matmul(tensor, cluster_centers.t())) # (B*H*W, 313)
+#     return dists
+#
+# dists = compute_dist(lut_coords)
+# del lut_coords
+# # lut = torch.argmin(dists, dim=1).long() # (65536,) [0..312] LUT for mapping (a, b) to cluster index
+# soft_lut_probs = torch.softmax(-dists, dim=1)  # shape: (65536, 313)
+# lut = torch.argmax(soft_lut_probs, dim=1).long()  # shape: (65536,)
+# del dists
 #%%
-trainset = MyDataset(train_data, lut, L_transform=transforms.Normalize(mean=L_mean, std=L_std))
-valset = MyDataset(val_data, lut, L_transform=transforms.Normalize(mean=L_mean, std=L_std))
-testset = MyDataset(test_data, lut, L_transform=transforms.Normalize(mean=L_mean, std=L_std))
-del train_data, val_data, test_data
+# temp_dataset = MyDataset(train_data, lut)
+# temp_loader = DataLoader(temp_dataset, batch_size=64, shuffle=False, num_workers=4, pin_memory=True, prefetch_factor=2)
+# L_pixel_count, L_sum, L_sum_sq = 0, 0.0, 0.0
+# ab_pixel_count, ab_sum, ab_sum_sq = 0, 0.0, 0.0
+# for l, ab in tqdm(temp_loader, desc='Computing L and ab channel mean and std'):
+#     l = l.float()
+#     ab = ab.float()
+#     L_sum += torch.sum(l)
+#     L_sum_sq += torch.sum(l ** 2)
+#     L_pixel_count += l.numel()
+#     ab_sum += torch.sum(ab)
+#     ab_sum_sq += torch.sum(ab ** 2)
+#     ab_pixel_count += ab.numel()
+# L_mean = (L_sum / L_pixel_count).item()
+# L_std = torch.sqrt((L_sum_sq / L_pixel_count) - (L_mean ** 2)).item()
+# ab_mean = (ab_sum / ab_pixel_count).item()
+# ab_std = torch.sqrt((ab_sum_sq / ab_pixel_count) - (ab_mean ** 2)).item()
+# del temp_dataset, temp_loader, l, ab, L_sum, L_sum_sq, L_pixel_count, ab_sum, ab_sum_sq, ab_pixel_count
+# print(L_mean, L_std)
+# print(ab_mean, ab_std)
+#%%
+trainset = MyDataset(L_train, ab_train, L_transform=transforms.Normalize(mean=L_mean, std=L_std), ab_transform=transforms.Normalize(mean=ab_mean, std=ab_std))
+valset = MyDataset(L_val, ab_val, L_transform=transforms.Normalize(mean=L_mean, std=L_std), ab_transform=transforms.Normalize(mean=ab_mean, std=ab_std))
+testset = MyDataset(L_test, ab_test, L_transform=transforms.Normalize(mean=L_mean, std=L_std), ab_transform=transforms.Normalize(mean=ab_mean, std=ab_std))
+del L_train, ab_train, L_val, ab_val, L_test, ab_test
 #%%
 def save_checkpoint(model, name='checkpoint'):
     torch.save(model.state_dict(), f"../models/{name}.pth")
@@ -243,11 +292,7 @@ class EarlyStopping:
 #%%
 def fit(net, trainloader, optimizer, scaler, loss_fn, beta=0.5):
     net.train()
-    loss_sum = torch.zeros(1, device=device) # sum of per-pixel losses
-    pixel_acc = torch.zeros(1, device=device) # total correct pixels
-    pixel_total = torch.zeros(1, device=device) # total valid pixels
-    image_acc = torch.zeros(1, device=device) # sum of per-image accuracies
-    image_count = torch.zeros(1, device=device) # count of images contributing to per-image metric
+    total_loss, total_sse, total_psnr, total_ssim, total_pcc_num, total_pcc_den1, total_pcc_den2, pixels, count = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0, 0
     prefetcher = CUDAPrefetcher(trainloader)
     inputs, targets = prefetcher.next()
     while inputs is not None:
@@ -262,30 +307,24 @@ def fit(net, trainloader, optimizer, scaler, loss_fn, beta=0.5):
         scaler.step(optimizer)
         scaler.update()
         with torch.no_grad():
-            valid = torch.ones_like(targets, dtype=torch.bool)
-            # Pixel accuracy
-            correct = (out.argmax(1) == targets) & valid
-            pixel_acc += correct.sum()
-            batch_valid_pixels = valid.sum()
-            pixel_total += batch_valid_pixels
-            # Mean per-image accuracy
-            B = targets.size(0)
-            correct_per = correct.reshape(B, -1).sum(dim=1)
-            valid_per = valid.reshape(B, -1).sum(dim=1)
-            valid_imgs = valid_per > 0
-            if valid_imgs.any():
-                image_acc += (correct_per[valid_imgs].float() / valid_per[valid_imgs].float()).sum()
-                image_count += valid_imgs.sum()
-            # Loss averaging across epoch
-            if batch_valid_pixels.item() > 0:
-                loss_sum += loss.detach() * batch_valid_pixels
-        # Get the next batch from the prefetcher
+            total_loss += loss.item()
+            count += 1
+            sse = nn.MSELoss()(out, targets, reduction='sum')
+            pixels += targets.numel()
+            pcc_num, pcc_den1, pcc_den2 = compute_pcc_components(out, targets)
+            total_sse += sse.item()
+            total_ssim = structural_similarity_index_measure(out, targets).item()
+            total_pcc_num += pcc_num.sum().item()
+            total_pcc_den1 += pcc_den1.sum().item()
+            total_pcc_den2 += pcc_den2.sum().item()
         inputs, targets = prefetcher.next()
-    # Safeguards against division by zero
-    total_valid_pixels = pixel_total.clamp_min(1)
-    total_valid_images = image_count.clamp_min(1)
-    return ((loss_sum / total_valid_pixels).item(), (pixel_acc / total_valid_pixels).item(),
-            (image_acc / total_valid_images).item())
+    avg_mse = total_sse / pixels
+    avg_rmse = avg_mse ** 0.5
+    return (total_loss / count, avg_rmse, 20 * torch.log10(1.0 / avg_rmse), total_ssim / count,
+            (total_pcc_num / (total_pcc_den1 * total_pcc_den2) ** 0.5))
+
+# TODO: <- arrived here with new implementation update
+# TODO: modify predict to use the new metrics for regression
 
 @torch.inference_mode()
 def predict(net, valloader, loss_fn, beta=0.5):
@@ -368,57 +407,57 @@ def objective(trial, trainset, scaler, X):
     return mean_loss
 #%%
 class Net(nn.Module):
-    def __init__(self, latent_dim=256):
+    def __init__(self, latent_dim):
         super(Net, self).__init__()
-        self.conv1 = nn.Conv2d(1, 128, 4, 2, 1)  # input is L only
-        self.conv2 = nn.Conv2d(128, 128, 4, 2, 1)
-        self.conv3 = nn.Conv2d(128, 256, 4, 2, 1)
-        self.conv4 = nn.Conv2d(256, 512, 4, 2, 1)
-        self.conv5 = nn.Conv2d(512, 512, 4, 2, 1)
+        self.latent_dim = latent_dim
+        self.encoder = nn.Sequential(
+            nn.Conv2d(1, 64, kernel_size=3, stride=2, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(64, 128, kernel_size=3, stride=1, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(128, 128, kernel_size=3, stride=2, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(128, 256, kernel_size=3, stride=1, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(256, 256, kernel_size=3, stride=2, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(256, 512, kernel_size=3, stride=1, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(512, 512, kernel_size=3, stride=1, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(512, 256, kernel_size=3, stride=1, padding=1),
+            nn.ReLU(),
+            nn.Flatten()  # Flatten the 3D output into a 1D vector
+        )
+        self.fc_mu = nn.Linear(256 * 28 * 28, latent_dim)  # 31 is the dimension of the feature map
+        self.fc_logvar = nn.Linear(256 * 28 * 28, latent_dim)
+        self.decoder_input = nn.Linear(latent_dim, 256 * 28 * 28)
+        self.decoder = nn.Sequential(
+            nn.Unflatten(1, (256, 28, 28)),
+            nn.ConvTranspose2d(256, 128, kernel_size=3, stride=2, padding=1, output_padding=1),
+            nn.ReLU(),
+            nn.ConvTranspose2d(128, 64, kernel_size=3, stride=2, padding=1, output_padding=1),
+            nn.ReLU(),
+            nn.ConvTranspose2d(64, 32, kernel_size=3, stride=1, padding=1),
+            nn.ReLU(),
+            nn.ConvTranspose2d(32, 16, kernel_size=3, stride=1, padding=1),
+            nn.ReLU(),
+            nn.ConvTranspose2d(16, 2, kernel_size=3, stride=2, padding=1, output_padding=1),
+            nn.Tanh()
+        )
 
-        self.fc_mu = nn.Linear(512 * 5 * 5, latent_dim)
-        self.fc_logvar = nn.Linear(512 * 5 * 5, latent_dim)
-        self.fc_decode = nn.Linear(latent_dim, 512 * 5 * 5)
-
-        self.convt1 = nn.ConvTranspose2d(512, 512, 4, 2, 1)
-        self.convt2 = nn.ConvTranspose2d(1024, 256, 4, 2, 1)
-        self.convt3 = nn.ConvTranspose2d(512, 128, 4, 2, 1)
-        self.convt4 = nn.ConvTranspose2d(256, 128, 4, 2, 1)
-        self.convt5 = nn.ConvTranspose2d(256, 128, 4, 2, 1)
-
-        self.bnorm1 = nn.BatchNorm2d(256)
-        self.bnorm2 = nn.BatchNorm2d(512)
-        self.bnorm3 = nn.BatchNorm2d(512)
-        self.dropout = nn.Dropout(0.2)
-        self.lrelu = nn.LeakyReLU(inplace=True)
-        self.classifier = nn.Conv2d(128, 313, 1, 1)
-
-    def forward(self, x): # x is (B, 1, H, W) => L channel
-        d1 = self.lrelu(self.conv1(x)) # (B, 128, 80, 80)
-        d2 = self.lrelu(self.conv2(d1)) # (B, 128, 40, 40)
-        d3 = self.lrelu(self.bnorm1(self.conv3(d2))) # (B, 256, 20, 20)
-        d4 = self.lrelu(self.bnorm2(self.conv4(d3))) # (B, 512, 10, 10)
-        d5 = self.lrelu(self.bnorm3(self.conv5(d4))) # (B, 512, 5, 5)
-
-        flat = torch.flatten(d5, start_dim=1) # (B, 512*5*5)
-        mu = self.fc_mu(flat) # (B, latent_dim)
-        logvar = self.fc_logvar(flat) # (B, latent_dim)
+    def reparameterize(self, mu, logvar):
         std = torch.exp(0.5 * logvar)
         eps = torch.randn_like(std)
-        z = mu + eps * std # reparameterization trick
-        decode = self.fc_decode(z) # (B, 512*5*5)
-        d5 = decode.reshape(-1, 512, 5, 5)
+        return mu + eps * std
 
-        u1 = self.lrelu(self.convt1(d5)) # (B, 512, 10, 10)
-        u1 = torch.cat([u1, d4], dim=1) # (B, 1024, 10, 10)
-        u2 = self.lrelu(self.convt2(u1)) # (B, 256, 20, 20)
-        u2 = torch.cat([u2, d3], dim=1) # (B, 512, 20, 20)
-        u3 = self.lrelu(self.convt3(u2)) # (B, 128, 40, 40)
-        u3 = torch.cat([u3, d2], dim=1) # (B, 256, 40, 40)
-        u4 = self.lrelu(self.convt4(u3)) # (B, 128, 80, 80)
-        u4 = torch.cat([u4, d1], dim=1) # (B, 256, 80, 80)
-        u5 = self.lrelu(self.convt5(u4)) # (B, 128, 160, 160)
-        x = self.classifier(u5) # (B, 313, 160, 160)
+    def forward(self, x):
+        encoded = self.encoder(x)
+        mu = self.fc_mu(encoded)
+        logvar = self.fc_logvar(encoded)
+        z = self.reparameterize(mu, logvar)
+        decoder_input = self.decoder_input(z)
+        x = self.decoder(decoder_input)
         return x, mu, logvar
 #%%
 writer = SummaryWriter('../runs')
