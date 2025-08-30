@@ -299,15 +299,15 @@ def fit(net, trainloader, optimizer, scaler, loss_fn, beta=0.5):
         optimizer.zero_grad(set_to_none=True)
         with torch.cuda.amp.autocast():
             out, mu, logvar = net(inputs)
-            loss_clf = loss_fn(out, targets)
+            loss_rec = loss_fn(out, targets)
             loss_kld = -0.5 * torch.sum(1 + logvar - mu ** 2 - logvar.exp(), dim=1).mean()
-            loss = loss_clf + beta * loss_kld
+            loss = loss_rec + beta * loss_kld
         scaler.scale(loss).backward()
         nn.utils.clip_grad_norm_(net.parameters(), 3)
         scaler.step(optimizer)
         scaler.update()
         with torch.no_grad():
-            total_loss += loss.item()
+            total_loss += loss_rec.item()
             count += 1
             sse = nn.MSELoss()(out, targets, reduction='sum')
             pixels += targets.numel()
@@ -323,50 +323,31 @@ def fit(net, trainloader, optimizer, scaler, loss_fn, beta=0.5):
     return (total_loss / count, avg_rmse, 20 * torch.log10(1.0 / avg_rmse), total_ssim / count,
             (total_pcc_num / (total_pcc_den1 * total_pcc_den2) ** 0.5))
 
-# TODO: <- arrived here with new implementation update
-# TODO: modify predict to use the new metrics for regression
-
 @torch.inference_mode()
-def predict(net, valloader, loss_fn, beta=0.5):
+def predict(net, valloader, loss_fn):
     net.eval()
-    loss_sum = torch.zeros(1, device=device)
-    pixel_acc = torch.zeros(1, device=device)
-    pixel_total = torch.zeros(1, device=device)
-    image_acc = torch.zeros(1, device=device)
-    image_count = torch.zeros(1, device=device)
+    total_loss, total_sse, total_psnr, total_ssim, total_pcc_num, total_pcc_den1, total_pcc_den2, pixels, count = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0, 0
     prefetcher = CUDAPrefetcher(valloader)
     inputs, targets = prefetcher.next()
     while inputs is not None:
         with torch.cuda.amp.autocast():
             out, mu, logvar = net(inputs)
-            loss_clf = loss_fn(out, targets)
-            loss_kld = ((-0.5 * torch.mean(1 + logvar - mu ** 2 - logvar.exp())) /
-                        (inputs.size(0) * inputs.size(2) * inputs.size(3)))  # normalize by batch*H*W
-            loss = loss_clf + beta * loss_kld
-        valid = torch.ones_like(targets, dtype=torch.bool)
-        # Pixel accuracy
-        correct = (out.argmax(1) == targets) & valid
-        pixel_acc += correct.sum()
-        batch_valid_pixels = valid.sum()
-        pixel_total += batch_valid_pixels
-        # Mean per-image accuracy
-        B = targets.size(0)
-        correct_per = correct.reshape(B, -1).sum(dim=1)
-        valid_per = valid.reshape(B, -1).sum(dim=1)
-        valid_imgs = valid_per > 0
-        if valid_imgs.any():
-            image_acc += (correct_per[valid_imgs].float() / valid_per[valid_imgs].float()).sum()
-            image_count += valid_imgs.sum()
-        # Loss averaging across epoch
-        if batch_valid_pixels.item() > 0:
-            loss_sum += loss.detach() * batch_valid_pixels
-        # Get the next batch from the prefetcher
+            loss_rec = loss_fn(out, targets)
+        total_loss += loss_rec.item()
+        count += 1
+        sse = nn.MSELoss()(out, targets, reduction='sum')
+        pixels += targets.numel()
+        pcc_num, pcc_den1, pcc_den2 = compute_pcc_components(out, targets)
+        total_sse += sse.item()
+        total_ssim = structural_similarity_index_measure(out, targets).item()
+        total_pcc_num += pcc_num.sum().item()
+        total_pcc_den1 += pcc_den1.sum().item()
+        total_pcc_den2 += pcc_den2.sum().item()
         inputs, targets = prefetcher.next()
-    # Safeguards against division by zero
-    total_valid_pixels = pixel_total.clamp_min(1)
-    total_valid_images = image_count.clamp_min(1)
-    return ((loss_sum / total_valid_pixels).item(), (pixel_acc / total_valid_pixels).item(),
-            (image_acc / total_valid_images).item())
+    avg_mse = total_sse / pixels
+    avg_rmse = avg_mse ** 0.5
+    return (total_loss / count, avg_rmse, 20 * torch.log10(1.0 / avg_rmse), total_ssim / count,
+            (total_pcc_num / (total_pcc_den1 * total_pcc_den2) ** 0.5))
 #%%
 def objective(trial, trainset, scaler, X):
     num_cycles = trial.suggest_int('num_cycles', 4, 10)
@@ -374,6 +355,7 @@ def objective(trial, trainset, scaler, X):
     final_beta = 0.5
     lr = trial.suggest_float('lr', 1e-5, 1e-1, log=True)
     batch_size = trial.suggest_categorical('batch_size', [32, 64, 128])
+    latent_dim = trial.suggest_categorical('latent_dim', [64, 128, 256, 512])
     kf = KFold(n_splits=5, shuffle=True, random_state=42)
     val_losses, mean_loss = [], 0.0
     split_n = 0
@@ -382,23 +364,23 @@ def objective(trial, trainset, scaler, X):
         split_n += 1
         trainloader = DataLoader(trainset, batch_size=batch_size, sampler=SubsetRandomSampler(train_idx), num_workers=4, pin_memory=True, prefetch_factor=2)
         valloader = DataLoader(trainset, batch_size=batch_size, sampler=SubsetRandomSampler(val_idx), num_workers=4, pin_memory=True, prefetch_factor=2)
-        prior = compute_ab_prior(trainloader)
-        weights = make_rebalancing_weights(prior, alpha=0.5)
-        criterion = nn.CrossEntropyLoss(weight=weights, reduction='mean').to(device, memory_format=torch.channels_last)
-        net = Net().to(device, memory_format=torch.channels_last)
+        criterion = nn.MSELoss(reduction='mean').to(device, memory_format=torch.channels_last)
+        # prior = compute_ab_prior(trainloader)
+        # weights = make_rebalancing_weights(prior, alpha=0.5)
+        # criterion = nn.CrossEntropyLoss(weight=weights, reduction='mean').to(device, memory_format=torch.channels_last)
+        net = Net(latent_dim).to(device, memory_format=torch.channels_last)
         optimizer = optim.Adam(net.parameters(), lr=lr)
         scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5)
         for epoch in range(50):
             cycle_pos = epoch % cycle_length
             beta = final_beta * (0.5 * (1 + np.cos(np.pi * (1 - cycle_pos / cycle_length))))
-            train_loss, train_pix_acc, train_img_acc = fit(net, trainloader, optimizer, scaler, criterion, beta)
-            val_loss, val_pix_acc, val_img_acc = predict(net, valloader, criterion, beta)
-            train_losses.append(train_loss)
+            train_loss, train_rmse, train_psnr, train_ssim, train_pcc = fit(net, trainloader, optimizer, scaler, criterion, beta)
+            val_loss, val_rmse, val_psnr, val_ssim, val_pcc = predict(net, valloader, criterion)
             val_losses.append(val_loss)
             scheduler.step(val_loss)
-            prog_bar.set_description(f"Epoch {epoch + 1}, lr={current_lr}, beta={beta:.3f} | "
-                                     f"Metrics train/val: Pixel Acc={train_pix_acc:.3f}/{val_pix_acc:.3f}, "
-                                     f"Image Acc={train_img_acc:.3f}/{val_img_acc:.3f} | Loss: {train_loss:.3f}/{val_loss:.3f}")
+            prog_bar.set_description(f"Epoch {epoch + 1}, lr={current_lr}, beta={beta:.3f}, Loss={train_loss:.3f}/{val_loss:.3f} | "
+                                     f"Metrics train/val: RMSE={train_rmse:.3f}/{val_rmse:.3f}, PSNR={train_psnr:.3f}/{val_psnr:.3f}, "
+                                     f"SSIM={train_ssim:.3f}/{val_ssim:.3f}, PCC={train_pcc:.3f}/{val_pcc:.3f}")
         del net, optimizer, scheduler
         mean_loss = np.mean(val_losses)
         trial.report(mean_loss, split_n)
@@ -407,7 +389,7 @@ def objective(trial, trainset, scaler, X):
     return mean_loss
 #%%
 class Net(nn.Module):
-    def __init__(self, latent_dim):
+    def __init__(self, latent_dim=256):
         super(Net, self).__init__()
         self.latent_dim = latent_dim
         self.encoder = nn.Sequential(
@@ -505,10 +487,11 @@ valloader = DataLoader(valset, batch_size=64, shuffle=False, num_workers=4, pin_
 testloader = DataLoader(testset, batch_size=64, shuffle=False, num_workers=4, pin_memory=True, prefetch_factor=2)
 optimizer = optim.AdamW(net.parameters(), lr=1e-3, fused=True)
 scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5)
-prior = compute_ab_prior(trainloader).to(device)
-weights = make_rebalancing_weights(prior, alpha=0.5)
-criterion = nn.CrossEntropyLoss(weight=weights, reduction='mean').to(device, memory_format=torch.channels_last)
-del prior, dummy
+criterion = nn.MSELoss(reduction='mean').to(device, memory_format=torch.channels_last)
+# prior = compute_ab_prior(trainloader).to(device)
+# weights = make_rebalancing_weights(prior, alpha=0.5)
+# criterion = nn.CrossEntropyLoss(weight=weights, reduction='mean').to(device, memory_format=torch.channels_last)
+del dummy # , prior
 gc.collect()
 torch.cuda.empty_cache()
 #%%
@@ -521,8 +504,8 @@ def update_plot():
     fig.canvas.draw()
 #%% Train entire dataset
 early_stopping = EarlyStopping()
-train_losses, train_pix_accs, train_img_accs = [], [], []
-val_losses, val_pix_accs, val_img_accs = [], [], []
+train_losses, train_rmses, train_psnrs, train_ssims, train_pccs = [], [], [], [], []
+val_losses, val_rmses, val_psnrs, val_ssims, val_pccs = [], [], [], [], []
 last_checkpoint = None
 num_epochs = 50
 num_cycles = 4
@@ -539,20 +522,24 @@ scaler = torch.cuda.amp.GradScaler()
 for epoch in prog_bar:
     cycle_pos = epoch % cycle_length
     beta = final_beta * (0.5 * (1 + np.cos(np.pi * (1 - cycle_pos / cycle_length))))
-    train_loss, train_pix_acc, train_img_acc = fit(net, trainloader, optimizer, scaler, criterion, beta)
+    train_loss, train_rmse, train_psnr, train_ssim, train_pcc = fit(net, trainloader, optimizer, scaler, criterion, beta)
     train_losses.append(train_loss)
-    train_pix_accs.append(train_pix_acc)
-    train_img_accs.append(train_img_acc)
-    val_loss, val_pix_acc, val_img_acc = predict(net, valloader, criterion, beta)
+    train_rmses.append(train_rmse)
+    train_psnrs.append(train_psnr)
+    train_ssims.append(train_ssim)
+    train_pccs.append(train_pcc)
+    val_loss, val_rmse, val_psnr, val_ssim, val_pcc = predict(net, valloader, criterion)
     val_losses.append(val_loss)
-    val_pix_accs.append(val_pix_acc)
-    val_img_accs.append(val_img_acc)
+    val_rmses.append(val_rmse)
+    val_psnrs.append(val_psnr)
+    val_ssims.append(val_ssim)
+    val_pccs.append(val_pcc)
     #scheduler.step(val_img_acc) TODO: find the correct factor/scheduling method
     #early_stopping(val_loss, net)
     current_lr = optimizer.param_groups[0]['lr']
-    prog_bar.set_description(f"Epoch {epoch + 1}, lr={current_lr}, beta={beta:.3f} | "
-                             f"Metrics train/val: Pixel Acc={train_pix_acc:.3f}/{val_pix_acc:.3f}, "
-                             f"Image Acc={train_img_acc:.3f}/{val_img_acc:.3f} | Loss: {train_loss:.3f}/{val_loss:.3f}")
+    prog_bar.set_description(f"Epoch {epoch + 1}, lr={current_lr}, beta={beta:.3f}, Loss={train_loss:.3f}/{val_loss:.3f} | "
+                             f"Metrics train/val: RMSE={train_rmse:.3f}/{val_rmse:.3f}, PSNR={train_psnr:.3f}/{val_psnr:.3f}, "
+                             f"SSIM={train_ssim:.3f}/{val_ssim:.3f}, PCC={train_pcc:.3f}/{val_pcc:.3f}")
     writer.add_scalar('Loss/train', train_loss, epoch)
     writer.add_scalar('Loss/val', val_loss, epoch)
     update_plot()
@@ -573,120 +560,151 @@ class ModelWithLoss(nn.Module):
         return self.loss_fn(preds, y)
 #%%
 @torch.inference_mode()
-def final_predict(net, valloader, loss_fn, beta=0.5):
+def final_predict(net, valloader):
     net.eval()
-    loss_sum = torch.zeros(1, device=device)
-    pixel_acc = torch.zeros(1, device=device)
-    pixel_total = torch.zeros(1, device=device)
-    image_acc = torch.zeros(1, device=device)
-    image_count = torch.zeros(1, device=device)
-    ins, preds_soft, preds_hard, truths = [], [], [], []
+    ins, preds, truths = [], [], []
     prefetcher = CUDAPrefetcher(valloader)
     inputs, targets = prefetcher.next()
-    batch_bar = tqdm(total=len(valloader), desc='Final Predicting', leave=False)
+    prog_bar = tqdm(total=len(valloader), desc='Final Predicting', leave=False)
     while inputs is not None:
         with torch.cuda.amp.autocast():
-            out, mu, logvar = net(inputs)
-            loss_clf = loss_fn(out, targets)
-            loss_kld = ((-0.5 * torch.mean(1 + logvar - mu ** 2 - logvar.exp())) /
-                        (inputs.size(0) * inputs.size(2) * inputs.size(3)))  # normalize by batch*H*W
-            loss = loss_clf + beta * loss_kld
-        valid = torch.ones_like(targets, dtype=torch.bool)
-        # Pixel accuracy
-        correct = (out.argmax(1) == targets) & valid
-        pixel_acc += correct.sum()
-        batch_valid_pixels = valid.sum()
-        pixel_total += batch_valid_pixels
-        # Mean per-image accuracy
-        B = targets.size(0)
-        correct_per = correct.reshape(B, -1).sum(dim=1)
-        valid_per = valid.reshape(B, -1).sum(dim=1)
-        valid_imgs = valid_per > 0
-        if valid_imgs.any():
-            image_acc += (correct_per[valid_imgs].float() / valid_per[valid_imgs].float()).sum()
-            image_count += valid_imgs.sum()
-        # Loss averaging across epoch
-        if batch_valid_pixels.item() > 0:
-            loss_sum += loss.detach() * batch_valid_pixels
+            out, *_ = net(inputs)
         ins.append(inputs.cpu())
-        ab_pred_soft = torch.einsum('bchw,cd->bdhw', torch.softmax(out.float(), dim=1), cluster_centers)
-        preds_soft.append(ab_pred_soft.cpu())
-        ab_pred_hard = cluster_centers[out.argmax(1)].permute(0, 3, 1, 2)
-        preds_hard.append(ab_pred_hard.cpu())
-        truths.append((cluster_centers[targets] + 128).permute(0, 3, 1, 2).cpu())
+        preds.append(out.cpu())
+        truths.append(targets.cpu())
+        # ab_pred_soft = torch.einsum('bchw,cd->bdhw', torch.softmax(out.float(), dim=1), cluster_centers)
+        # preds_soft.append(ab_pred_soft.cpu())
+        # ab_pred_hard = cluster_centers[out.argmax(1)].permute(0, 3, 1, 2)
+        # preds_hard.append(ab_pred_hard.cpu())
+        # truths.append((cluster_centers[targets] + 128).permute(0, 3, 1, 2).cpu())
         inputs, targets = prefetcher.next()
-        batch_bar.update(1)
-    batch_bar.close()
-    # Safeguards against division by zero
-    total_valid_pixels = pixel_total.clamp_min(1)
-    total_valid_images = image_count.clamp_min(1)
-    return (ins, preds_soft, preds_hard, truths, (loss_sum / total_valid_pixels).item(),
-            (pixel_acc / total_valid_pixels).item(), (image_acc / total_valid_images).item())
+        prog_bar.update(1)
+    prog_bar.close()
+    return ins, preds, truths
 #%% final evaluation
-cluster_centers = cluster_centers.to(device)
 net.load_state_dict(torch.load('../models/checkpoint.pth'))
-ins, preds_soft, preds_hard, truths, test_loss, test_pix_acc, test_img_acc = final_predict(net, testloader, criterion, beta)
-net_script = ModelWithLoss(net, nn.CrossEntropyLoss(weight=weights, reduction='mean'))
+ins, preds, truths = final_predict(net, testloader)
+net_script = ModelWithLoss(net, nn.MSELoss(reduction='mean'))
+# net_script = ModelWithLoss(net, nn.CrossEntropyLoss(weight=weights, reduction='mean'))
 net_script = torch.jit.script(net_script)
 net_script.save('../models/model_and_loss.pt')
 #%%
 ins = unstandardize(torch.cat(ins, dim=0), L_mean, L_std)
-preds_soft = torch.cat(preds_soft, dim=0)
-preds_hard = torch.cat(preds_hard, dim=0)
-truths = torch.cat(truths, dim=0)
+preds = unstandardize(torch.cat(preds, dim=0), ab_mean, ab_std)
+truths = unstandardize(torch.cat(truths, dim=0), ab_mean, ab_std)
+# preds_soft = torch.cat(preds_soft, dim=0)
+# preds_hard = torch.cat(preds_hard, dim=0)
+# truths = torch.cat(truths, dim=0)
 
-preds_rgb_soft = [lab_to_rgb(torch.cat([L, ab], dim=0)) for L, ab in zip(ins, preds_soft)]
-preds_rgb_hard = [lab_to_rgb(torch.cat([L, ab], dim=0)) for L, ab in zip(ins, preds_hard)]
+preds_rgb = [lab_to_rgb(torch.cat([L, ab], dim=0)) for L, ab in zip(ins, preds)]
+# preds_rgb_soft = [lab_to_rgb(torch.cat([L, ab], dim=0)) for L, ab in zip(ins, preds_soft)]
+# preds_rgb_hard = [lab_to_rgb(torch.cat([L, ab], dim=0)) for L, ab in zip(ins, preds_hard)]
 truths_rgb = [lab_to_rgb(torch.cat([L, ab], dim=0)) for L, ab in zip(ins, truths)]
-print(test_loss, test_pix_acc, test_img_acc)
 #%%
 # %matplotlib inline
 
 plt.figure()
-plt.plot(train_pix_accs, label='Train pixel accuracy')
-plt.plot(val_pix_accs, label='Val pixel accuracy')
-plt.axhline(y=test_pix_acc, color='g', linestyle='--')
-plt.xlabel('Epoch')
-plt.ylabel('Accuracy')
-plt.legend()
-plt.show()
-
-plt.figure()
-plt.plot(train_img_accs, label='Train per image accuracy')
-plt.plot(val_img_accs, label='Test per image accuracy')
-plt.axhline(y=test_img_acc, color='g', linestyle='--')
-plt.xlabel('Epoch')
-plt.ylabel('Accuracy')
-plt.legend()
-plt.show()
-
-plt.figure()
 plt.plot(train_losses, label='Train loss')
 plt.plot(val_losses, label='Val loss')
-plt.axhline(y=test_loss, color='g', linestyle='--')
 plt.xlabel('Epoch')
 plt.ylabel('Loss')
-plt.ylim(bottom=0)
 plt.legend()
 plt.show()
+
+plt.figure()
+plt.plot(train_rmses, label='Train RMSE')
+plt.plot(val_rmses, label='Val RMSE')
+plt.xlabel('Epoch')
+plt.ylabel('RMSE')
+plt.legend()
+plt.show()
+
+plt.figure()
+plt.plot(train_psnrs, label='Train PSNR')
+plt.plot(val_psnrs, label='Val PSNR')
+plt.xlabel('Epoch')
+plt.ylabel('PSNR')
+plt.legend()
+plt.show()
+
+plt.figure()
+plt.plot(train_ssims, label='Train SSIM')
+plt.plot(val_ssims, label='Val SSIM')
+plt.xlabel('Epoch')
+plt.ylabel('SSIM')
+plt.legend()
+plt.show()
+
+plt.figure()
+plt.plot(train_pccs, label='Train PCC')
+plt.plot(val_pccs, label='Val PCC')
+plt.xlabel('Epoch')
+plt.ylabel('PCC')
+plt.legend()
+plt.show()
+
+# plt.figure()
+# plt.plot(train_pix_accs, label='Train pixel accuracy')
+# plt.plot(val_pix_accs, label='Val pixel accuracy')
+# plt.axhline(y=test_pix_acc, color='g', linestyle='--')
+# plt.xlabel('Epoch')
+# plt.ylabel('Accuracy')
+# plt.legend()
+# plt.show()
+#
+# plt.figure()
+# plt.plot(train_img_accs, label='Train per image accuracy')
+# plt.plot(val_img_accs, label='Test per image accuracy')
+# plt.axhline(y=test_img_acc, color='g', linestyle='--')
+# plt.xlabel('Epoch')
+# plt.ylabel('Accuracy')
+# plt.legend()
+# plt.show()
+#
+# plt.figure()
+# plt.plot(train_losses, label='Train loss')
+# plt.plot(val_losses, label='Val loss')
+# plt.axhline(y=test_loss, color='g', linestyle='--')
+# plt.xlabel('Epoch')
+# plt.ylabel('Loss')
+# plt.ylim(bottom=0)
+# plt.legend()
+# plt.show()
 #%%
 for _ in range(5):
     idx = np.random.randint(0, len(ins))
     plt.figure(figsize=(15, 15))
-    plt.subplot(1, 4, 1)
+    plt.subplot(1, 3, 1)
     plt.title('Gray', fontsize=20)
     plt.imshow(ins[idx].squeeze().cpu().numpy() , cmap='gray')
     plt.axis('off')
-    plt.subplot(1, 4, 2)
-    plt.title('Predicted (Soft)', fontsize=20)
-    plt.imshow(preds_rgb_soft[idx])
+    plt.subplot(1, 3, 2)
+    plt.title('Predicted', fontsize=20)
+    plt.imshow(preds[idx])
     plt.axis('off')
-    plt.subplot(1, 4, 3)
-    plt.title('Predicted (Hard)', fontsize=20)
-    plt.imshow(preds_rgb_hard[idx])
-    plt.axis('off')
-    plt.subplot(1, 4, 4)
+    plt.subplot(1, 3, 3)
     plt.title('Groundtruth', fontsize=20)
     plt.imshow(truths_rgb[idx])
     plt.axis('off')
     plt.show()
+
+# for _ in range(5):
+#     idx = np.random.randint(0, len(ins))
+#     plt.figure(figsize=(15, 15))
+#     plt.subplot(1, 4, 1)
+#     plt.title('Gray', fontsize=20)
+#     plt.imshow(ins[idx].squeeze().cpu().numpy() , cmap='gray')
+#     plt.axis('off')
+#     plt.subplot(1, 4, 2)
+#     plt.title('Predicted (Soft)', fontsize=20)
+#     plt.imshow(preds_rgb_soft[idx])
+#     plt.axis('off')
+#     plt.subplot(1, 4, 3)
+#     plt.title('Predicted (Hard)', fontsize=20)
+#     plt.imshow(preds_rgb_hard[idx])
+#     plt.axis('off')
+#     plt.subplot(1, 4, 4)
+#     plt.title('Groundtruth', fontsize=20)
+#     plt.imshow(truths_rgb[idx])
+#     plt.axis('off')
+#     plt.show()
