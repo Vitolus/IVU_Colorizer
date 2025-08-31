@@ -549,6 +549,7 @@ for epoch in prog_bar:
 save_checkpoint(net, 'lastcheck')
 writer.flush()
 #%%
+# %matplotlib inline
 class ModelWithLoss(nn.Module):
     def __init__(self, net, loss_fn):
         super().__init__()
@@ -582,6 +583,8 @@ def final_predict(net, valloader):
     prog_bar.close()
     return ins, preds, truths
 #%% final evaluation
+gc.collect()
+torch.cuda.empty_cache()
 net.load_state_dict(torch.load('../models/checkpoint.pth'))
 ins, preds, truths = final_predict(net, testloader)
 net_script = ModelWithLoss(net, nn.MSELoss(reduction='mean'))
@@ -601,8 +604,6 @@ preds_rgb = [lab_to_rgb(torch.cat([L, ab], dim=0)) for L, ab in zip(ins, preds)]
 # preds_rgb_hard = [lab_to_rgb(torch.cat([L, ab], dim=0)) for L, ab in zip(ins, preds_hard)]
 truths_rgb = [lab_to_rgb(torch.cat([L, ab], dim=0)) for L, ab in zip(ins, truths)]
 #%%
-# %matplotlib inline
-
 plt.figure()
 plt.plot(train_losses, label='Train loss')
 plt.plot(val_losses, label='Val loss')
