@@ -55,7 +55,7 @@ print(input_L.shape, target_ab.shape)
 #%%
 for _ in range(5):
     idx = np.random.randint(0, len(input_L) - 1)
-    color_img = np.concatenate([input_L[idx] * 255, target_ab[idx]], axis=2).astype(np.uint8)
+    color_img = np.concatenate([input_L[idx] * 255, target_ab[idx] * 255], axis=2).clip(0, 255).astype(np.uint8)
     plt.figure(figsize=(15, 15))
     plt.subplot(1, 3, 1)
     plt.title('RGB Color Image', fontsize=20)
@@ -74,7 +74,7 @@ for _ in range(5):
 input_L = np.transpose(input_L, (0, 3, 1, 2)) # (N, 1, H, W)
 target_ab = np.transpose(target_ab, (0, 3, 1, 2)) # (N, 2, H, W)
 L_train, L_test, ab_train, ab_test = train_test_split(input_L, target_ab, test_size=0.3, random_state=seed)
-L_val, L_test, ab_val, ab_test = train_test_split(L_test, ab_test, test_size=0.3, random_state=seed)
+L_val, L_test, ab_val, ab_test = train_test_split(L_test, ab_test, test_size=0.2, random_state=seed)
 L_train = torch.tensor(L_train, dtype=torch.float32)
 ab_train = torch.tensor(ab_train, dtype=torch.float32)
 L_val = torch.tensor(L_val, dtype=torch.float32)
@@ -309,7 +309,7 @@ def fit(net, trainloader, optimizer, scaler, loss_fn, beta=0.5):
         with torch.no_grad():
             total_loss += loss_rec.item()
             count += 1
-            sse = nn.MSELoss()(out, targets, reduction='sum')
+            sse = nn.MSELoss(reduction='sum')(out, targets)
             pixels += targets.numel()
             pcc_num, pcc_den1, pcc_den2 = compute_pcc_components(out, targets)
             total_sse += sse.item()
@@ -320,7 +320,7 @@ def fit(net, trainloader, optimizer, scaler, loss_fn, beta=0.5):
         inputs, targets = prefetcher.next()
     avg_mse = total_sse / pixels
     avg_rmse = avg_mse ** 0.5
-    return (total_loss / count, avg_rmse, 20 * torch.log10(1.0 / avg_rmse), total_ssim / count,
+    return (total_loss / count, avg_rmse, 20 * np.log10(1.0 / avg_rmse), total_ssim / count,
             (total_pcc_num / (total_pcc_den1 * total_pcc_den2) ** 0.5))
 
 @torch.inference_mode()
@@ -335,7 +335,7 @@ def predict(net, valloader, loss_fn):
             loss_rec = loss_fn(out, targets)
         total_loss += loss_rec.item()
         count += 1
-        sse = nn.MSELoss()(out, targets, reduction='sum')
+        sse = nn.MSELoss(reduction='sum')(out, targets)
         pixels += targets.numel()
         pcc_num, pcc_den1, pcc_den2 = compute_pcc_components(out, targets)
         total_sse += sse.item()
@@ -346,7 +346,7 @@ def predict(net, valloader, loss_fn):
         inputs, targets = prefetcher.next()
     avg_mse = total_sse / pixels
     avg_rmse = avg_mse ** 0.5
-    return (total_loss / count, avg_rmse, 20 * torch.log10(1.0 / avg_rmse), total_ssim / count,
+    return (total_loss / count, avg_rmse, 20 * np.log10(1.0 / avg_rmse), total_ssim / count,
             (total_pcc_num / (total_pcc_den1 * total_pcc_den2) ** 0.5))
 #%%
 def objective(trial, trainset, scaler, X):
@@ -369,7 +369,7 @@ def objective(trial, trainset, scaler, X):
         # weights = make_rebalancing_weights(prior, alpha=0.5)
         # criterion = nn.CrossEntropyLoss(weight=weights, reduction='mean').to(device, memory_format=torch.channels_last)
         net = Net(latent_dim).to(device, memory_format=torch.channels_last)
-        optimizer = optim.Adam(net.parameters(), lr=lr)
+        optimizer = optim.AdamW(net.parameters(), lr=lr)
         scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5)
         for epoch in range(50):
             cycle_pos = epoch % cycle_length
@@ -411,7 +411,7 @@ class Net(nn.Module):
             nn.ReLU(),
             nn.Flatten()  # Flatten the 3D output into a 1D vector
         )
-        self.fc_mu = nn.Linear(256 * 28 * 28, latent_dim)  # 31 is the dimension of the feature map
+        self.fc_mu = nn.Linear(256 * 28 * 28, latent_dim)  # 28 is the dimension of the feature map
         self.fc_logvar = nn.Linear(256 * 28 * 28, latent_dim)
         self.decoder_input = nn.Linear(latent_dim, 256 * 28 * 28)
         self.decoder = nn.Sequential(
@@ -425,7 +425,7 @@ class Net(nn.Module):
             nn.ConvTranspose2d(32, 16, kernel_size=3, stride=1, padding=1),
             nn.ReLU(),
             nn.ConvTranspose2d(16, 2, kernel_size=3, stride=2, padding=1, output_padding=1),
-            nn.Tanh()
+            nn.Sigmoid()
         )
 
     def reparameterize(self, mu, logvar):
@@ -444,11 +444,11 @@ class Net(nn.Module):
 #%%
 writer = SummaryWriter('../runs')
 net = Net().eval()
-torch.quantization.fuse_modules(net, [
-    ['conv3', 'bnorm1'],
-    ['conv4', 'bnorm2'],
-    ['conv5', 'bnorm3']
-], inplace=True)
+# torch.quantization.fuse_modules(net, [
+#     ['conv3', 'bnorm1'],
+#     ['conv4', 'bnorm2'],
+#     ['conv5', 'bnorm3']
+# ], inplace=True)
 net = net.to(device, memory_format=torch.channels_last)
 for m in net.modules():
     if isinstance(m, (torch.nn.Conv2d, torch.nn.ConvTranspose2d)):
@@ -457,7 +457,7 @@ dummy = torch.zeros(1, 1, SIZE, SIZE).to(device, memory_format=torch.channels_la
 writer.add_graph(net, dummy)
 writer.flush()
 summary(net, input_data=dummy, col_names=('input_size', 'output_size', 'num_params', 'trainable'))
-#%%
+#%% Hyper parameter tuning
 del dummy
 gc.collect()
 torch.cuda.empty_cache()
@@ -503,6 +503,7 @@ def update_plot():
     ax.autoscale_view()
     fig.canvas.draw()
 #%% Train entire dataset
+# TODO: add perceptual loss of VGG19 features
 early_stopping = EarlyStopping()
 train_losses, train_rmses, train_psnrs, train_ssims, train_pccs = [], [], [], [], []
 val_losses, val_rmses, val_psnrs, val_ssims, val_pccs = [], [], [], [], []
@@ -585,12 +586,12 @@ def final_predict(net, valloader):
 #%% final evaluation
 gc.collect()
 torch.cuda.empty_cache()
-net.load_state_dict(torch.load('../models/checkpoint.pth'))
+# net.load_state_dict(torch.load('../models/checkpoint.pth'))
 ins, preds, truths = final_predict(net, testloader)
-net_script = ModelWithLoss(net, nn.MSELoss(reduction='mean'))
-# net_script = ModelWithLoss(net, nn.CrossEntropyLoss(weight=weights, reduction='mean'))
-net_script = torch.jit.script(net_script)
-net_script.save('../models/model_and_loss.pt')
+# net_script = ModelWithLoss(net, nn.MSELoss(reduction='mean'))
+# # net_script = ModelWithLoss(net, nn.CrossEntropyLoss(weight=weights, reduction='mean'))
+# net_script = torch.jit.script(net_script) TODO: fix scripting issue
+# net_script.save('../models/model_and_loss.pt')
 #%%
 ins = unstandardize(torch.cat(ins, dim=0), L_mean, L_std)
 preds = unstandardize(torch.cat(preds, dim=0), ab_mean, ab_std)
@@ -681,7 +682,7 @@ for _ in range(5):
     plt.axis('off')
     plt.subplot(1, 3, 2)
     plt.title('Predicted', fontsize=20)
-    plt.imshow(preds[idx])
+    plt.imshow(preds_rgb[idx])
     plt.axis('off')
     plt.subplot(1, 3, 3)
     plt.title('Groundtruth', fontsize=20)
