@@ -31,6 +31,7 @@ torch.backends.cuda.matmul.allow_tf32 = True # allow TensorFloat-32 on matmul op
 torch.backends.cudnn.allow_tf32  = True # allow TensorFloat-32 on convolution operations
 print("Using device: ", device)
 #%%
+# TODO: check all code for correct use of reshape -> change to permute if needed (reshape scramble the pixel order?)
 def sort_files(folder):
     convert_func = lambda x: int(x) if x.isdigit() else x.lower()
     key_func = lambda x: [convert_func(c) for c in re.split('([0-9]+)', x)]
@@ -43,19 +44,20 @@ folder = os.listdir(path)
 folder = sort_files(folder)
 for file in tqdm(folder, desc='Loading color images'):
     img = cv2.imread(os.path.join(path, file), 1)
+    img = img.astype(np.float32) / 255.0 # [0..1]
     img = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
     img = cv2.resize(img, (SIZE, SIZE))
-    L = img[:, :, 0:1] / 255.0 # (H, W, 1)
-    ab = img[:, :, 1:3] / 255.0 # (H, W, 2)
+    L = img[:, :, 0:1] # (H, W, 1) [0..100]
+    ab = img[:, :, 1:3] # (H, W, 2) [-128..127]
     input_L.append(L)
     target_ab.append(ab)
-input_L = np.array(input_L).astype(np.float32) # (N, H, W, 1)
-target_ab = np.array(target_ab).astype(np.float32) # (N, H, W, 2)
+input_L = np.array(input_L) # (N, H, W, 1)
+target_ab = np.array(target_ab) # (N, H, W, 2)
 print(input_L.shape, target_ab.shape)
 #%%
 for _ in range(5):
     idx = np.random.randint(0, len(input_L) - 1)
-    color_img = np.concatenate([input_L[idx] * 255, target_ab[idx] * 255], axis=2).clip(0, 255).astype(np.uint8)
+    color_img = np.concatenate([input_L[idx] / 100 * 255, target_ab[idx] + 128], axis=2).clip(0, 255).astype(np.uint8)
     plt.figure(figsize=(15, 15))
     plt.subplot(1, 3, 1)
     plt.title('RGB Color Image', fontsize=20)
@@ -67,9 +69,10 @@ for _ in range(5):
     plt.axis('off')
     plt.subplot(1, 3, 3)
     plt.title('Grayscale Image ', fontsize=20)
-    plt.imshow((input_L[idx] * 255).astype(np.uint8).squeeze(), cmap='gray')
+    plt.imshow((input_L[idx] / 100 * 255).astype(np.uint8).squeeze(), cmap='gray')
     plt.axis('off')
     plt.show()
+# TODO: finish to change the scale of data (net input, output rescaling for loss?), mean/std calculation and unstandardize func
 #%%
 input_L = np.transpose(input_L, (0, 3, 1, 2)) # (N, 1, H, W)
 target_ab = np.transpose(target_ab, (0, 3, 1, 2)) # (N, 2, H, W)
@@ -412,7 +415,7 @@ class Net(nn.Module):
         )
         self.pool = nn.AdaptiveAvgPool2d((1, 1))
         self.fc_mu_logvar = nn.Conv2d(256, 2 * latent_dim, kernel_size=1)
-        # self.fc_mu = nn.Linear(256 * 28 * 28, latent_dim)  # 28 is the dimension of the feature map
+        # self.fc_mu = nn.Linear(256 * 28 * 28, latent_dim) # 28 is the dimension of the feature map
         # self.fc_logvar = nn.Linear(256 * 28 * 28, latent_dim)
         self.decoder_input = nn.Linear(latent_dim, 256 * 28 * 28)
         self.decoder = nn.Sequential(
@@ -426,7 +429,7 @@ class Net(nn.Module):
             nn.ConvTranspose2d(32, 16, kernel_size=3, stride=1, padding=1),
             nn.LeakyReLU(),
             nn.ConvTranspose2d(16, 2, kernel_size=3, stride=2, padding=1, output_padding=1),
-            nn.Sigmoid()
+            nn.Tanh()
         )
 
     def reparameterize(self, mu, logvar):
