@@ -73,7 +73,7 @@ for _ in range(5):
 #%%
 input_L = np.transpose(input_L, (0, 3, 1, 2)) # (N, 1, H, W)
 target_ab = np.transpose(target_ab, (0, 3, 1, 2)) # (N, 2, H, W)
-L_train, L_test, ab_train, ab_test = train_test_split(input_L, target_ab, test_size=0.3, random_state=seed)
+L_train, L_test, ab_train, ab_test = train_test_split(input_L, target_ab, test_size=0.2, random_state=seed)
 L_val, L_test, ab_val, ab_test = train_test_split(L_test, ab_test, test_size=0.2, random_state=seed)
 L_train = torch.tensor(L_train, dtype=torch.float32)
 ab_train = torch.tensor(ab_train, dtype=torch.float32)
@@ -394,36 +394,37 @@ class Net(nn.Module):
         self.latent_dim = latent_dim
         self.encoder = nn.Sequential(
             nn.Conv2d(1, 64, kernel_size=3, stride=2, padding=1),
-            nn.ReLU(),
+            nn.LeakyReLU(),
             nn.Conv2d(64, 128, kernel_size=3, stride=1, padding=1),
-            nn.ReLU(),
+            nn.LeakyReLU(),
             nn.Conv2d(128, 128, kernel_size=3, stride=2, padding=1),
-            nn.ReLU(),
+            nn.LeakyReLU(),
             nn.Conv2d(128, 256, kernel_size=3, stride=1, padding=1),
-            nn.ReLU(),
+            nn.LeakyReLU(),
             nn.Conv2d(256, 256, kernel_size=3, stride=2, padding=1),
-            nn.ReLU(),
+            nn.LeakyReLU(),
             nn.Conv2d(256, 512, kernel_size=3, stride=1, padding=1),
-            nn.ReLU(),
+            nn.LeakyReLU(),
             nn.Conv2d(512, 512, kernel_size=3, stride=1, padding=1),
-            nn.ReLU(),
+            nn.LeakyReLU(),
             nn.Conv2d(512, 256, kernel_size=3, stride=1, padding=1),
-            nn.ReLU(),
-            nn.Flatten()  # Flatten the 3D output into a 1D vector
+            nn.LeakyReLU()
         )
-        self.fc_mu = nn.Linear(256 * 28 * 28, latent_dim)  # 28 is the dimension of the feature map
-        self.fc_logvar = nn.Linear(256 * 28 * 28, latent_dim)
+        self.pool = nn.AdaptiveAvgPool2d((1, 1))
+        self.fc_mu_logvar = nn.Conv2d(256, 2 * latent_dim, kernel_size=1)
+        # self.fc_mu = nn.Linear(256 * 28 * 28, latent_dim)  # 28 is the dimension of the feature map
+        # self.fc_logvar = nn.Linear(256 * 28 * 28, latent_dim)
         self.decoder_input = nn.Linear(latent_dim, 256 * 28 * 28)
         self.decoder = nn.Sequential(
             nn.Unflatten(1, (256, 28, 28)),
             nn.ConvTranspose2d(256, 128, kernel_size=3, stride=2, padding=1, output_padding=1),
-            nn.ReLU(),
+            nn.LeakyReLU(),
             nn.ConvTranspose2d(128, 64, kernel_size=3, stride=2, padding=1, output_padding=1),
-            nn.ReLU(),
+            nn.LeakyReLU(),
             nn.ConvTranspose2d(64, 32, kernel_size=3, stride=1, padding=1),
-            nn.ReLU(),
+            nn.LeakyReLU(),
             nn.ConvTranspose2d(32, 16, kernel_size=3, stride=1, padding=1),
-            nn.ReLU(),
+            nn.LeakyReLU(),
             nn.ConvTranspose2d(16, 2, kernel_size=3, stride=2, padding=1, output_padding=1),
             nn.Sigmoid()
         )
@@ -434,9 +435,12 @@ class Net(nn.Module):
         return mu + eps * std
 
     def forward(self, x):
-        encoded = self.encoder(x)
-        mu = self.fc_mu(encoded)
-        logvar = self.fc_logvar(encoded)
+        encoded = self.encoder(x) # [B, 256, 28, 28]
+        pooled = self.pool(encoded) # [B, 256, 1, 1]
+        mu_logvar = self.fc_mu_logvar(pooled).squeeze(-1).squeeze(-1) # [B, 2 * latent_dim]
+        mu, logvar = mu_logvar.chunk(2, dim=1)
+        # mu = self.fc_mu(encoded)
+        # logvar = self.fc_logvar(encoded)
         z = self.reparameterize(mu, logvar)
         decoder_input = self.decoder_input(z)
         x = self.decoder(decoder_input)
