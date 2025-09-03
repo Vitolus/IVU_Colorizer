@@ -84,90 +84,16 @@ L_mean = torch.mean(L_train, dim=[0, 2, 3])
 L_std = torch.std(L_train, dim=[0, 2, 3])
 print(L_mean, L_std)
 #%%
-# TODO: finish to change the scale of data (net input, output rescaling for loss?), mean/std calculation and unstandardize func
-# TODO: check correct use of reshape -> change to permute if needed (reshape scramble the pixel order?)
-def unstandardize(tensor, mean, std):
-    og_shape = tensor.shape
-    C, H, W = og_shape[-3:]
-    if not torch.is_tensor(mean):
-        mean = torch.tensor(mean, dtype=tensor.dtype, device=tensor.device)
-    if not torch.is_tensor(std):
-        std = torch.tensor(std, dtype=tensor.dtype, device=tensor.device)
-
-    tensor = (tensor.reshape(-1, C, H, W) * std.reshape(1, C, 1, 1) + mean.reshape(1, C, 1, 1)).clamp(0, 1)  # unnormalize to [0, 1]
-    return tensor.reshape(og_shape)  # restore original shape
-
-def compute_pcc_components(pred, targets):
-    pred_flat = pred.reshape(pred.size(0), -1)
-    target_flat = targets.reshape(targets.size(0), -1)
-    vx = pred_flat - pred_flat.mean(dim=1, keepdim=True)
-    vy = target_flat - target_flat.mean(dim=1, keepdim=True)
-    numerator = (vx * vy).sum(dim=1) # covariance
-    denominator1 = (vx ** 2).sum(dim=1)
-    denominator2 = (vy ** 2).sum(dim=1)
-    return numerator, denominator1, denominator2
-
-# def compute_ab_prior(dataloader):
-#     hist = torch.zeros(313)
-#     total = 0
-#     for _, labels in dataloader:
-#         hist += torch.bincount(labels.reshape(-1), minlength=313)  # accumulate histogram
-#         total += labels.numel()
-#         del labels
-#     return hist / total # p(c)
-#
-# def make_rebalancing_weights(priors, alpha=0.5):
-#     C = priors.size(0)
-#     uniform = torch.full_like(priors, 1.0 / C, device=device)
-#     smoothed = (1.0 - alpha) * uniform + alpha * priors
-#     weights = 1.0 / smoothed # inverse of smoothed priors (Cross entropies) [0..inf]
-#     return weights / weights.mean()
-
-def lab_to_rgb(x):
-    lab = x.permute(1, 2, 0)
-    L = (lab[:, :, 0] * 255).cpu().numpy().astype(np.uint8)
-    a = (lab[:, :, 1] * 255).cpu().numpy().astype(np.uint8)
-    b = (lab[:, :, 2] * 255).cpu().numpy().astype(np.uint8)
-    lab_cv = np.stack([L, a, b], axis=2)
-    rgb = cv2.cvtColor(lab_cv, cv2.COLOR_LAB2RGB)
-    return rgb
-#%%
 class MyDataset(torch.utils.data.Dataset):
-    def __init__(self, L_data, ab_data, L_transform=None, ab_transform=None):
+    def __init__(self, L_data, ab_data, L_transform=None):
         self.L_data = L_transform(L_data) if L_transform else L_data
-        self.ab_data = ab_transform(ab_data) if ab_transform else ab_data
+        self.ab_data = ab_data
+
     def __len__(self):
         return len(self.L_data)
 
     def __getitem__(self, idx):
         return self.L_data[idx], self.ab_data[idx]
-
-# class MyDataset(torch.utils.data.Dataset):
-#     def __init__(self, filepaths, lut, L_transform=None):
-#         self.filepaths = filepaths
-#         self.lut = lut.cpu()
-#         self.L_transform = L_transform
-#
-#     def __len__(self):
-#         return len(self.filepaths)
-#
-#     def __getitem__(self, idx):
-#         img_path = self.filepaths[idx]
-#         img = cv2.imread(img_path, 1)
-#         img = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
-#         img = cv2.resize(img, (SIZE, SIZE))
-#         L = (img[:, :, 0:1].astype(np.float32) / 255.0).transpose(2, 0, 1) # (1, H, W) [0..1]
-#         ab = (img[:, :, 1:3].astype(np.uint8)).transpose(2, 0, 1) # (2, H, W) [0..255]
-#         L_data = torch.from_numpy(L)
-#         ab_data = torch.from_numpy(ab).long()
-#         if self.L_transform:
-#             L_data = self.L_transform(L_data)
-#         with torch.no_grad():
-#             a = ab_data[0, :, :]
-#             b = ab_data[1, :, :]
-#             idx = a * 256 + b
-#             label = self.lut[idx]
-#         return L_data, label
 #%%
 class CUDAPrefetcher:
     def __init__(self, loader):
@@ -192,30 +118,6 @@ class CUDAPrefetcher:
         L, ab = self.next_L, self.next_ab
         self._preload()
         return L, ab
-
-# class CUDAPrefetcher:
-#     def __init__(self, loader):
-#         self.loader = iter(loader)
-#         self.stream = torch.cuda.Stream()
-#         self.next_L = None
-#         self.next_labels = None
-#         self._preload()
-#
-#     def _preload(self):
-#         try:
-#             self.next_L, self.next_labels = next(self.loader)
-#         except StopIteration:
-#             self.next_L = None
-#             return
-#         with torch.cuda.stream(self.stream):
-#             self.next_L = self.next_L.to(device, memory_format=torch.channels_last, non_blocking=True)
-#             self.next_labels = self.next_labels.to(device, non_blocking=True)
-#
-#     def next(self):
-#         torch.cuda.current_stream().wait_stream(self.stream)
-#         L, labels = self.next_L, self.next_labels
-#         self._preload()
-#         return L, labels
 #%%
 # cluster_path = '../data/pts_in_hull.npy'
 # assert os.path.exists(cluster_path), "Download pts_in_hull.npy and place next to this script"
@@ -258,9 +160,9 @@ class CUDAPrefetcher:
 # print(L_mean, L_std)
 # print(ab_mean, ab_std)
 #%%
-trainset = MyDataset(L_train, ab_train, L_transform=transforms.Normalize(mean=L_mean, std=L_std), ab_transform=transforms.Normalize(mean=ab_mean, std=ab_std))
-valset = MyDataset(L_val, ab_val, L_transform=transforms.Normalize(mean=L_mean, std=L_std), ab_transform=transforms.Normalize(mean=ab_mean, std=ab_std))
-testset = MyDataset(L_test, ab_test, L_transform=transforms.Normalize(mean=L_mean, std=L_std), ab_transform=transforms.Normalize(mean=ab_mean, std=ab_std))
+trainset = MyDataset(L_train, ab_train, L_transform=transforms.Normalize(mean=L_mean, std=L_std))
+valset = MyDataset(L_val, ab_val, L_transform=transforms.Normalize(mean=L_mean, std=L_std))
+testset = MyDataset(L_test, ab_test, L_transform=transforms.Normalize(mean=L_mean, std=L_std))
 del L_train, ab_train, L_val, ab_val, L_test, ab_test
 #%%
 def save_checkpoint(model, name='checkpoint'):
@@ -284,6 +186,16 @@ class EarlyStopping:
             if self.counter >= self.patience:
                 self.early_stop = True
 #%%
+def compute_pcc_components(pred, targets):
+    pred_flat = pred.reshape(pred.size(0), -1)
+    target_flat = targets.reshape(targets.size(0), -1)
+    vx = pred_flat - pred_flat.mean(dim=1, keepdim=True)
+    vy = target_flat - target_flat.mean(dim=1, keepdim=True)
+    numerator = (vx * vy).sum(dim=1) # covariance
+    denominator1 = (vx ** 2).sum(dim=1)
+    denominator2 = (vy ** 2).sum(dim=1)
+    return numerator, denominator1, denominator2
+
 def fit(net, trainloader, optimizer, scaler, loss_fn, beta=0.5):
     net.train()
     total_loss, total_sse, total_psnr, total_ssim, total_pcc_num, total_pcc_den1, total_pcc_den2, pixels, count = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0, 0
@@ -293,6 +205,7 @@ def fit(net, trainloader, optimizer, scaler, loss_fn, beta=0.5):
         optimizer.zero_grad(set_to_none=True)
         with torch.cuda.amp.autocast():
             out, mu, logvar = net(inputs)
+            out = (out + 1) / 2 * 255 - 128  # rescale to [-128, 127]
             loss_rec = loss_fn(out, targets)
             loss_kld = -0.5 * torch.sum(1 + logvar - mu ** 2 - logvar.exp(), dim=1).mean()
             loss = loss_rec + beta * loss_kld
@@ -326,6 +239,7 @@ def predict(net, valloader, loss_fn):
     while inputs is not None:
         with torch.cuda.amp.autocast():
             out, mu, logvar = net(inputs)
+            out = (out + 1) / 2 * 255 - 128  # rescale to [-128, 127]
             loss_rec = loss_fn(out, targets)
         total_loss += loss_rec.item()
         count += 1
@@ -517,6 +431,8 @@ line1, = ax.plot([], [], label='Train Loss')
 line2, = ax.plot([], [], label='Val Loss')
 ax.legend()
 
+# TODO: finish to change the scale of data (net input, output rescaling for loss?), mean/std calculation and unstandardize func
+# TODO: check correct use of reshape -> change to permute if needed (reshape scramble the pixel order?)
 scaler = torch.cuda.amp.GradScaler()
 for epoch in prog_bar:
     cycle_pos = epoch % cycle_length
@@ -569,6 +485,7 @@ def final_predict(net, valloader):
     while inputs is not None:
         with torch.cuda.amp.autocast():
             out, *_ = net(inputs)
+            out = (out + 1) / 2 * 255 - 128  # rescale to [-128, 127]
         ins.append(inputs.cpu())
         preds.append(out.cpu())
         truths.append(targets.cpu())
@@ -591,6 +508,17 @@ ins, preds, truths = final_predict(net, testloader)
 # net_script = torch.jit.script(net_script) TODO: fix scripting issue
 # net_script.save('../models/model_and_loss.pt')
 #%%
+# TODO: will change '* 255' to correct scaling after figuring out correct
+def lab_to_rgb(x):
+    lab = x.permute(1, 2, 0)
+    L = (lab[:, :, 0] * 255).cpu().numpy().astype(np.uint8)
+    a = (lab[:, :, 1] * 255).cpu().numpy().astype(np.uint8)
+    b = (lab[:, :, 2] * 255).cpu().numpy().astype(np.uint8)
+    lab_cv = np.stack([L, a, b], axis=2)
+    rgb = cv2.cvtColor(lab_cv, cv2.COLOR_LAB2RGB)
+    return rgb
+
+# TODO: unstandardize function removed, use formula directly
 ins = unstandardize(torch.cat(ins, dim=0), L_mean, L_std)
 preds = unstandardize(torch.cat(preds, dim=0), ab_mean, ab_std)
 truths = unstandardize(torch.cat(truths, dim=0), ab_mean, ab_std)
