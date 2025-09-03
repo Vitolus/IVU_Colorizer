@@ -31,7 +31,6 @@ torch.backends.cuda.matmul.allow_tf32 = True # allow TensorFloat-32 on matmul op
 torch.backends.cudnn.allow_tf32  = True # allow TensorFloat-32 on convolution operations
 print("Using device: ", device)
 #%%
-# TODO: check all code for correct use of reshape -> change to permute if needed (reshape scramble the pixel order?)
 def sort_files(folder):
     convert_func = lambda x: int(x) if x.isdigit() else x.lower()
     key_func = lambda x: [convert_func(c) for c in re.split('([0-9]+)', x)]
@@ -72,29 +71,21 @@ for _ in range(5):
     plt.imshow((input_L[idx] / 100 * 255).astype(np.uint8).squeeze(), cmap='gray')
     plt.axis('off')
     plt.show()
-# TODO: finish to change the scale of data (net input, output rescaling for loss?), mean/std calculation and unstandardize func
 #%%
-input_L = np.transpose(input_L, (0, 3, 1, 2)) # (N, 1, H, W)
-target_ab = np.transpose(target_ab, (0, 3, 1, 2)) # (N, 2, H, W)
+input_L = (torch.from_numpy(input_L) / 100.0).permute(0, 3, 1, 2) # (N, 1, H, W) [0..1]
+target_ab = torch.from_numpy(target_ab).permute(0, 3, 1, 2) # (N, 2, H, W) [-128..127]
 L_train, L_test, ab_train, ab_test = train_test_split(input_L, target_ab, test_size=0.2, random_state=seed)
 L_val, L_test, ab_val, ab_test = train_test_split(L_test, ab_test, test_size=0.2, random_state=seed)
-L_train = torch.tensor(L_train, dtype=torch.float32)
-ab_train = torch.tensor(ab_train, dtype=torch.float32)
-L_val = torch.tensor(L_val, dtype=torch.float32)
-ab_val = torch.tensor(ab_val, dtype=torch.float32)
-L_test = torch.tensor(L_test, dtype=torch.float32)
-ab_test = torch.tensor(ab_test, dtype=torch.float32)
 print(L_train.shape, ab_train.shape)
 print(L_val.shape, ab_val.shape)
 print(L_test.shape, ab_test.shape)
 #%%
-L_mean = L_train.mean(dim=(0, 2, 3))
-L_std = L_train.std(dim=(0, 2, 3))
-ab_mean = ab_train.mean(dim=(0, 2, 3))
-ab_std = ab_train.std(dim=(0, 2, 3))
+L_mean = torch.mean(L_train, dim=[0, 2, 3])
+L_std = torch.std(L_train, dim=[0, 2, 3])
 print(L_mean, L_std)
-print(ab_mean, ab_std)
 #%%
+# TODO: finish to change the scale of data (net input, output rescaling for loss?), mean/std calculation and unstandardize func
+# TODO: check correct use of reshape -> change to permute if needed (reshape scramble the pixel order?)
 def unstandardize(tensor, mean, std):
     og_shape = tensor.shape
     C, H, W = og_shape[-3:]
