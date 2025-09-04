@@ -205,12 +205,12 @@ def fit(net, trainloader, optimizer, scaler, loss_fn, beta=0.5):
         optimizer.zero_grad(set_to_none=True)
         with torch.cuda.amp.autocast():
             out, mu, logvar = net(inputs)
-            out = (out + 1) / 2 * 255 - 128  # rescale to [-128, 127]
+            out = (out + 1.0) / 2.0 * 255.0 - 128.0  # rescale to [-128, 127]
             loss_rec = loss_fn(out, targets)
             loss_kld = -0.5 * torch.sum(1 + logvar - mu ** 2 - logvar.exp(), dim=1).mean()
             loss = loss_rec + beta * loss_kld
         scaler.scale(loss).backward()
-        nn.utils.clip_grad_norm_(net.parameters(), 3)
+        nn.utils.clip_grad_norm_(net.parameters(), 2)
         scaler.step(optimizer)
         scaler.update()
         with torch.no_grad():
@@ -239,7 +239,7 @@ def predict(net, valloader, loss_fn):
     while inputs is not None:
         with torch.cuda.amp.autocast():
             out, mu, logvar = net(inputs)
-            out = (out + 1) / 2 * 255 - 128  # rescale to [-128, 127]
+            out = (out + 1.0) / 2.0 * 255.0 - 128.0  # rescale to [-128, 127]
             loss_rec = loss_fn(out, targets)
         total_loss += loss_rec.item()
         count += 1
@@ -483,7 +483,7 @@ def final_predict(net, valloader):
     while inputs is not None:
         with torch.cuda.amp.autocast():
             out, *_ = net(inputs)
-            out = (out + 1) / 2 * 255 - 128  # rescale to [-128, 127]
+            out = (out + 1.0) / 2.0 * 255.0 - 128.0  # rescale to [-128, 127]
         ins.append(inputs.cpu())
         preds.append(out.cpu())
         truths.append(targets.cpu())
