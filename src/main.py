@@ -431,8 +431,6 @@ line1, = ax.plot([], [], label='Train Loss')
 line2, = ax.plot([], [], label='Val Loss')
 ax.legend()
 
-# TODO: finish to change the scale of data (net input, output rescaling for loss?), mean/std calculation and unstandardize func
-# TODO: check correct use of reshape -> change to permute if needed (reshape scramble the pixel order?)
 scaler = torch.cuda.amp.GradScaler()
 for epoch in prog_bar:
     cycle_pos = epoch % cycle_length
@@ -508,28 +506,28 @@ ins, preds, truths = final_predict(net, testloader)
 # net_script = torch.jit.script(net_script) TODO: fix scripting issue
 # net_script.save('../models/model_and_loss.pt')
 #%%
-# TODO: will change '* 255' to correct scaling after figuring out correct
-def lab_to_rgb(x):
-    lab = x.permute(1, 2, 0)
-    L = (lab[:, :, 0] * 255).cpu().numpy().astype(np.uint8)
-    a = (lab[:, :, 1] * 255).cpu().numpy().astype(np.uint8)
-    b = (lab[:, :, 2] * 255).cpu().numpy().astype(np.uint8)
-    lab_cv = np.stack([L, a, b], axis=2)
-    rgb = cv2.cvtColor(lab_cv, cv2.COLOR_LAB2RGB)
+def lab_to_rgb(L, ab):
+    L = (L * 100.0).squeeze(0).detach().cpu().numpy() # rescale to [0..100]
+    a = ab[0].detach().cpu().numpy() # already in [-128..127]
+    b = ab[1].detach().cpu().numpy()
+    lab = np.stack([L, a, b], axis=2).astype(np.float32)
+    rgb = cv2.cvtColor(lab, cv2.COLOR_LAB2RGB)
     return rgb
 
-# TODO: unstandardize function removed, use formula directly
-ins = unstandardize(torch.cat(ins, dim=0), L_mean, L_std)
-preds = unstandardize(torch.cat(preds, dim=0), ab_mean, ab_std)
-truths = unstandardize(torch.cat(truths, dim=0), ab_mean, ab_std)
+ins = (torch.cat(ins, 0) * L_std.reshape(1, -1, 1, 1) + L_mean.reshape(1, -1, 1, 1)) * 100.0 # unstandardize and rescale to [0..100]
 # preds_soft = torch.cat(preds_soft, dim=0)
 # preds_hard = torch.cat(preds_hard, dim=0)
 # truths = torch.cat(truths, dim=0)
 
-preds_rgb = [lab_to_rgb(torch.cat([L, ab], dim=0)) for L, ab in zip(ins, preds)]
+preds_rgb = (torch.cat([ins, torch.cat(preds, 0)], 1)
+             .permute(0, 2, 3, 1).detach().cpu().numpy()) # (N, H, W, 3)
+preds_rgb = [cv2.cvtColor(img, cv2.COLOR_LAB2RGB) for img in preds_rgb]
 # preds_rgb_soft = [lab_to_rgb(torch.cat([L, ab], dim=0)) for L, ab in zip(ins, preds_soft)]
 # preds_rgb_hard = [lab_to_rgb(torch.cat([L, ab], dim=0)) for L, ab in zip(ins, preds_hard)]
-truths_rgb = [lab_to_rgb(torch.cat([L, ab], dim=0)) for L, ab in zip(ins, truths)]
+truths_rgb = (torch.cat([ins, torch.cat(truths, 0)], 1)
+             .permute(0, 2, 3, 1).detach().cpu().numpy()) # (N, H, W, 3)
+truths_rgb = [cv2.cvtColor(img, cv2.COLOR_LAB2RGB) for img in truths_rgb]
+ins = ins.permute(0, 2, 3, 1).detach().cpu().numpy() # (N, H, W, 1)
 #%%
 plt.figure()
 plt.plot(train_losses, label='Train loss')
@@ -604,7 +602,7 @@ for _ in range(5):
     plt.figure(figsize=(15, 15))
     plt.subplot(1, 3, 1)
     plt.title('Gray', fontsize=20)
-    plt.imshow(ins[idx].squeeze().cpu().numpy() , cmap='gray')
+    plt.imshow(ins[idx] , cmap='gray')
     plt.axis('off')
     plt.subplot(1, 3, 2)
     plt.title('Predicted', fontsize=20)
