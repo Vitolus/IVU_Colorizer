@@ -220,15 +220,15 @@ def fit(net, trainloader, optimizer, scaler, loss_fn, beta=0.5):
             pixels += targets.numel()
             pcc_num, pcc_den1, pcc_den2 = compute_pcc_components(out, targets)
             total_sse += sse.item()
-            total_ssim = structural_similarity_index_measure(out, targets).item()
+            total_ssim += structural_similarity_index_measure(out, targets).item()
             total_pcc_num += pcc_num.sum().item()
             total_pcc_den1 += pcc_den1.sum().item()
             total_pcc_den2 += pcc_den2.sum().item()
         inputs, targets = prefetcher.next()
     avg_mse = total_sse / pixels
     avg_rmse = avg_mse ** 0.5
-    return (total_loss / count, avg_rmse, 20 * np.log10(1.0 / avg_rmse), total_ssim / count,
-            (total_pcc_num / (total_pcc_den1 * total_pcc_den2) ** 0.5))
+    return (total_loss / count, avg_rmse, 10 * np.log10(255.0 ** 2 / avg_rmse), total_ssim / count,
+            (total_pcc_num / ((total_pcc_den1 * total_pcc_den2) ** 0.5) + 1e-6))
 
 @torch.inference_mode()
 def predict(net, valloader, loss_fn):
