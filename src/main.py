@@ -13,6 +13,7 @@ from torch.utils.data import DataLoader, SubsetRandomSampler
 from torch.utils.tensorboard import SummaryWriter
 from torchmetrics.functional.image import structural_similarity_index_measure
 from torchvision import transforms
+import torchvision.models as models
 from torchinfo import summary
 from sklearn.model_selection import KFold, train_test_split
 import numpy as np
@@ -295,6 +296,16 @@ def objective(trial, trainset, scaler, X):
         if trial.should_prune():
             raise optuna.exceptions.TrialPruned()
     return mean_loss
+#%% See VGG19 architecture to select layers for perceptual loss
+print(models.vgg19(weights=models.VGG19_Weights.IMAGENET1K_V1).features)
+ext_layer = 8  # extract features up to this layer (0-indexed)
+#%%
+class VGGLoss(nn.Module):
+    def __init__(self):
+        super(VGGLoss, self).__init__()
+        vgg = models.vgg19(weights=models.VGG19_Weights.IMAGENET1K_V1).features
+        self.features = nn.Sequential(*list(vgg.children())[:ext_layer]).eval()
+        # TODO: finish building perceptual loss
 #%%
 class Net(nn.Module):
     def __init__(self, latent_dim=256):
