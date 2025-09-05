@@ -322,9 +322,9 @@ class Net(nn.Module):
         self.fc_mu_logvar = nn.Conv2d(256, 2 * latent_dim, kernel_size=1)
         # self.fc_mu = nn.Linear(256 * 28 * 28, latent_dim) # 28 is the dimension of the feature map
         # self.fc_logvar = nn.Linear(256 * 28 * 28, latent_dim)
-        self.decoder_input = nn.Linear(latent_dim, 256 * 28 * 28)
+        self.decoder_input = nn.Linear(latent_dim, 256 * SIZE // 8 * SIZE // 8)
         self.decoder = nn.Sequential(
-            nn.Unflatten(1, (256, 28, 28)),
+            nn.Unflatten(1, (256, SIZE // 8, SIZE // 8)),
             nn.ConvTranspose2d(256, 128, kernel_size=3, stride=2, padding=1, output_padding=1),
             nn.LeakyReLU(),
             nn.ConvTranspose2d(128, 64, kernel_size=3, stride=2, padding=1, output_padding=1),
