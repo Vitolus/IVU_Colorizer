@@ -191,15 +191,21 @@ print(models.vgg19(weights=models.VGG19_Weights.IMAGENET1K_V1).features)
 ext_layer = 8  # extract features up to this layer (0-indexed)
 #%%
 class VGGLoss(nn.Module):
-    def __init__(self):
+    def __init__(self, layers=(16,)):
         super(VGGLoss, self).__init__()
         vgg = models.vgg19(weights=models.VGG19_Weights.IMAGENET1K_V1).features
-        self.features = nn.Sequential(*list(vgg.children())[:ext_layer]).eval()
-        for param in self.features.parameters():
-            param.requires_grad = False
+        self.slices = nn.ModuleList()
+        prev = 0
+        for i in sorted(layers):
+            slice = nn.Sequential(*list(vgg.children())[prev:i + 1])
+            self.slices.append(slice.eval())
+            prev = i + 1
+        for slice in self.slices:
+            for p in slice.parameters():
+                p.requires_grad = False
         self.register_buffer('mean', torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1))
         self.register_buffer('std', torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
-        self.loss_fn = nn.MSELoss()
+        self.loss_fn = nn.L1Loss()
 
     def _lab_to_rgb(self, L, ab):
         L = L * 100.0
@@ -226,10 +232,12 @@ class VGGLoss(nn.Module):
     def forward(self, L, ab_pred, ab_target):
         pred_rgb = (self._lab_to_rgb(L, ab_pred) - self.mean) / self.std
         target_rgb = (self._lab_to_rgb(L, ab_target) - self.mean) / self.std
-        pred_features = self.features(pred_rgb)
-        target_features = self.features(target_rgb)
-        loss_perc = self.loss_fn(pred_features, target_features)
-        return loss_perc
+        loss = 0.0
+        for slice in self.slices:
+            x = slice(pred_rgb)
+            y = slice(target_rgb)
+            loss += self.loss_fn(x, y)
+        return loss / len(self.slices)
 
 def compute_pcc_components(pred, targets):
     pred_flat = pred.reshape(pred.size(0), -1)
@@ -241,7 +249,7 @@ def compute_pcc_components(pred, targets):
     denominator2 = (vy ** 2).sum(dim=1)
     return numerator, denominator1, denominator2
 
-def fit(net, trainloader, optimizer, scaler, loss_pixel_fn, loss_vgg_fn=VGGLoss(), gamma= 0.5, beta=0.5):
+def fit(net, trainloader, optimizer, scaler, loss_pixel_fn, loss_vgg_fn, gamma, beta):
     net.train()
     total_loss, total_sse, total_psnr, total_ssim, total_pcc_num, total_pcc_den1, total_pcc_den2, pixels, count = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0, 0
     prefetcher = CUDAPrefetcher(trainloader)
@@ -276,7 +284,7 @@ def fit(net, trainloader, optimizer, scaler, loss_pixel_fn, loss_vgg_fn=VGGLoss(
             (total_pcc_num / ((total_pcc_den1 * total_pcc_den2) ** 0.5) + 1e-6))
 
 @torch.inference_mode()
-def predict(net, valloader, loss_pixel_fn, loss_vgg_fn=VGGLoss(), gamma=0.5):
+def predict(net, valloader, loss_pixel_fn, loss_vgg_fn, gamma):
     net.eval()
     total_loss, total_sse, total_psnr, total_ssim, total_pcc_num, total_pcc_den1, total_pcc_den2, pixels, count = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0, 0
     prefetcher = CUDAPrefetcher(valloader)
@@ -307,6 +315,7 @@ def objective(trial, trainset, scaler, X):
     cycle_length = num_epochs // num_cycles
     final_beta = 0.5
     gamma = trial.suggest_float('gamma', 0.1, 1.0)
+    layers = trial.suggest_categorical('layers', [(16,), (16, 22)])
     lr = trial.suggest_float('lr', 1e-5, 1e-1, log=True)
     batch_size = trial.suggest_categorical('batch_size', [32, 64, 128])
     latent_dim = trial.suggest_categorical('latent_dim', [64, 128, 256, 512])
@@ -319,7 +328,7 @@ def objective(trial, trainset, scaler, X):
         trainloader = DataLoader(trainset, batch_size=batch_size, sampler=SubsetRandomSampler(train_idx), num_workers=4, pin_memory=True, prefetch_factor=2)
         valloader = DataLoader(trainset, batch_size=batch_size, sampler=SubsetRandomSampler(val_idx), num_workers=4, pin_memory=True, prefetch_factor=2)
         criterion1 = nn.MSELoss(reduction='mean').to(device, memory_format=torch.channels_last)
-        criterion2 = VGGLoss().to(device, memory_format=torch.channels_last)
+        criterion2 = VGGLoss(layers=layers).to(device, memory_format=torch.channels_last)
         # prior = compute_ab_prior(trainloader)
         # weights = make_rebalancing_weights(prior, alpha=0.5)
         # criterion = nn.CrossEntropyLoss(weight=weights, reduction='mean').to(device, memory_format=torch.channels_last)
@@ -447,7 +456,7 @@ testloader = DataLoader(testset, batch_size=64, shuffle=False, num_workers=4, pi
 optimizer = optim.AdamW(net.parameters(), lr=1e-3, fused=True)
 scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5)
 criterion1 = nn.MSELoss(reduction='mean').to(device, memory_format=torch.channels_last)
-criterion2 = VGGLoss().to(device, memory_format=torch.channels_last)
+criterion2 = VGGLoss(layers=(16,)).to(device, memory_format=torch.channels_last)
 # prior = compute_ab_prior(trainloader).to(device)
 # weights = make_rebalancing_weights(prior, alpha=0.5)
 # criterion = nn.CrossEntropyLoss(weight=weights, reduction='mean').to(device, memory_format=torch.channels_last)
