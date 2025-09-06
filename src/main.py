@@ -259,6 +259,7 @@ def fit(net, trainloader, optimizer, scaler, loss_pixel_fn, loss_vgg_fn, gamma, 
         with torch.cuda.amp.autocast():
             out, mu, logvar = net(inputs)
             out = (out + 1.0) / 2.0 * 255.0 - 128.0  # rescale to [-128, 127]
+            # TODO: why even if gamma=0, vgg loss is not 0 / destroy convergence
             loss_rec = loss_pixel_fn(out, targets) + gamma * loss_vgg_fn(inputs, out, targets)
             loss_kld = -0.5 * torch.sum(1 + logvar - mu ** 2 - logvar.exp(), dim=1).mean()
             loss = loss_rec + beta * loss_kld
@@ -307,8 +308,8 @@ def predict(net, valloader, loss_pixel_fn, loss_vgg_fn, gamma):
         inputs, targets = prefetcher.next()
     avg_mse = total_sse / pixels
     avg_rmse = avg_mse ** 0.5
-    return (total_loss / count, avg_rmse, 20 * np.log10(1.0 / avg_rmse), total_ssim / count,
-            (total_pcc_num / (total_pcc_den1 * total_pcc_den2) ** 0.5))
+    return (total_loss / count, avg_rmse, 10 * np.log10(255.0 ** 2 / avg_rmse), total_ssim / count,
+            (total_pcc_num / (total_pcc_den1 * total_pcc_den2) ** 0.5 + 1e-6))
 #%%
 def objective(trial, trainset, scaler, X):
     num_cycles = trial.suggest_int('num_cycles', 4, 10)
