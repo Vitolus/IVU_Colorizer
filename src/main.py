@@ -260,6 +260,7 @@ def fit(net, trainloader, optimizer, scaler, loss_pixel_fn, loss_vgg_fn, coeff_v
     while inputs is not None:
         optimizer.zero_grad(set_to_none=True)
         with torch.cuda.amp.autocast():
+            # TODO: add other losses with relative coeffs to the composite loss_rec: charbonnier instead of L1 and cosine similarity
             out, mu, logvar = net(inputs)
             out = (out + 1.0) / 2.0 * 255.0 - 128.0  # rescale to [-128, 127]
             # TODO: why even if coeff_vgg=0, vgg loss is not 0 / destroy convergence
@@ -286,7 +287,7 @@ def fit(net, trainloader, optimizer, scaler, loss_pixel_fn, loss_vgg_fn, coeff_v
     pcc_num = pixels * total_pcc_sxy - total_pcc_sx * total_pcc_sy
     pcc_den = torch.sqrt(pixels * total_pcc_sxx - total_pcc_sx ** 2) * torch.sqrt(pixels * total_pcc_syy - total_pcc_sy ** 2)
     avg_rmse = (total_sse / pixels) ** 0.5
-    return (total_loss / count).item(), avg_rmse.item(), (10 * np.log10(255.0 ** 2 / avg_rmse)).item(), (pcc_num / (pcc_den + 1e-8)).item()
+    return (total_loss / count).item(), avg_rmse.item(), (10 * torch.log10(255.0 ** 2 / avg_rmse)).item(), (pcc_num / (pcc_den + 1e-8)).item()
 
 @torch.inference_mode()
 def predict(net, valloader, loss_pixel_fn, loss_vgg_fn, coeff_vgg):
@@ -317,7 +318,7 @@ def predict(net, valloader, loss_pixel_fn, loss_vgg_fn, coeff_vgg):
     pcc_num = pixels * total_pcc_sxy - total_pcc_sx * total_pcc_sy
     pcc_den = torch.sqrt(pixels * total_pcc_sxx - total_pcc_sx ** 2) * torch.sqrt(pixels * total_pcc_syy - total_pcc_sy ** 2)
     avg_rmse = (total_sse / pixels) ** 0.5
-    return (total_loss / count).item(), avg_rmse.item(), (10 * np.log10(255.0 ** 2 / avg_rmse)).item(), (pcc_num / (pcc_den + 1e-8)).item()
+    return (total_loss / count).item(), avg_rmse.item(), (10 * torch.log10(255.0 ** 2 / avg_rmse)).item(), (pcc_num / (pcc_den + 1e-8)).item()
 #%%
 def objective(trial, trainset, scaler, X):
     num_cycles = trial.suggest_int('num_cycles', 4, 10)
