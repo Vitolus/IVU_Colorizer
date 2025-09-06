@@ -238,19 +238,23 @@ class VGGLoss(nn.Module):
             loss += self.loss_fn(x, y)
         return loss / len(self.slices)
 
-def compute_pcc_components(pred, targets):
-    pred_flat = pred.reshape(pred.size(0), -1)
-    target_flat = targets.reshape(targets.size(0), -1)
-    vx = pred_flat - pred_flat.mean(dim=1, keepdim=True)
-    vy = target_flat - target_flat.mean(dim=1, keepdim=True)
-    numerator = (vx * vy).sum(dim=1) # covariance
-    denominator1 = (vx ** 2).sum(dim=1)
-    denominator2 = (vy ** 2).sum(dim=1)
-    return numerator, denominator1, denominator2
+def compute_pcc_components(preds, targets):
+    preds = preds.flatten()
+    target = targets.flatten()
+    sx = preds.sum()
+    sy = target.sum()
+    sxx = (preds ** 2).sum()
+    syy = (target ** 2).sum()
+    sxy = (preds * target).sum()
+    return sx, sy, sxx, syy, sxy
 
 def fit(net, trainloader, optimizer, scaler, loss_pixel_fn, loss_vgg_fn, coeff_vgg, coeff_kld):
     net.train()
-    total_loss, total_sse, total_psnr, total_pcc_num, total_pcc_den1, total_pcc_den2, pixels, count = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0, 0
+    total_loss, total_sse, total_pcc_num, pixels, count = (torch.zeros(1, device=device), torch.zeros(1, device=device),
+                                                                       torch.zeros(1, device=device), 0, 0)
+    total_pcc_sx, total_pcc_sy, total_pcc_sxx, total_pcc_syy, total_pcc_sxy = (torch.zeros(1, device=device), torch.zeros(1, device=device),
+                                                                               torch.zeros(1, device=device), torch.zeros(1, device=device),
+                                                                               torch.zeros(1, device=device))
     prefetcher = CUDAPrefetcher(trainloader)
     inputs, targets = prefetcher.next()
     while inputs is not None:
@@ -267,46 +271,53 @@ def fit(net, trainloader, optimizer, scaler, loss_pixel_fn, loss_vgg_fn, coeff_v
         scaler.step(optimizer)
         scaler.update()
         with torch.no_grad():
-            total_loss += loss_rec.item()
+            total_loss += loss_rec
             count += 1
             sse = nn.MSELoss(reduction='sum')(out, targets)
+            total_sse += sse
             pixels += targets.numel()
-            pcc_num, pcc_den1, pcc_den2 = compute_pcc_components(out, targets)
-            total_sse += sse.item()
-            total_pcc_num += pcc_num.sum().item()
-            total_pcc_den1 += pcc_den1.sum().item()
-            total_pcc_den2 += pcc_den2.sum().item()
+            pcc_sx, pcc_sy, pcc_sxx, pcc_syy, pcc_sxy = compute_pcc_components(out, targets)
+            total_pcc_sx += pcc_sx
+            total_pcc_sy += pcc_sy
+            total_pcc_sxx += pcc_sxx
+            total_pcc_syy += pcc_syy
+            total_pcc_sxy += pcc_sxy
         inputs, targets = prefetcher.next()
-    avg_mse = total_sse / pixels
-    avg_rmse = avg_mse ** 0.5
-    return (total_loss / count, avg_rmse, 10 * np.log10(255.0 ** 2 / avg_rmse),
-            (total_pcc_num / ((total_pcc_den1 * total_pcc_den2) ** 0.5 + 1e-6)))
+    pcc_num = pixels * total_pcc_sxy - total_pcc_sx * total_pcc_sy
+    pcc_den = torch.sqrt(pixels * total_pcc_sxx - total_pcc_sx ** 2) * torch.sqrt(pixels * total_pcc_syy - total_pcc_sy ** 2)
+    avg_rmse = (total_sse / pixels) ** 0.5
+    return (total_loss / count).item(), avg_rmse.item(), (10 * np.log10(255.0 ** 2 / avg_rmse)).item(), (pcc_num / (pcc_den + 1e-8)).item()
 
 @torch.inference_mode()
 def predict(net, valloader, loss_pixel_fn, loss_vgg_fn, coeff_vgg):
     net.eval()
-    total_loss, total_sse, total_psnr, total_pcc_num, total_pcc_den1, total_pcc_den2, pixels, count = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0, 0
+    total_loss, total_sse, total_pcc_num, pixels, count = (torch.zeros(1, device=device), torch.zeros(1, device=device),
+                                                           torch.zeros(1, device=device), 0, 0)
+    total_pcc_sx, total_pcc_sy, total_pcc_sxx, total_pcc_syy, total_pcc_sxy = (torch.zeros(1, device=device), torch.zeros(1, device=device),
+                                                                               torch.zeros(1, device=device), torch.zeros(1, device=device),
+                                                                               torch.zeros(1, device=device))
     prefetcher = CUDAPrefetcher(valloader)
     inputs, targets = prefetcher.next()
     while inputs is not None:
         with torch.cuda.amp.autocast():
             out, mu, logvar = net(inputs)
             out = (out + 1.0) / 2.0 * 255.0 - 128.0  # rescale to [-128, 127]
-            loss_rec = loss_pixel_fn(out, targets) + coeff_vgg * loss_vgg_fn(inputs, out, targets)
-        total_loss += loss_rec.item()
+            total_loss += loss_pixel_fn(out, targets) + coeff_vgg * loss_vgg_fn(inputs, out, targets)
         count += 1
         sse = nn.MSELoss(reduction='sum')(out, targets)
+        total_sse += sse
         pixels += targets.numel()
-        pcc_num, pcc_den1, pcc_den2 = compute_pcc_components(out, targets)
-        total_sse += sse.item()
-        total_pcc_num += pcc_num.sum().item()
-        total_pcc_den1 += pcc_den1.sum().item()
-        total_pcc_den2 += pcc_den2.sum().item()
+        pcc_sx, pcc_sy, pcc_sxx, pcc_syy, pcc_sxy = compute_pcc_components(out, targets)
+        total_pcc_sx += pcc_sx
+        total_pcc_sy += pcc_sy
+        total_pcc_sxx += pcc_sxx
+        total_pcc_syy += pcc_syy
+        total_pcc_sxy += pcc_sxy
         inputs, targets = prefetcher.next()
-    avg_mse = total_sse / pixels
-    avg_rmse = avg_mse ** 0.5
-    return (total_loss / count, avg_rmse, 10 * np.log10(255.0 ** 2 / avg_rmse),
-            (total_pcc_num / ((total_pcc_den1 * total_pcc_den2) ** 0.5 + 1e-6)))
+    pcc_num = pixels * total_pcc_sxy - total_pcc_sx * total_pcc_sy
+    pcc_den = torch.sqrt(pixels * total_pcc_sxx - total_pcc_sx ** 2) * torch.sqrt(pixels * total_pcc_syy - total_pcc_sy ** 2)
+    avg_rmse = (total_sse / pixels) ** 0.5
+    return (total_loss / count).item(), avg_rmse.item(), (10 * np.log10(255.0 ** 2 / avg_rmse)).item(), (pcc_num / (pcc_den + 1e-8)).item()
 #%%
 def objective(trial, trainset, scaler, X):
     num_cycles = trial.suggest_int('num_cycles', 4, 10)
