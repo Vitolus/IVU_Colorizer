@@ -249,7 +249,7 @@ def compute_pcc_components(pred, targets):
     denominator2 = (vy ** 2).sum(dim=1)
     return numerator, denominator1, denominator2
 
-def fit(net, trainloader, optimizer, scaler, loss_pixel_fn, loss_vgg_fn, gamma, beta):
+def fit(net, trainloader, optimizer, scaler, loss_pixel_fn, loss_vgg_fn, coeff_vgg, coeff_kld):
     net.train()
     total_loss, total_sse, total_psnr, total_ssim, total_pcc_num, total_pcc_den1, total_pcc_den2, pixels, count = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0, 0
     prefetcher = CUDAPrefetcher(trainloader)
@@ -259,10 +259,10 @@ def fit(net, trainloader, optimizer, scaler, loss_pixel_fn, loss_vgg_fn, gamma, 
         with torch.cuda.amp.autocast():
             out, mu, logvar = net(inputs)
             out = (out + 1.0) / 2.0 * 255.0 - 128.0  # rescale to [-128, 127]
-            # TODO: why even if gamma=0, vgg loss is not 0 / destroy convergence
-            loss_rec = loss_pixel_fn(out, targets) + gamma * loss_vgg_fn(inputs, out, targets)
+            # TODO: why even if coeff_vgg=0, vgg loss is not 0 / destroy convergence
+            loss_rec = loss_pixel_fn(out, targets) + coeff_vgg * loss_vgg_fn(inputs, out, targets)
             loss_kld = -0.5 * torch.sum(1 + logvar - mu ** 2 - logvar.exp(), dim=1).mean()
-            loss = loss_rec + beta * loss_kld
+            loss = loss_rec + coeff_kld * loss_kld
         scaler.scale(loss).backward()
         nn.utils.clip_grad_norm_(net.parameters(), 2)
         scaler.step(optimizer)
@@ -282,10 +282,10 @@ def fit(net, trainloader, optimizer, scaler, loss_pixel_fn, loss_vgg_fn, gamma, 
     avg_mse = total_sse / pixels
     avg_rmse = avg_mse ** 0.5
     return (total_loss / count, avg_rmse, 10 * np.log10(255.0 ** 2 / avg_rmse), total_ssim / count,
-            (total_pcc_num / ((total_pcc_den1 * total_pcc_den2) ** 0.5) + 1e-6))
+            (total_pcc_num / ((total_pcc_den1 * total_pcc_den2) ** 0.5 + 1e-6)))
 
 @torch.inference_mode()
-def predict(net, valloader, loss_pixel_fn, loss_vgg_fn, gamma):
+def predict(net, valloader, loss_pixel_fn, loss_vgg_fn, coeff_vgg):
     net.eval()
     total_loss, total_sse, total_psnr, total_ssim, total_pcc_num, total_pcc_den1, total_pcc_den2, pixels, count = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0, 0
     prefetcher = CUDAPrefetcher(valloader)
@@ -294,7 +294,7 @@ def predict(net, valloader, loss_pixel_fn, loss_vgg_fn, gamma):
         with torch.cuda.amp.autocast():
             out, mu, logvar = net(inputs)
             out = (out + 1.0) / 2.0 * 255.0 - 128.0  # rescale to [-128, 127]
-            loss_rec = loss_pixel_fn(out, targets) + gamma * loss_vgg_fn(inputs, out, targets)
+            loss_rec = loss_pixel_fn(out, targets) + coeff_vgg * loss_vgg_fn(inputs, out, targets)
         total_loss += loss_rec.item()
         count += 1
         sse = nn.MSELoss(reduction='sum')(out, targets)
@@ -309,7 +309,7 @@ def predict(net, valloader, loss_pixel_fn, loss_vgg_fn, gamma):
     avg_mse = total_sse / pixels
     avg_rmse = avg_mse ** 0.5
     return (total_loss / count, avg_rmse, 10 * np.log10(255.0 ** 2 / avg_rmse), total_ssim / count,
-            (total_pcc_num / (total_pcc_den1 * total_pcc_den2) ** 0.5 + 1e-6))
+            (total_pcc_num / ((total_pcc_den1 * total_pcc_den2) ** 0.5 + 1e-6)))
 #%%
 def objective(trial, trainset, scaler, X):
     num_cycles = trial.suggest_int('num_cycles', 4, 10)
@@ -456,7 +456,7 @@ valloader = DataLoader(valset, batch_size=64, shuffle=False, num_workers=4, pin_
 testloader = DataLoader(testset, batch_size=64, shuffle=False, num_workers=4, pin_memory=True, prefetch_factor=2)
 optimizer = optim.AdamW(net.parameters(), lr=1e-3, fused=True)
 scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5)
-criterion1 = nn.MSELoss(reduction='mean').to(device, memory_format=torch.channels_last)
+criterion1 = nn.L1Loss(reduction='mean').to(device, memory_format=torch.channels_last)
 criterion2 = VGGLoss(layers=(16,)).to(device, memory_format=torch.channels_last)
 # prior = compute_ab_prior(trainloader).to(device)
 # weights = make_rebalancing_weights(prior, alpha=0.5)
@@ -469,8 +469,8 @@ last_checkpoint = None
 num_epochs = 50
 num_cycles = 4
 cycle_length = num_epochs // num_cycles
-final_beta = 0.5
-gamma = 0.5
+final_coeff_kld = 0.5
+coeff_vgg = 0.5
 gc.collect()
 torch.cuda.empty_cache()
 #%%
@@ -492,14 +492,14 @@ ax.legend()
 scaler = torch.cuda.amp.GradScaler()
 for epoch in prog_bar:
     cycle_pos = epoch % cycle_length
-    beta = final_beta * (0.5 * (1 + np.cos(np.pi * (1 - cycle_pos / cycle_length))))
-    train_loss, train_rmse, train_psnr, train_ssim, train_pcc = fit(net, trainloader, optimizer, scaler, criterion1, criterion2, gamma, beta)
+    coeff_kld = final_coeff_kld * (0.5 * (1 + np.cos(np.pi * (1 - cycle_pos / cycle_length))))
+    train_loss, train_rmse, train_psnr, train_ssim, train_pcc = fit(net, trainloader, optimizer, scaler, criterion1, criterion2, coeff_vgg, coeff_kld)
     train_losses.append(train_loss)
     train_rmses.append(train_rmse)
     train_psnrs.append(train_psnr)
     train_ssims.append(train_ssim)
     train_pccs.append(train_pcc)
-    val_loss, val_rmse, val_psnr, val_ssim, val_pcc = predict(net, valloader, criterion1, criterion2, gamma)
+    val_loss, val_rmse, val_psnr, val_ssim, val_pcc = predict(net, valloader, criterion1, criterion2, coeff_vgg)
     val_losses.append(val_loss)
     val_rmses.append(val_rmse)
     val_psnrs.append(val_psnr)
@@ -508,7 +508,7 @@ for epoch in prog_bar:
     #scheduler.step(val_img_acc) TODO: find the correct factor/scheduling method
     #early_stopping(val_loss, net)
     current_lr = optimizer.param_groups[0]['lr']
-    prog_bar.set_description(f"Epoch {epoch + 1}, lr={current_lr}, beta={beta:.3f}, Loss={train_loss:.3f}/{val_loss:.3f} | "
+    prog_bar.set_description(f"Epoch {epoch + 1}, lr={current_lr}, coeff_kld={coeff_kld:.3f}, Loss={train_loss:.3f}/{val_loss:.3f} | "
                              f"Metrics train/val: RMSE={train_rmse:.3f}/{val_rmse:.3f}, PSNR={train_psnr:.3f}/{val_psnr:.3f}, "
                              f"SSIM={train_ssim:.3f}/{val_ssim:.3f}, PCC={train_pcc:.3f}/{val_pcc:.3f}")
     writer.add_scalar('Loss/train', train_loss, epoch)
