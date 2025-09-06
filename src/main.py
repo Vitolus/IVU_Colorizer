@@ -462,6 +462,15 @@ criterion2 = VGGLoss(layers=(16,)).to(device, memory_format=torch.channels_last)
 # weights = make_rebalancing_weights(prior, alpha=0.5)
 # criterion = nn.CrossEntropyLoss(weight=weights, reduction='mean').to(device, memory_format=torch.channels_last)
 del dummy # , prior
+early_stopping = EarlyStopping()
+train_losses, train_rmses, train_psnrs, train_ssims, train_pccs = [], [], [], [], []
+val_losses, val_rmses, val_psnrs, val_ssims, val_pccs = [], [], [], [], []
+last_checkpoint = None
+num_epochs = 50
+num_cycles = 4
+cycle_length = num_epochs // num_cycles
+final_beta = 0.5
+gamma = 0.5
 gc.collect()
 torch.cuda.empty_cache()
 #%%
@@ -473,16 +482,6 @@ def update_plot():
     ax.autoscale_view()
     fig.canvas.draw()
 #%% Train entire dataset
-# TODO: add perceptual loss of VGG19 features
-early_stopping = EarlyStopping()
-train_losses, train_rmses, train_psnrs, train_ssims, train_pccs = [], [], [], [], []
-val_losses, val_rmses, val_psnrs, val_ssims, val_pccs = [], [], [], [], []
-last_checkpoint = None
-num_epochs = 50
-num_cycles = 4
-cycle_length = num_epochs // num_cycles
-final_beta = 0.5
-gamma = 0.5
 prog_bar = tqdm(range(num_epochs), total=num_epochs, desc='Training', position=0)
 
 fig, ax = plt.subplots()
