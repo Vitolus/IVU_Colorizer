@@ -11,7 +11,6 @@ from torch import nn, optim
 from torch.utils.checkpoint import checkpoint
 from torch.utils.data import DataLoader, SubsetRandomSampler
 from torch.utils.tensorboard import SummaryWriter
-from torchmetrics.functional.image import structural_similarity_index_measure
 from torchvision import transforms
 import torchvision.models as models
 from torchinfo import summary
@@ -251,7 +250,7 @@ def compute_pcc_components(pred, targets):
 
 def fit(net, trainloader, optimizer, scaler, loss_pixel_fn, loss_vgg_fn, coeff_vgg, coeff_kld):
     net.train()
-    total_loss, total_sse, total_psnr, total_ssim, total_pcc_num, total_pcc_den1, total_pcc_den2, pixels, count = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0, 0
+    total_loss, total_sse, total_psnr, total_pcc_num, total_pcc_den1, total_pcc_den2, pixels, count = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0, 0
     prefetcher = CUDAPrefetcher(trainloader)
     inputs, targets = prefetcher.next()
     while inputs is not None:
@@ -274,20 +273,19 @@ def fit(net, trainloader, optimizer, scaler, loss_pixel_fn, loss_vgg_fn, coeff_v
             pixels += targets.numel()
             pcc_num, pcc_den1, pcc_den2 = compute_pcc_components(out, targets)
             total_sse += sse.item()
-            total_ssim += structural_similarity_index_measure(out, targets).item()
             total_pcc_num += pcc_num.sum().item()
             total_pcc_den1 += pcc_den1.sum().item()
             total_pcc_den2 += pcc_den2.sum().item()
         inputs, targets = prefetcher.next()
     avg_mse = total_sse / pixels
     avg_rmse = avg_mse ** 0.5
-    return (total_loss / count, avg_rmse, 10 * np.log10(255.0 ** 2 / avg_rmse), total_ssim / count,
+    return (total_loss / count, avg_rmse, 10 * np.log10(255.0 ** 2 / avg_rmse),
             (total_pcc_num / ((total_pcc_den1 * total_pcc_den2) ** 0.5 + 1e-6)))
 
 @torch.inference_mode()
 def predict(net, valloader, loss_pixel_fn, loss_vgg_fn, coeff_vgg):
     net.eval()
-    total_loss, total_sse, total_psnr, total_ssim, total_pcc_num, total_pcc_den1, total_pcc_den2, pixels, count = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0, 0
+    total_loss, total_sse, total_psnr, total_pcc_num, total_pcc_den1, total_pcc_den2, pixels, count = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0, 0
     prefetcher = CUDAPrefetcher(valloader)
     inputs, targets = prefetcher.next()
     while inputs is not None:
@@ -301,14 +299,13 @@ def predict(net, valloader, loss_pixel_fn, loss_vgg_fn, coeff_vgg):
         pixels += targets.numel()
         pcc_num, pcc_den1, pcc_den2 = compute_pcc_components(out, targets)
         total_sse += sse.item()
-        total_ssim = structural_similarity_index_measure(out, targets).item()
         total_pcc_num += pcc_num.sum().item()
         total_pcc_den1 += pcc_den1.sum().item()
         total_pcc_den2 += pcc_den2.sum().item()
         inputs, targets = prefetcher.next()
     avg_mse = total_sse / pixels
     avg_rmse = avg_mse ** 0.5
-    return (total_loss / count, avg_rmse, 10 * np.log10(255.0 ** 2 / avg_rmse), total_ssim / count,
+    return (total_loss / count, avg_rmse, 10 * np.log10(255.0 ** 2 / avg_rmse),
             (total_pcc_num / ((total_pcc_den1 * total_pcc_den2) ** 0.5 + 1e-6)))
 #%%
 def objective(trial, trainset, scaler, X):
@@ -339,13 +336,13 @@ def objective(trial, trainset, scaler, X):
         for epoch in range(50):
             cycle_pos = epoch % cycle_length
             beta = final_beta * (0.5 * (1 + np.cos(np.pi * (1 - cycle_pos / cycle_length))))
-            train_loss, train_rmse, train_psnr, train_ssim, train_pcc = fit(net, trainloader, optimizer, scaler, criterion1, criterion2, gamma, beta)
-            val_loss, val_rmse, val_psnr, val_ssim, val_pcc = predict(net, valloader, criterion1, criterion2, gamma)
+            train_loss, train_rmse, train_psnr, train_pcc = fit(net, trainloader, optimizer, scaler, criterion1, criterion2, gamma, beta)
+            val_loss, val_rmse, val_psnr, val_pcc = predict(net, valloader, criterion1, criterion2, gamma)
             val_losses.append(val_loss)
             scheduler.step(val_loss)
             prog_bar.set_description(f"Epoch {epoch + 1}, lr={current_lr}, beta={beta:.3f}, Loss={train_loss:.3f}/{val_loss:.3f} | "
                                      f"Metrics train/val: RMSE={train_rmse:.3f}/{val_rmse:.3f}, PSNR={train_psnr:.3f}/{val_psnr:.3f}, "
-                                     f"SSIM={train_ssim:.3f}/{val_ssim:.3f}, PCC={train_pcc:.3f}/{val_pcc:.3f}")
+                                     f"PCC={train_pcc:.3f}/{val_pcc:.3f}")
         del net, optimizer, scheduler
         mean_loss = np.mean(val_losses)
         trial.report(mean_loss, split_n)
@@ -463,8 +460,8 @@ criterion2 = VGGLoss(layers=(16,)).to(device, memory_format=torch.channels_last)
 # criterion = nn.CrossEntropyLoss(weight=weights, reduction='mean').to(device, memory_format=torch.channels_last)
 del dummy # , prior
 early_stopping = EarlyStopping()
-train_losses, train_rmses, train_psnrs, train_ssims, train_pccs = [], [], [], [], []
-val_losses, val_rmses, val_psnrs, val_ssims, val_pccs = [], [], [], [], []
+train_losses, train_rmses, train_psnrs, train_pccs = [], [], [], []
+val_losses, val_rmses, val_psnrs, val_pccs = [], [], [], []
 last_checkpoint = None
 num_epochs = 50
 num_cycles = 4
@@ -493,24 +490,22 @@ scaler = torch.cuda.amp.GradScaler()
 for epoch in prog_bar:
     cycle_pos = epoch % cycle_length
     coeff_kld = final_coeff_kld * (0.5 * (1 + np.cos(np.pi * (1 - cycle_pos / cycle_length))))
-    train_loss, train_rmse, train_psnr, train_ssim, train_pcc = fit(net, trainloader, optimizer, scaler, criterion1, criterion2, coeff_vgg, coeff_kld)
+    train_loss, train_rmse, train_psnr, train_pcc = fit(net, trainloader, optimizer, scaler, criterion1, criterion2, coeff_vgg, coeff_kld)
     train_losses.append(train_loss)
     train_rmses.append(train_rmse)
     train_psnrs.append(train_psnr)
-    train_ssims.append(train_ssim)
     train_pccs.append(train_pcc)
-    val_loss, val_rmse, val_psnr, val_ssim, val_pcc = predict(net, valloader, criterion1, criterion2, coeff_vgg)
+    val_loss, val_rmse, val_psnr, val_pcc = predict(net, valloader, criterion1, criterion2, coeff_vgg)
     val_losses.append(val_loss)
     val_rmses.append(val_rmse)
     val_psnrs.append(val_psnr)
-    val_ssims.append(val_ssim)
     val_pccs.append(val_pcc)
     #scheduler.step(val_img_acc) TODO: find the correct factor/scheduling method
     #early_stopping(val_loss, net)
     current_lr = optimizer.param_groups[0]['lr']
     prog_bar.set_description(f"Epoch {epoch + 1}, lr={current_lr}, coeff_kld={coeff_kld:.3f}, Loss={train_loss:.3f}/{val_loss:.3f} | "
                              f"Metrics train/val: RMSE={train_rmse:.3f}/{val_rmse:.3f}, PSNR={train_psnr:.3f}/{val_psnr:.3f}, "
-                             f"SSIM={train_ssim:.3f}/{val_ssim:.3f}, PCC={train_pcc:.3f}/{val_pcc:.3f}")
+                             f"PCC={train_pcc:.3f}/{val_pcc:.3f}")
     writer.add_scalar('Loss/train', train_loss, epoch)
     writer.add_scalar('Loss/val', val_loss, epoch)
     update_plot()
@@ -594,14 +589,6 @@ plt.plot(train_psnrs, label='Train PSNR')
 plt.plot(val_psnrs, label='Val PSNR')
 plt.xlabel('Epoch')
 plt.ylabel('PSNR')
-plt.legend()
-plt.show()
-
-plt.figure()
-plt.plot(train_ssims, label='Train SSIM')
-plt.plot(val_ssims, label='Val SSIM')
-plt.xlabel('Epoch')
-plt.ylabel('SSIM')
 plt.legend()
 plt.show()
 
