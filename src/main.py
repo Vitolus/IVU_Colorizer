@@ -186,116 +186,6 @@ class EarlyStopping:
             self.counter += 1
             if self.counter >= self.patience:
                 self.early_stop = True
-#%%
-def compute_pcc_components(pred, targets):
-    pred_flat = pred.reshape(pred.size(0), -1)
-    target_flat = targets.reshape(targets.size(0), -1)
-    vx = pred_flat - pred_flat.mean(dim=1, keepdim=True)
-    vy = target_flat - target_flat.mean(dim=1, keepdim=True)
-    numerator = (vx * vy).sum(dim=1) # covariance
-    denominator1 = (vx ** 2).sum(dim=1)
-    denominator2 = (vy ** 2).sum(dim=1)
-    return numerator, denominator1, denominator2
-
-def fit(net, trainloader, optimizer, scaler, loss_fn, beta=0.5):
-    net.train()
-    total_loss, total_sse, total_psnr, total_ssim, total_pcc_num, total_pcc_den1, total_pcc_den2, pixels, count = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0, 0
-    prefetcher = CUDAPrefetcher(trainloader)
-    inputs, targets = prefetcher.next()
-    while inputs is not None:
-        optimizer.zero_grad(set_to_none=True)
-        with torch.cuda.amp.autocast():
-            out, mu, logvar = net(inputs)
-            out = (out + 1.0) / 2.0 * 255.0 - 128.0  # rescale to [-128, 127]
-            loss_rec = loss_fn(out, targets)
-            loss_kld = -0.5 * torch.sum(1 + logvar - mu ** 2 - logvar.exp(), dim=1).mean()
-            loss = loss_rec + beta * loss_kld
-        scaler.scale(loss).backward()
-        nn.utils.clip_grad_norm_(net.parameters(), 2)
-        scaler.step(optimizer)
-        scaler.update()
-        with torch.no_grad():
-            total_loss += loss_rec.item()
-            count += 1
-            sse = nn.MSELoss(reduction='sum')(out, targets)
-            pixels += targets.numel()
-            pcc_num, pcc_den1, pcc_den2 = compute_pcc_components(out, targets)
-            total_sse += sse.item()
-            total_ssim += structural_similarity_index_measure(out, targets).item()
-            total_pcc_num += pcc_num.sum().item()
-            total_pcc_den1 += pcc_den1.sum().item()
-            total_pcc_den2 += pcc_den2.sum().item()
-        inputs, targets = prefetcher.next()
-    avg_mse = total_sse / pixels
-    avg_rmse = avg_mse ** 0.5
-    return (total_loss / count, avg_rmse, 10 * np.log10(255.0 ** 2 / avg_rmse), total_ssim / count,
-            (total_pcc_num / ((total_pcc_den1 * total_pcc_den2) ** 0.5) + 1e-6))
-
-@torch.inference_mode()
-def predict(net, valloader, loss_fn):
-    net.eval()
-    total_loss, total_sse, total_psnr, total_ssim, total_pcc_num, total_pcc_den1, total_pcc_den2, pixels, count = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0, 0
-    prefetcher = CUDAPrefetcher(valloader)
-    inputs, targets = prefetcher.next()
-    while inputs is not None:
-        with torch.cuda.amp.autocast():
-            out, mu, logvar = net(inputs)
-            out = (out + 1.0) / 2.0 * 255.0 - 128.0  # rescale to [-128, 127]
-            loss_rec = loss_fn(out, targets)
-        total_loss += loss_rec.item()
-        count += 1
-        sse = nn.MSELoss(reduction='sum')(out, targets)
-        pixels += targets.numel()
-        pcc_num, pcc_den1, pcc_den2 = compute_pcc_components(out, targets)
-        total_sse += sse.item()
-        total_ssim = structural_similarity_index_measure(out, targets).item()
-        total_pcc_num += pcc_num.sum().item()
-        total_pcc_den1 += pcc_den1.sum().item()
-        total_pcc_den2 += pcc_den2.sum().item()
-        inputs, targets = prefetcher.next()
-    avg_mse = total_sse / pixels
-    avg_rmse = avg_mse ** 0.5
-    return (total_loss / count, avg_rmse, 20 * np.log10(1.0 / avg_rmse), total_ssim / count,
-            (total_pcc_num / (total_pcc_den1 * total_pcc_den2) ** 0.5))
-#%%
-def objective(trial, trainset, scaler, X):
-    num_cycles = trial.suggest_int('num_cycles', 4, 10)
-    cycle_length = num_epochs // num_cycles
-    final_beta = 0.5
-    lr = trial.suggest_float('lr', 1e-5, 1e-1, log=True)
-    batch_size = trial.suggest_categorical('batch_size', [32, 64, 128])
-    latent_dim = trial.suggest_categorical('latent_dim', [64, 128, 256, 512])
-    kf = KFold(n_splits=5, shuffle=True, random_state=42)
-    val_losses, mean_loss = [], 0.0
-    split_n = 0
-    prog_bar = tqdm(kf.split(X), desc="Splits", position=0)
-    for train_idx, val_idx in prog_bar:
-        split_n += 1
-        trainloader = DataLoader(trainset, batch_size=batch_size, sampler=SubsetRandomSampler(train_idx), num_workers=4, pin_memory=True, prefetch_factor=2)
-        valloader = DataLoader(trainset, batch_size=batch_size, sampler=SubsetRandomSampler(val_idx), num_workers=4, pin_memory=True, prefetch_factor=2)
-        criterion = nn.MSELoss(reduction='mean').to(device, memory_format=torch.channels_last)
-        # prior = compute_ab_prior(trainloader)
-        # weights = make_rebalancing_weights(prior, alpha=0.5)
-        # criterion = nn.CrossEntropyLoss(weight=weights, reduction='mean').to(device, memory_format=torch.channels_last)
-        net = Net(latent_dim).to(device, memory_format=torch.channels_last)
-        optimizer = optim.AdamW(net.parameters(), lr=lr)
-        scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5)
-        for epoch in range(50):
-            cycle_pos = epoch % cycle_length
-            beta = final_beta * (0.5 * (1 + np.cos(np.pi * (1 - cycle_pos / cycle_length))))
-            train_loss, train_rmse, train_psnr, train_ssim, train_pcc = fit(net, trainloader, optimizer, scaler, criterion, beta)
-            val_loss, val_rmse, val_psnr, val_ssim, val_pcc = predict(net, valloader, criterion)
-            val_losses.append(val_loss)
-            scheduler.step(val_loss)
-            prog_bar.set_description(f"Epoch {epoch + 1}, lr={current_lr}, beta={beta:.3f}, Loss={train_loss:.3f}/{val_loss:.3f} | "
-                                     f"Metrics train/val: RMSE={train_rmse:.3f}/{val_rmse:.3f}, PSNR={train_psnr:.3f}/{val_psnr:.3f}, "
-                                     f"SSIM={train_ssim:.3f}/{val_ssim:.3f}, PCC={train_pcc:.3f}/{val_pcc:.3f}")
-        del net, optimizer, scheduler
-        mean_loss = np.mean(val_losses)
-        trial.report(mean_loss, split_n)
-        if trial.should_prune():
-            raise optuna.exceptions.TrialPruned()
-    return mean_loss
 #%% See VGG19 architecture to select layers for perceptual loss
 print(models.vgg19(weights=models.VGG19_Weights.IMAGENET1K_V1).features)
 ext_layer = 8  # extract features up to this layer (0-indexed)
@@ -340,6 +230,118 @@ class VGGLoss(nn.Module):
         target_features = self.features(target_rgb)
         loss_perc = self.loss_fn(pred_features, target_features)
         return loss_perc
+
+def compute_pcc_components(pred, targets):
+    pred_flat = pred.reshape(pred.size(0), -1)
+    target_flat = targets.reshape(targets.size(0), -1)
+    vx = pred_flat - pred_flat.mean(dim=1, keepdim=True)
+    vy = target_flat - target_flat.mean(dim=1, keepdim=True)
+    numerator = (vx * vy).sum(dim=1) # covariance
+    denominator1 = (vx ** 2).sum(dim=1)
+    denominator2 = (vy ** 2).sum(dim=1)
+    return numerator, denominator1, denominator2
+
+def fit(net, trainloader, optimizer, scaler, loss_pixel_fn, loss_vgg_fn=VGGLoss(), gamma= 0.5, beta=0.5):
+    net.train()
+    total_loss, total_sse, total_psnr, total_ssim, total_pcc_num, total_pcc_den1, total_pcc_den2, pixels, count = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0, 0
+    prefetcher = CUDAPrefetcher(trainloader)
+    inputs, targets = prefetcher.next()
+    while inputs is not None:
+        optimizer.zero_grad(set_to_none=True)
+        with torch.cuda.amp.autocast():
+            out, mu, logvar = net(inputs)
+            out = (out + 1.0) / 2.0 * 255.0 - 128.0  # rescale to [-128, 127]
+            loss_rec = loss_pixel_fn(out, targets) + gamma * loss_vgg_fn(inputs, out, targets)
+            loss_kld = -0.5 * torch.sum(1 + logvar - mu ** 2 - logvar.exp(), dim=1).mean()
+            loss = loss_rec + beta * loss_kld
+        scaler.scale(loss).backward()
+        nn.utils.clip_grad_norm_(net.parameters(), 2)
+        scaler.step(optimizer)
+        scaler.update()
+        with torch.no_grad():
+            total_loss += loss_rec.item()
+            count += 1
+            sse = nn.MSELoss(reduction='sum')(out, targets)
+            pixels += targets.numel()
+            pcc_num, pcc_den1, pcc_den2 = compute_pcc_components(out, targets)
+            total_sse += sse.item()
+            total_ssim += structural_similarity_index_measure(out, targets).item()
+            total_pcc_num += pcc_num.sum().item()
+            total_pcc_den1 += pcc_den1.sum().item()
+            total_pcc_den2 += pcc_den2.sum().item()
+        inputs, targets = prefetcher.next()
+    avg_mse = total_sse / pixels
+    avg_rmse = avg_mse ** 0.5
+    return (total_loss / count, avg_rmse, 10 * np.log10(255.0 ** 2 / avg_rmse), total_ssim / count,
+            (total_pcc_num / ((total_pcc_den1 * total_pcc_den2) ** 0.5) + 1e-6))
+
+@torch.inference_mode()
+def predict(net, valloader, loss_pixel_fn, loss_vgg_fn=VGGLoss(), gamma=0.5):
+    net.eval()
+    total_loss, total_sse, total_psnr, total_ssim, total_pcc_num, total_pcc_den1, total_pcc_den2, pixels, count = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0, 0
+    prefetcher = CUDAPrefetcher(valloader)
+    inputs, targets = prefetcher.next()
+    while inputs is not None:
+        with torch.cuda.amp.autocast():
+            out, mu, logvar = net(inputs)
+            out = (out + 1.0) / 2.0 * 255.0 - 128.0  # rescale to [-128, 127]
+            loss_rec = loss_pixel_fn(out, targets) + gamma * loss_vgg_fn(inputs, out, targets)
+        total_loss += loss_rec.item()
+        count += 1
+        sse = nn.MSELoss(reduction='sum')(out, targets)
+        pixels += targets.numel()
+        pcc_num, pcc_den1, pcc_den2 = compute_pcc_components(out, targets)
+        total_sse += sse.item()
+        total_ssim = structural_similarity_index_measure(out, targets).item()
+        total_pcc_num += pcc_num.sum().item()
+        total_pcc_den1 += pcc_den1.sum().item()
+        total_pcc_den2 += pcc_den2.sum().item()
+        inputs, targets = prefetcher.next()
+    avg_mse = total_sse / pixels
+    avg_rmse = avg_mse ** 0.5
+    return (total_loss / count, avg_rmse, 20 * np.log10(1.0 / avg_rmse), total_ssim / count,
+            (total_pcc_num / (total_pcc_den1 * total_pcc_den2) ** 0.5))
+#%%
+def objective(trial, trainset, scaler, X):
+    num_cycles = trial.suggest_int('num_cycles', 4, 10)
+    cycle_length = num_epochs // num_cycles
+    final_beta = 0.5
+    gamma = trial.suggest_float('gamma', 0.1, 1.0)
+    lr = trial.suggest_float('lr', 1e-5, 1e-1, log=True)
+    batch_size = trial.suggest_categorical('batch_size', [32, 64, 128])
+    latent_dim = trial.suggest_categorical('latent_dim', [64, 128, 256, 512])
+    kf = KFold(n_splits=5, shuffle=True, random_state=42)
+    val_losses, mean_loss = [], 0.0
+    split_n = 0
+    prog_bar = tqdm(kf.split(X), desc="Splits", position=0)
+    for train_idx, val_idx in prog_bar:
+        split_n += 1
+        trainloader = DataLoader(trainset, batch_size=batch_size, sampler=SubsetRandomSampler(train_idx), num_workers=4, pin_memory=True, prefetch_factor=2)
+        valloader = DataLoader(trainset, batch_size=batch_size, sampler=SubsetRandomSampler(val_idx), num_workers=4, pin_memory=True, prefetch_factor=2)
+        criterion1 = nn.MSELoss(reduction='mean').to(device, memory_format=torch.channels_last)
+        criterion2 = VGGLoss().to(device, memory_format=torch.channels_last)
+        # prior = compute_ab_prior(trainloader)
+        # weights = make_rebalancing_weights(prior, alpha=0.5)
+        # criterion = nn.CrossEntropyLoss(weight=weights, reduction='mean').to(device, memory_format=torch.channels_last)
+        net = Net(latent_dim).to(device, memory_format=torch.channels_last)
+        optimizer = optim.AdamW(net.parameters(), lr=lr)
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5)
+        for epoch in range(50):
+            cycle_pos = epoch % cycle_length
+            beta = final_beta * (0.5 * (1 + np.cos(np.pi * (1 - cycle_pos / cycle_length))))
+            train_loss, train_rmse, train_psnr, train_ssim, train_pcc = fit(net, trainloader, optimizer, scaler, criterion1, criterion2, gamma, beta)
+            val_loss, val_rmse, val_psnr, val_ssim, val_pcc = predict(net, valloader, criterion1, criterion2, gamma)
+            val_losses.append(val_loss)
+            scheduler.step(val_loss)
+            prog_bar.set_description(f"Epoch {epoch + 1}, lr={current_lr}, beta={beta:.3f}, Loss={train_loss:.3f}/{val_loss:.3f} | "
+                                     f"Metrics train/val: RMSE={train_rmse:.3f}/{val_rmse:.3f}, PSNR={train_psnr:.3f}/{val_psnr:.3f}, "
+                                     f"SSIM={train_ssim:.3f}/{val_ssim:.3f}, PCC={train_pcc:.3f}/{val_pcc:.3f}")
+        del net, optimizer, scheduler
+        mean_loss = np.mean(val_losses)
+        trial.report(mean_loss, split_n)
+        if trial.should_prune():
+            raise optuna.exceptions.TrialPruned()
+    return mean_loss
 #%%
 class Net(nn.Module):
     def __init__(self, latent_dim=256):
@@ -444,7 +446,8 @@ valloader = DataLoader(valset, batch_size=64, shuffle=False, num_workers=4, pin_
 testloader = DataLoader(testset, batch_size=64, shuffle=False, num_workers=4, pin_memory=True, prefetch_factor=2)
 optimizer = optim.AdamW(net.parameters(), lr=1e-3, fused=True)
 scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5)
-criterion = nn.MSELoss(reduction='mean').to(device, memory_format=torch.channels_last)
+criterion1 = nn.MSELoss(reduction='mean').to(device, memory_format=torch.channels_last)
+criterion2 = VGGLoss().to(device, memory_format=torch.channels_last)
 # prior = compute_ab_prior(trainloader).to(device)
 # weights = make_rebalancing_weights(prior, alpha=0.5)
 # criterion = nn.CrossEntropyLoss(weight=weights, reduction='mean').to(device, memory_format=torch.channels_last)
@@ -469,6 +472,7 @@ num_epochs = 50
 num_cycles = 4
 cycle_length = num_epochs // num_cycles
 final_beta = 0.5
+gamma = 0.5
 prog_bar = tqdm(range(num_epochs), total=num_epochs, desc='Training', position=0)
 
 fig, ax = plt.subplots()
@@ -480,13 +484,13 @@ scaler = torch.cuda.amp.GradScaler()
 for epoch in prog_bar:
     cycle_pos = epoch % cycle_length
     beta = final_beta * (0.5 * (1 + np.cos(np.pi * (1 - cycle_pos / cycle_length))))
-    train_loss, train_rmse, train_psnr, train_ssim, train_pcc = fit(net, trainloader, optimizer, scaler, criterion, beta)
+    train_loss, train_rmse, train_psnr, train_ssim, train_pcc = fit(net, trainloader, optimizer, scaler, criterion1, criterion2, gamma, beta)
     train_losses.append(train_loss)
     train_rmses.append(train_rmse)
     train_psnrs.append(train_psnr)
     train_ssims.append(train_ssim)
     train_pccs.append(train_pcc)
-    val_loss, val_rmse, val_psnr, val_ssim, val_pcc = predict(net, valloader, criterion)
+    val_loss, val_rmse, val_psnr, val_ssim, val_pcc = predict(net, valloader, criterion1, criterion2, gamma)
     val_losses.append(val_loss)
     val_rmses.append(val_rmse)
     val_psnrs.append(val_psnr)
