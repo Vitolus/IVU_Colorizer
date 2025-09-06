@@ -305,7 +305,41 @@ class VGGLoss(nn.Module):
         super(VGGLoss, self).__init__()
         vgg = models.vgg19(weights=models.VGG19_Weights.IMAGENET1K_V1).features
         self.features = nn.Sequential(*list(vgg.children())[:ext_layer]).eval()
-        # TODO: finish building perceptual loss
+        for param in self.features.parameters():
+            param.requires_grad = False
+        self.register_buffer('mean', torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1))
+        self.register_buffer('std', torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
+        self.loss_fn = nn.MSELoss()
+
+    def _lab_to_rgb(self, L, ab):
+        L = L * 100.0
+        lab = torch.cat([L, ab], dim=1) # (B, 3, H, W)
+        Y = (lab[:, 0:1, :, :] + 16.) / 116.
+        X = lab[:, 1:2, :, :] / 500. + Y
+        Z = Y - lab[:, 2:3, :, :] / 200.
+        Y = torch.where(Y > 0.008856, Y ** 3, (Y - 16. / 116.) / 7.787)
+        X = torch.where(X > 0.008856, X ** 3, (X - 16. / 116.) / 7.787)
+        Z = torch.where(Z > 0.008856, Z ** 3, (Z - 16. / 116.) / 7.787)
+        xyz = torch.cat([X, Y, Z], dim=1)
+        xyz[:, 0:1, :, :] = xyz[:, 0:1, :, :] * 0.95047
+        xyz[:, 2:3, :, :] = xyz[:, 2:3, :, :] * 1.08883
+        rgb = torch.zeros_like(xyz)
+        rgb[:, 0:1, :, :] = (3.2404542 * xyz[:, 0:1, :, :] - 1.5371385 *
+                             xyz[:, 1:2, :, :] - 0.4985314 * xyz[:, 2:3, :, :])
+        rgb[:, 1:2, :, :] = (-0.9692660 * xyz[:, 0:1, :, :] + 1.8760108 *
+                             xyz[:, 1:2, :, :] + 0.0415560 * xyz[:, 2:3, :, :])
+        rgb[:, 2:3, :, :] = (0.0556434 * xyz[:, 0:1, :, :] - 0.2040259 *
+                             xyz[:, 1:2, :, :] + 1.0572252 * xyz[:, 2:3, :, :])
+        rgb = torch.where(rgb > 0.0031308, 1.055 * (rgb.pow(1.0 / 2.4)) - 0.055, 12.92 * rgb)
+        return torch.clamp(rgb, 0.0, 1.0)
+
+    def forward(self, L, ab_pred, ab_target):
+        pred_rgb = (self._lab_to_rgb(L, ab_pred) - self.mean) / self.std
+        target_rgb = (self._lab_to_rgb(L, ab_target) - self.mean) / self.std
+        pred_features = self.features(pred_rgb)
+        target_features = self.features(target_rgb)
+        loss_perc = self.loss_fn(pred_features, target_features)
+        return loss_perc
 #%%
 class Net(nn.Module):
     def __init__(self, latent_dim=256):
@@ -517,24 +551,10 @@ ins, preds, truths = final_predict(net, testloader)
 # net_script = torch.jit.script(net_script) TODO: fix scripting issue
 # net_script.save('../models/model_and_loss.pt')
 #%%
-def lab_to_rgb(L, ab):
-    L = (L * 100.0).squeeze(0).detach().cpu().numpy() # rescale to [0..100]
-    a = ab[0].detach().cpu().numpy() # already in [-128..127]
-    b = ab[1].detach().cpu().numpy()
-    lab = np.stack([L, a, b], axis=2).astype(np.float32)
-    rgb = cv2.cvtColor(lab, cv2.COLOR_LAB2RGB)
-    return rgb
-
 ins = (torch.cat(ins, 0) * L_std.reshape(1, -1, 1, 1) + L_mean.reshape(1, -1, 1, 1)) * 100.0 # unstandardize and rescale to [0..100]
-# preds_soft = torch.cat(preds_soft, dim=0)
-# preds_hard = torch.cat(preds_hard, dim=0)
-# truths = torch.cat(truths, dim=0)
-
 preds_rgb = (torch.cat([ins, torch.cat(preds, 0)], 1)
              .permute(0, 2, 3, 1).detach().cpu().numpy()) # (N, H, W, 3)
 preds_rgb = [cv2.cvtColor(img, cv2.COLOR_LAB2RGB) for img in preds_rgb]
-# preds_rgb_soft = [lab_to_rgb(torch.cat([L, ab], dim=0)) for L, ab in zip(ins, preds_soft)]
-# preds_rgb_hard = [lab_to_rgb(torch.cat([L, ab], dim=0)) for L, ab in zip(ins, preds_hard)]
 truths_rgb = (torch.cat([ins, torch.cat(truths, 0)], 1)
              .permute(0, 2, 3, 1).detach().cpu().numpy()) # (N, H, W, 3)
 truths_rgb = [cv2.cvtColor(img, cv2.COLOR_LAB2RGB) for img in truths_rgb]
