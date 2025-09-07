@@ -189,48 +189,65 @@ class EarlyStopping:
 print(models.vgg19(weights=models.VGG19_Weights.IMAGENET1K_V1).features)
 #%%
 class VGGLoss(nn.Module):
-    def __init__(self, layer=18):
+    def __init__(self, layers):
         super(VGGLoss, self).__init__()
+        blocks = []
         vgg = models.vgg19(weights=models.VGG19_Weights.IMAGENET1K_V1).features
-        self.features = nn.Sequential(*[vgg[i] for i in range(layer)]).eval() # Up to relu2_1
-        for param in self.features.parameters():
-            param.requires_grad = False
-        self.register_buffer("mean", torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1))
-        self.register_buffer("std", torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
-        self.loss_fn = nn.L1Loss()
+        for i in range(len(layers)-1):
+            blocks.append(nn.Sequential(*list(vgg.children())[layers[i]:layers[i+1]]))
+        self.blocks = nn.ModuleList(blocks)
+        for block in self.blocks:
+            block.eval()
+            for p in block.parameters():
+                p.requires_grad = False
+        self.blocks = nn.ModuleList(blocks)
+        self.register_buffer("mean", torch.tensor([0.485, 0.456, 0.406]).reshape(1, 3, 1, 1))
+        self.register_buffer("std", torch.tensor([0.229, 0.224, 0.225]).reshape(1, 3, 1, 1))
 
     def _lab_to_rgb(self, L, ab):
-        L = L * 100.0
-        lab = torch.cat([L, ab], dim=1) # (B, 3, H, W)
-        Y = (lab[:, 0:1, :, :] + 16.) / 116.
-        X = lab[:, 1:2, :, :] / 500. + Y
-        Z = Y - lab[:, 2:3, :, :] / 200.
-        Y = torch.where(Y > 0.008856, Y ** 3, (Y - 16. / 116.) / 7.787)
-        X = torch.where(X > 0.008856, X ** 3, (X - 16. / 116.) / 7.787)
-        Z = torch.where(Z > 0.008856, Z ** 3, (Z - 16. / 116.) / 7.787)
+        lab = torch.cat([L, ab], dim=1)
+        Y = (lab[:, 0:1, :, :] + 16.0) / 116.0
+        X = lab[:, 1:2, :, :] / 500.0 + Y
+        Z = Y - lab[:, 2:3, :, :] / 200.0
+        eps = 0.008856
+        Y = torch.where(Y > eps, Y ** 3, (Y - 16.0 / 116.0) / 7.787)
+        X = torch.where(X > eps, X ** 3, (X - 16.0 / 116.0) / 7.787)
+        Z = torch.where(Z > eps, Z ** 3, (Z - 16.0 / 116.0) / 7.787)
         xyz = torch.cat([X, Y, Z], dim=1)
         xyz[:, 0:1, :, :] = xyz[:, 0:1, :, :] * 0.95047
         xyz[:, 2:3, :, :] = xyz[:, 2:3, :, :] * 1.08883
         rgb = torch.zeros_like(xyz)
-        rgb[:, 0:1, :, :] = (3.2404542 * xyz[:, 0:1, :, :] - 1.5371385 *
-                             xyz[:, 1:2, :, :] - 0.4985314 * xyz[:, 2:3, :, :])
-        rgb[:, 1:2, :, :] = (-0.9692660 * xyz[:, 0:1, :, :] + 1.8760108 *
-                             xyz[:, 1:2, :, :] + 0.0415560 * xyz[:, 2:3, :, :])
-        rgb[:, 2:3, :, :] = (0.0556434 * xyz[:, 0:1, :, :] - 0.2040259 *
-                             xyz[:, 1:2, :, :] + 1.0572252 * xyz[:, 2:3, :, :])
-        rgb = torch.where(rgb > 0.0031308, 1.055 * (rgb ** (1.0 / 2.4)) - 0.055, 12.92 * rgb)
-        return torch.clamp(rgb, 0.0, 1.0)
+        rgb[:, 0:1, :, :] = (3.2404542 * xyz[:, 0:1, :, :] -
+                             1.5371385 * xyz[:, 1:2, :, :] -
+                             0.4985314 * xyz[:, 2:3, :, :])
+        rgb[:, 1:2, :, :] = (-0.9692660 * xyz[:, 0:1, :, :] +
+                             1.8760108 * xyz[:, 1:2, :, :] +
+                             0.0415560 * xyz[:, 2:3, :, :])
+        rgb[:, 2:3, :, :] = (0.0556434 * xyz[:, 0:1, :, :] -
+                             0.2040259 * xyz[:, 1:2, :, :] +
+                             1.0572252 * xyz[:, 2:3, :, :])
+        # gamma correct
+        rgb = torch.where(rgb > 0.0031308,
+                          1.055 * (rgb ** (1.0 / 2.4)) - 0.055,
+                          12.92 * rgb)
+        rgb = torch.clamp(rgb, 0.0, 1.0)
+        return rgb
 
     def forward(self, L, ab_pred, ab_target):
+        L = L * 100.0
         pred_rgb = (self._lab_to_rgb(L, ab_pred) - self.mean) / self.std
         target_rgb = (self._lab_to_rgb(L, ab_target) - self.mean) / self.std
-        pred_features = self.features(pred_rgb)
-        target_features = self.features(target_rgb)
-        loss = self.loss_fn(pred_features, target_features)
+        loss = torch.tensor(0.0, device=device)
+        x = pred_rgb
+        y = target_rgb
+        for block in self.blocks:
+            x = block(x)
+            y = block(y)
+            loss += nn.functional.l1_loss(x, y)
         return loss
 
 def fit(net, trainloader, optimizer, scaler, loss_pixel_fn, loss_vgg_fn, coeff_vgg, coeff_kld):
-    total_loss, total_sse, pixels, count = torch.zeros(1, device=device), torch.zeros(1, device=device), 0, 0
+    total_loss, total_sse, pixels, count = torch.tensor(0.0, device=device), torch.tensor(0.0, device=device), 0, 0
     net.train()
     prefetcher = CUDAPrefetcher(trainloader)
     inputs, targets = prefetcher.next()
@@ -241,29 +258,35 @@ def fit(net, trainloader, optimizer, scaler, loss_pixel_fn, loss_vgg_fn, coeff_v
             out, mu, logvar = net(inputs)
             out = (out + 1.0) / 2.0 * 255.0 - 128.0  # rescale to [-128, 127]
             # TODO: why even if coeff_vgg=0, vgg loss is not 0
-            loss_rec = loss_pixel_fn(out, targets) + coeff_vgg * loss_vgg_fn(inputs, out, targets)
+            loss_pix = loss_pixel_fn(out, targets)
+            loss_vgg = loss_vgg_fn(inputs, out, targets)
+            loss_rec = loss_pix + coeff_vgg * loss_vgg
             loss_kld = -0.5 * torch.sum(1 + logvar - mu ** 2 - logvar.exp(), dim=1).mean()
             loss = loss_rec + coeff_kld * loss_kld
-        if torch.isnan(loss) or torch.isinf(loss):
+        if not torch.isfinite(loss):
             inputs, targets = prefetcher.next()
             continue
         scaler.scale(loss).backward()
+        scaler.unscale_(optimizer)
         nn.utils.clip_grad_norm_(net.parameters(), 2)
         scaler.step(optimizer)
         scaler.update()
         with torch.no_grad():
-            total_loss += loss_rec
+            total_loss += loss_rec.detach()
             count += 1
             sse = nn.MSELoss(reduction='sum')(out, targets)
             total_sse += sse
             pixels += targets.numel()
         inputs, targets = prefetcher.next()
-    avg_rmse = (total_sse / pixels) ** 0.5
-    return (total_loss / count).item(), avg_rmse.item(), (10 * torch.log10(255.0 ** 2 / avg_rmse)).item()
+    mse = total_sse / pixels
+    rmse = torch.sqrt(mse)
+    eps = 1e-10
+    psnr = 10 * torch.log10((255.0 ** 2) / (mse + eps))
+    return (total_loss / count).item(), rmse.item(), psnr.item()
 
 @torch.inference_mode()
 def predict(net, valloader, loss_pixel_fn, loss_vgg_fn, coeff_vgg):
-    total_loss, total_sse, pixels, count = torch.zeros(1, device=device), torch.zeros(1, device=device), 0, 0
+    total_loss, total_sse, pixels, count = torch.tensor(0.0, device=device), torch.tensor(0.0, device=device), 0, 0
     net.eval()
     prefetcher = CUDAPrefetcher(valloader)
     inputs, targets = prefetcher.next()
@@ -271,21 +294,27 @@ def predict(net, valloader, loss_pixel_fn, loss_vgg_fn, coeff_vgg):
         with torch.cuda.amp.autocast():
             out, mu, logvar = net(inputs)
             out = (out + 1.0) / 2.0 * 255.0 - 128.0  # rescale to [-128, 127]
-            total_loss += loss_pixel_fn(out, targets) + coeff_vgg * loss_vgg_fn(inputs, out, targets)
+            loss_pix = loss_pixel_fn(out, targets)
+            loss_vgg = loss_vgg_fn(inputs, out, targets)
+            loss_rec = loss_pix + coeff_vgg * loss_vgg
+        total_loss += loss_rec.detach()
         count += 1
         sse = nn.MSELoss(reduction='sum')(out, targets)
         total_sse += sse
         pixels += targets.numel()
         inputs, targets = prefetcher.next()
-    avg_rmse = (total_sse / pixels) ** 0.5
-    return (total_loss / count).item(), avg_rmse.item(), (10 * torch.log10(255.0 ** 2 / avg_rmse)).item()
+    mse = total_sse / pixels
+    rmse = torch.sqrt(mse)
+    eps = 1e-10
+    psnr = 10 * torch.log10((255.0 ** 2) / (mse + eps))
+    return (total_loss / count).item(), rmse.item(), psnr.item()
 #%%
 def objective(trial, trainset, scaler, X):
     num_cycles = trial.suggest_int('num_cycles', 4, 10)
     cycle_length = num_epochs // num_cycles
     final_beta = 0.5
     gamma = trial.suggest_float('gamma', 0.1, 1.0)
-    layers = trial.suggest_categorical('layers', [(16,), (16, 22)])
+    layers = trial.suggest_categorical('layers', [[0, 17], [0, 17, 26]])
     lr = trial.suggest_float('lr', 1e-5, 1e-1, log=True)
     batch_size = trial.suggest_categorical('batch_size', [32, 64, 128])
     latent_dim = trial.suggest_categorical('latent_dim', [64, 128, 256, 512])
@@ -298,7 +327,7 @@ def objective(trial, trainset, scaler, X):
         trainloader = DataLoader(trainset, batch_size=batch_size, sampler=SubsetRandomSampler(train_idx), num_workers=4, pin_memory=True, prefetch_factor=2)
         valloader = DataLoader(trainset, batch_size=batch_size, sampler=SubsetRandomSampler(val_idx), num_workers=4, pin_memory=True, prefetch_factor=2)
         criterion1 = nn.MSELoss(reduction='mean').to(device, memory_format=torch.channels_last)
-        criterion2 = VGGLoss(layers=layers).to(device, memory_format=torch.channels_last)
+        criterion2 = VGGLoss(layers).to(device, memory_format=torch.channels_last)
         # prior = compute_ab_prior(trainloader)
         # weights = make_rebalancing_weights(prior, alpha=0.5)
         # criterion = nn.CrossEntropyLoss(weight=weights, reduction='mean').to(device, memory_format=torch.channels_last)
@@ -425,7 +454,7 @@ testloader = DataLoader(testset, batch_size=64, shuffle=False, num_workers=4, pi
 optimizer = optim.AdamW(net.parameters(), lr=1e-3, fused=True)
 scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5)
 criterion1 = nn.L1Loss(reduction='mean').to(device, memory_format=torch.channels_last)
-criterion2 = VGGLoss(layer=18).to(device, memory_format=torch.channels_last)
+criterion2 = VGGLoss([0,17,26]).to(device, memory_format=torch.channels_last)
 # prior = compute_ab_prior(trainloader).to(device)
 # weights = make_rebalancing_weights(prior, alpha=0.5)
 # criterion = nn.CrossEntropyLoss(weight=weights, reduction='mean').to(device, memory_format=torch.channels_last)
