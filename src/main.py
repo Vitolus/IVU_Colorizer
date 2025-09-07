@@ -187,23 +187,16 @@ class EarlyStopping:
                 self.early_stop = True
 #%% See VGG19 architecture to select layers for perceptual loss
 print(models.vgg19(weights=models.VGG19_Weights.IMAGENET1K_V1).features)
-ext_layer = 8  # extract features up to this layer (0-indexed)
 #%%
 class VGGLoss(nn.Module):
-    def __init__(self, layers=(16,)):
+    def __init__(self, layer=18):
         super(VGGLoss, self).__init__()
         vgg = models.vgg19(weights=models.VGG19_Weights.IMAGENET1K_V1).features
-        self.slices = nn.ModuleList()
-        prev = 0
-        for i in sorted(layers):
-            slice = nn.Sequential(*list(vgg.children())[prev:i + 1])
-            self.slices.append(slice.eval())
-            prev = i + 1
-        for slice in self.slices:
-            for p in slice.parameters():
-                p.requires_grad = False
-        self.register_buffer('mean', torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1))
-        self.register_buffer('std', torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
+        self.features = nn.Sequential(*[vgg[i] for i in range(layer)]).eval() # Up to relu2_1
+        for param in self.features.parameters():
+            param.requires_grad = False
+        self.register_buffer("mean", torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1))
+        self.register_buffer("std", torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
         self.loss_fn = nn.L1Loss()
 
     def _lab_to_rgb(self, L, ab):
@@ -225,18 +218,16 @@ class VGGLoss(nn.Module):
                              xyz[:, 1:2, :, :] + 0.0415560 * xyz[:, 2:3, :, :])
         rgb[:, 2:3, :, :] = (0.0556434 * xyz[:, 0:1, :, :] - 0.2040259 *
                              xyz[:, 1:2, :, :] + 1.0572252 * xyz[:, 2:3, :, :])
-        rgb = torch.where(rgb > 0.0031308, 1.055 * (rgb.pow(1.0 / 2.4)) - 0.055, 12.92 * rgb)
+        rgb = torch.where(rgb > 0.0031308, 1.055 * (rgb ** (1.0 / 2.4)) - 0.055, 12.92 * rgb)
         return torch.clamp(rgb, 0.0, 1.0)
 
     def forward(self, L, ab_pred, ab_target):
         pred_rgb = (self._lab_to_rgb(L, ab_pred) - self.mean) / self.std
         target_rgb = (self._lab_to_rgb(L, ab_target) - self.mean) / self.std
-        loss = 0.0
-        for slice in self.slices:
-            x = slice(pred_rgb)
-            y = slice(target_rgb)
-            loss += self.loss_fn(x, y)
-        return loss / len(self.slices)
+        pred_features = self.features(pred_rgb)
+        target_features = self.features(target_rgb)
+        loss = self.loss_fn(pred_features, target_features)
+        return loss
 
 def fit(net, trainloader, optimizer, scaler, loss_pixel_fn, loss_vgg_fn, coeff_vgg, coeff_kld):
     total_loss, total_sse, pixels, count = torch.zeros(1, device=device), torch.zeros(1, device=device), 0, 0
@@ -249,10 +240,13 @@ def fit(net, trainloader, optimizer, scaler, loss_pixel_fn, loss_vgg_fn, coeff_v
             # TODO: add other losses with relative coeffs to the composite loss_rec: charbonnier instead of L1 and cosine similarity
             out, mu, logvar = net(inputs)
             out = (out + 1.0) / 2.0 * 255.0 - 128.0  # rescale to [-128, 127]
-            # TODO: why even if coeff_vgg=0, vgg loss is not 0 / destroy convergence
+            # TODO: why even if coeff_vgg=0, vgg loss is not 0
             loss_rec = loss_pixel_fn(out, targets) + coeff_vgg * loss_vgg_fn(inputs, out, targets)
             loss_kld = -0.5 * torch.sum(1 + logvar - mu ** 2 - logvar.exp(), dim=1).mean()
             loss = loss_rec + coeff_kld * loss_kld
+        if torch.isnan(loss) or torch.isinf(loss):
+            inputs, targets = prefetcher.next()
+            continue
         scaler.scale(loss).backward()
         nn.utils.clip_grad_norm_(net.parameters(), 2)
         scaler.step(optimizer)
@@ -431,7 +425,7 @@ testloader = DataLoader(testset, batch_size=64, shuffle=False, num_workers=4, pi
 optimizer = optim.AdamW(net.parameters(), lr=1e-3, fused=True)
 scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5)
 criterion1 = nn.L1Loss(reduction='mean').to(device, memory_format=torch.channels_last)
-criterion2 = VGGLoss(layers=(16,)).to(device, memory_format=torch.channels_last)
+criterion2 = VGGLoss(layer=18).to(device, memory_format=torch.channels_last)
 # prior = compute_ab_prior(trainloader).to(device)
 # weights = make_rebalancing_weights(prior, alpha=0.5)
 # criterion = nn.CrossEntropyLoss(weight=weights, reduction='mean').to(device, memory_format=torch.channels_last)
@@ -563,14 +557,6 @@ plt.plot(train_psnrs, label='Train PSNR')
 plt.plot(val_psnrs, label='Val PSNR')
 plt.xlabel('Epoch')
 plt.ylabel('PSNR')
-plt.legend()
-plt.show()
-
-plt.figure()
-plt.plot(train_pccs, label='Train PCC')
-plt.plot(val_pccs, label='Val PCC')
-plt.xlabel('Epoch')
-plt.ylabel('PCC')
 plt.legend()
 plt.show()
 #%%
