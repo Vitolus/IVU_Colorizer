@@ -224,7 +224,7 @@ def fit(net, trainloader, optimizer, scaler, loss_pixel_fn, loss_vgg_fn, coeff_v
         with torch.cuda.amp.autocast():
             # TODO: add other losses with relative coeffs to the composite loss_rec: charbonnier instead of L1 and cosine similarity
             out, mu, logvar = net(inputs)
-            inputs = (inputs - L_mean) / L_std # unstandardize for VGG loss [0, 1]
+            inputs = (inputs - L_mean.to(device)) / L_std.to(device) # unstandardize for VGG loss [0, 1]
             out = (out + 1.0) / 2.0 * 255.0 - 128.0  # rescale to [-128, 127]
             loss_rec = loss_pixel_fn(out, targets)
             if coeff_vgg > 0.0:
@@ -262,7 +262,7 @@ def predict(net, valloader, loss_pixel_fn, loss_vgg_fn, coeff_vgg):
     while inputs is not None:
         with torch.cuda.amp.autocast():
             out, mu, logvar = net(inputs)
-            inputs = (inputs - L_mean) / L_std  # unstandardize for VGG loss [0, 1]
+            inputs = (inputs - L_mean.to(device)) / L_std.to(device) # unstandardize for VGG loss [0, 1]
             out = (out + 1.0) / 2.0 * 255.0 - 128.0  # rescale to [-128, 127]
             loss_rec = loss_pixel_fn(out, targets)
             if coeff_vgg > 0.0:
