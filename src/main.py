@@ -154,12 +154,13 @@ class MyDataset(torch.utils.data.Dataset):
     def __init__(self, L_data, ab_data, vggloss, L_transform=None):
         self.L_data = L_transform(L_data) if L_transform else L_data # (N, 1, H, W)
         self.ab_data = ab_data # (N, 2, H, W)
+        # TODO: wrong computation, maybe akso getitem
         vggloss = vggloss.to('cpu').eval()
         with torch.no_grad():
             target_rgb = vggloss._lab_to_rgb(L_data * 100.0, self.ab_data) - vggloss.mean / vggloss.std
             block_features = []
             y = target_rgb
-            for block in vggloss.blocks:
+            for block in tqdm(vggloss.blocks, desc='Precomputing VGG features'):
                 y = block(y)
                 block_features.append(y.detach())
         self.target_features = torch.tensor(block_features)
