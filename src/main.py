@@ -29,6 +29,7 @@ torch.backends.cudnn.deterministic = True # deterministic mode
 torch.backends.cudnn.benchmark = False # disable auto-tuner to find the best algorithm to use for your hardware
 torch.backends.cuda.matmul.allow_tf32 = True # allow TensorFloat-32 on matmul operations
 torch.backends.cudnn.allow_tf32  = True # allow TensorFloat-32 on convolution operations
+torch.autograd.set_detect_anomaly(True)
 print("Using device: ", device)
 #%%
 def sort_files(folder):
@@ -43,11 +44,11 @@ folder = os.listdir(path)
 folder = sort_files(folder)
 for file in tqdm(folder, desc='Loading color images'):
     img = cv2.imread(os.path.join(path, file), 1)
-    img = img.astype(np.float32) / 255.0 # [0..1]
+    img = img.astype(np.float32) / 255.0 # [0, 1]
     img = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
     img = cv2.resize(img, (SIZE, SIZE))
-    L = img[:, :, 0:1] # (H, W, 1) [0..100]
-    ab = img[:, :, 1:3] # (H, W, 2) [-128..127]
+    L = img[:, :, 0:1] # (H, W, 1) [0, 100]
+    ab = img[:, :, 1:3] # (H, W, 2) [-128, 127]
     input_L.append(L)
     target_ab.append(ab)
 input_L = np.array(input_L) # (N, H, W, 1)
@@ -72,8 +73,8 @@ for _ in range(5):
     plt.axis('off')
     plt.show()
 #%%
-input_L = (torch.from_numpy(input_L) / 100.0).permute(0, 3, 1, 2) # (N, 1, H, W) [0..1]
-target_ab = torch.from_numpy(target_ab).permute(0, 3, 1, 2) # (N, 2, H, W) [-128..127]
+input_L = (torch.from_numpy(input_L) / 100.0).permute(0, 3, 1, 2) # (N, 1, H, W) [0, 1]
+target_ab = torch.from_numpy(target_ab).permute(0, 3, 1, 2) # (N, 2, H, W) [-128, 127]
 L_train, L_test, ab_train, ab_test = train_test_split(input_L, target_ab, test_size=0.2, random_state=seed)
 L_val, L_test, ab_val, ab_test = train_test_split(L_test, ab_test, test_size=0.2, random_state=seed)
 print(L_train.shape, ab_train.shape)
@@ -83,110 +84,6 @@ print(L_test.shape, ab_test.shape)
 L_mean = torch.mean(L_train, dim=[0, 2, 3])
 L_std = torch.std(L_train, dim=[0, 2, 3])
 print(L_mean, L_std)
-#%%
-class MyDataset(torch.utils.data.Dataset):
-    def __init__(self, L_data, ab_data, L_transform=None):
-        self.L_data = L_transform(L_data) if L_transform else L_data
-        self.ab_data = ab_data
-
-    def __len__(self):
-        return len(self.L_data)
-
-    def __getitem__(self, idx):
-        return self.L_data[idx], self.ab_data[idx]
-#%%
-class CUDAPrefetcher:
-    def __init__(self, loader):
-        self.loader = iter(loader)
-        self.stream = torch.cuda.Stream()
-        self.next_L = None
-        self.next_ab = None
-        self._preload()
-
-    def _preload(self):
-        try:
-            self.next_L, self.next_ab = next(self.loader)
-        except StopIteration:
-            self.next_L = None
-            return
-        with torch.cuda.stream(self.stream):
-            self.next_L = self.next_L.to(device, memory_format=torch.channels_last, non_blocking=True)
-            self.next_ab = self.next_ab.to(device, non_blocking=True)
-
-    def next(self):
-        torch.cuda.current_stream().wait_stream(self.stream)
-        L, ab = self.next_L, self.next_ab
-        self._preload()
-        return L, ab
-#%%
-# cluster_path = '../data/pts_in_hull.npy'
-# assert os.path.exists(cluster_path), "Download pts_in_hull.npy and place next to this script"
-# cluster_centers = torch.from_numpy(np.load(cluster_path)).float() # (313, 2) [-128..127]
-# cc_l2 = (cluster_centers ** 2).sum(dim=1) # (313,)
-# lut_coords  = (((torch.stack(torch.meshgrid(torch.arange(256), torch.arange(256), indexing='xy'), dim=-1).float()) - 128.0)
-#                .reshape(-1, 2)) # (65536, 2) [-128..127]
-#
-# def compute_dist(tensor):
-#     dists = ((tensor ** 2).sum(dim=1, keepdim=True) # (B*H*W, 1)
-#              + cc_l2.reshape(1, -1) # (1, 313)
-#              - 2 * torch.matmul(tensor, cluster_centers.t())) # (B*H*W, 313)
-#     return dists
-#
-# dists = compute_dist(lut_coords)
-# del lut_coords
-# # lut = torch.argmin(dists, dim=1).long() # (65536,) [0..312] LUT for mapping (a, b) to cluster index
-# soft_lut_probs = torch.softmax(-dists, dim=1)  # shape: (65536, 313)
-# lut = torch.argmax(soft_lut_probs, dim=1).long()  # shape: (65536,)
-# del dists
-#%%
-# temp_dataset = MyDataset(train_data, lut)
-# temp_loader = DataLoader(temp_dataset, batch_size=64, shuffle=False, num_workers=4, pin_memory=True, prefetch_factor=2)
-# L_pixel_count, L_sum, L_sum_sq = 0, 0.0, 0.0
-# ab_pixel_count, ab_sum, ab_sum_sq = 0, 0.0, 0.0
-# for l, ab in tqdm(temp_loader, desc='Computing L and ab channel mean and std'):
-#     l = l.float()
-#     ab = ab.float()
-#     L_sum += torch.sum(l)
-#     L_sum_sq += torch.sum(l ** 2)
-#     L_pixel_count += l.numel()
-#     ab_sum += torch.sum(ab)
-#     ab_sum_sq += torch.sum(ab ** 2)
-#     ab_pixel_count += ab.numel()
-# L_mean = (L_sum / L_pixel_count).item()
-# L_std = torch.sqrt((L_sum_sq / L_pixel_count) - (L_mean ** 2)).item()
-# ab_mean = (ab_sum / ab_pixel_count).item()
-# ab_std = torch.sqrt((ab_sum_sq / ab_pixel_count) - (ab_mean ** 2)).item()
-# del temp_dataset, temp_loader, l, ab, L_sum, L_sum_sq, L_pixel_count, ab_sum, ab_sum_sq, ab_pixel_count
-# print(L_mean, L_std)
-# print(ab_mean, ab_std)
-#%%
-trainset = MyDataset(L_train, ab_train, L_transform=transforms.Normalize(mean=L_mean, std=L_std))
-valset = MyDataset(L_val, ab_val, L_transform=transforms.Normalize(mean=L_mean, std=L_std))
-testset = MyDataset(L_test, ab_test, L_transform=transforms.Normalize(mean=L_mean, std=L_std))
-del L_train, ab_train, L_val, ab_val, L_test, ab_test
-#%%
-def save_checkpoint(model, name='checkpoint'):
-    torch.save(model.state_dict(), f"../models/{name}.pth")
-
-class EarlyStopping:
-    def __init__(self, patience=10, delta=0.05):
-        self.patience = patience
-        self.counter = 0
-        self.best_score = np.Inf
-        self.early_stop = False
-        self.delta = delta
-
-    def __call__(self, val_loss, net):
-        if self.best_score > val_loss:
-            self.best_score = val_loss
-            self.counter = 0
-            save_checkpoint(net)
-        elif self.best_score + self.delta < val_loss:
-            self.counter += 1
-            if self.counter >= self.patience:
-                self.early_stop = True
-#%% See VGG19 architecture to select layers for perceptual loss
-print(models.vgg19(weights=models.VGG19_Weights.IMAGENET1K_V1).features)
 #%%
 class VGGLoss(nn.Module):
     def __init__(self, layers):
@@ -239,40 +136,115 @@ class VGGLoss(nn.Module):
         # threshold mask (still uses original rgb for linear branch to preserve negatives)
         mask = rgb_sane > 0.0031308
         rgb = torch.where(mask, 1.055 * rgb_pow - 0.055, 12.92 * rgb_sane)
-        rgb = torch.clamp(rgb, 0.0, 1.0)
+        rgb = torch.clamp(rgb, 0.0, 1.0) # (B, 3, H, W)
         return rgb
 
-    def forward(self, L, ab_pred, ab_target):
+    def forward(self, L, ab_pred, target_features):
         L = L * 100.0
         pred_rgb = (self._lab_to_rgb(L, ab_pred) - self.mean) / self.std
-        target_rgb = (self._lab_to_rgb(L, ab_target) - self.mean) / self.std
         loss = torch.tensor(0.0, device=device)
         x = pred_rgb
-        y = target_rgb
-        for block in self.blocks:
+        for i, block in enumerate(self.blocks):
             x = block(x)
-            y = block(y)
+            y = target_features[i]
             loss += nn.functional.l1_loss(x, y)
         return loss
+#%%
+class MyDataset(torch.utils.data.Dataset):
+    def __init__(self, L_data, ab_data, vggloss, L_transform=None):
+        self.L_data = L_transform(L_data) if L_transform else L_data # (N, 1, H, W)
+        self.ab_data = ab_data # (N, 2, H, W)
+        vggloss = vggloss.to('cpu').eval()
+        with torch.no_grad():
+            target_rgb = vggloss._lab_to_rgb(L_data * 100.0, self.ab_data) - vggloss.mean / vggloss.std
+            block_features = []
+            y = target_rgb
+            for block in vggloss.blocks:
+                y = block(y)
+                block_features.append(y.detach())
+        self.target_features = torch.tensor(block_features)
 
+    def __len__(self):
+        return len(self.L_data)
+
+    def __getitem__(self, idx):
+        L, ab, features = self.L_data[idx], self.ab_data[idx], self.target_features[:, idx]
+        return L, ab, features
+#%%
+class CUDAPrefetcher:
+    def __init__(self, loader):
+        self.loader = iter(loader)
+        self.stream = torch.cuda.Stream()
+        self.next_L = None
+        self.next_ab = None
+        self.next_features = None
+        self._preload()
+
+    def _preload(self):
+        try:
+            self.next_L, self.next_ab, self.next_features = next(self.loader)
+        except StopIteration:
+            self.next_L = None
+            return
+        with torch.cuda.stream(self.stream):
+            self.next_L = self.next_L.to(device, memory_format=torch.channels_last, non_blocking=True)
+            self.next_ab = self.next_ab.to(device,memory_format=torch.channels_last, non_blocking=True)
+            self.next_features = self.next_features.to(device, memory_format=torch.channels_last, non_blocking=True)
+
+    def next(self):
+        torch.cuda.current_stream().wait_stream(self.stream)
+        L, ab, target_features = self.next_L, self.next_ab, self.next_features
+        self._preload()
+        return L, ab, target_features
+#%%
+vggloss = VGGLoss([0, 17, 26]).to(device)
+trainset = MyDataset(L_train, ab_train, vggloss, L_transform=transforms.Normalize(mean=L_mean, std=L_std))
+valset = MyDataset(L_val, ab_val, vggloss, L_transform=transforms.Normalize(mean=L_mean, std=L_std))
+testset = MyDataset(L_test, ab_test, vggloss, L_transform=transforms.Normalize(mean=L_mean, std=L_std))
+del L_train, ab_train, L_val, ab_val, L_test, ab_test
+#%%
+def save_checkpoint(model, name='checkpoint'):
+    torch.save(model.state_dict(), f"../models/{name}.pth")
+
+class EarlyStopping:
+    def __init__(self, patience=10, delta=0.05):
+        self.patience = patience
+        self.counter = 0
+        self.best_score = np.Inf
+        self.early_stop = False
+        self.delta = delta
+
+    def __call__(self, val_loss, net):
+        if self.best_score > val_loss:
+            self.best_score = val_loss
+            self.counter = 0
+            save_checkpoint(net)
+        elif self.best_score + self.delta < val_loss:
+            self.counter += 1
+            if self.counter >= self.patience:
+                self.early_stop = True
+#%% See VGG19 architecture to select layers for perceptual loss
+print(models.vgg19(weights=models.VGG19_Weights.IMAGENET1K_V1).features)
+#%%
 def fit(net, trainloader, optimizer, scaler, loss_pixel_fn, loss_vgg_fn, coeff_vgg, coeff_kld):
     total_loss, total_sse, pixels, count = torch.tensor(0.0, device=device), torch.tensor(0.0, device=device), 0, 0
     net.train()
     prefetcher = CUDAPrefetcher(trainloader)
-    inputs, targets = prefetcher.next()
+    inputs, targets, tar_features = prefetcher.next()
     while inputs is not None:
         with torch.cuda.amp.autocast():
             # TODO: add other losses with relative coeffs to the composite loss_rec: charbonnier instead of L1 and cosine similarity
             out, mu, logvar = net(inputs)
+            inputs = (inputs - L_mean) / L_std # unstandardize for VGG loss [0, 1]
             out = (out + 1.0) / 2.0 * 255.0 - 128.0  # rescale to [-128, 127]
             loss_rec = loss_pixel_fn(out, targets)
             if coeff_vgg > 0.0:
-                loss_rec += coeff_vgg * loss_vgg_fn(inputs, out, targets)
+                loss_rec += coeff_vgg * loss_vgg_fn(inputs, out, tar_features)
             loss_kld = -0.5 * torch.sum(1 + logvar - mu ** 2 - logvar.exp(), dim=1).mean()
             loss = loss_rec + coeff_kld * loss_kld
         optimizer.zero_grad(set_to_none=True)
         if not torch.isfinite(loss):
-            inputs, targets = prefetcher.next()
+            inputs, targets, tar_features = prefetcher.next()
             continue
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
@@ -285,7 +257,7 @@ def fit(net, trainloader, optimizer, scaler, loss_pixel_fn, loss_vgg_fn, coeff_v
             sse = nn.MSELoss(reduction='sum')(out, targets)
             total_sse += sse
             pixels += targets.numel()
-        inputs, targets = prefetcher.next()
+        inputs, targets, tar_features = prefetcher.next()
     mse = total_sse / pixels
     rmse = torch.sqrt(mse)
     eps = 1e-10
@@ -297,20 +269,24 @@ def predict(net, valloader, loss_pixel_fn, loss_vgg_fn, coeff_vgg):
     total_loss, total_sse, pixels, count = torch.tensor(0.0, device=device), torch.tensor(0.0, device=device), 0, 0
     net.eval()
     prefetcher = CUDAPrefetcher(valloader)
-    inputs, targets = prefetcher.next()
+    inputs, targets, tar_features = prefetcher.next()
     while inputs is not None:
         with torch.cuda.amp.autocast():
             out, mu, logvar = net(inputs)
+            inputs = (inputs - L_mean) / L_std  # unstandardize for VGG loss [0, 1]
             out = (out + 1.0) / 2.0 * 255.0 - 128.0  # rescale to [-128, 127]
             loss_rec = loss_pixel_fn(out, targets)
             if coeff_vgg > 0.0:
-                loss_rec += coeff_vgg * loss_vgg_fn(inputs, out, targets)
+                loss_rec += coeff_vgg * loss_vgg_fn(inputs, out, tar_features)
+        if not torch.isfinite(loss_rec):
+            inputs, targets, tar_features = prefetcher.next()
+            continue
         total_loss += loss_rec.detach()
         count += 1
         sse = nn.MSELoss(reduction='sum')(out, targets)
         total_sse += sse
         pixels += targets.numel()
-        inputs, targets = prefetcher.next()
+        inputs, targets, tar_features = prefetcher.next()
     mse = total_sse / pixels
     rmse = torch.sqrt(mse)
     eps = 1e-10
@@ -500,10 +476,7 @@ optimizer = optim.AdamW(net.parameters(), lr=1e-3, fused=True)
 scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5)
 criterion1 = nn.L1Loss(reduction='mean').to(device)
 criterion2 = VGGLoss([0,17,26]).to(device)
-# prior = compute_ab_prior(trainloader).to(device)
-# weights = make_rebalancing_weights(prior, alpha=0.5)
-# criterion = nn.CrossEntropyLoss(weight=weights, reduction='mean').to(device, memory_format=torch.channels_last)
-del dummy # , prior
+del dummy
 early_stopping = EarlyStopping()
 train_losses, train_rmses, train_psnrs, train_pccs = [], [], [], []
 val_losses, val_rmses, val_psnrs, val_pccs = [], [], [], []
@@ -601,7 +574,7 @@ ins, preds, truths = final_predict(net, testloader)
 # net_script = torch.jit.script(net_script) TODO: fix scripting issue
 # net_script.save('../models/model_and_loss.pt')
 #%%
-ins = (torch.cat(ins, 0) * L_std.reshape(1, -1, 1, 1) + L_mean.reshape(1, -1, 1, 1)) * 100.0 # unstandardize and rescale to [0..100]
+ins = (torch.cat(ins, 0) * L_std.reshape(1, -1, 1, 1) + L_mean.reshape(1, -1, 1, 1)) * 100.0 # unstandardize and rescale to [0, 100]
 preds_rgb = (torch.cat([ins, torch.cat(preds, 0)], 1)
              .permute(0, 2, 3, 1).detach().cpu().numpy()) # (N, H, W, 3)
 preds_rgb = [cv2.cvtColor(img, cv2.COLOR_LAB2RGB) for img in preds_rgb]
