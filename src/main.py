@@ -205,15 +205,19 @@ class VGGLoss(nn.Module):
         self.register_buffer("std", torch.tensor([0.229, 0.224, 0.225]).reshape(1, 3, 1, 1))
 
     def _lab_to_rgb(self, L, ab):
-        lab = torch.cat([L, ab], dim=1)
+        lab = torch.cat([L, ab], dim=1)  # (B,3,H,W)
+        # convert to XYZ
         Y = (lab[:, 0:1, :, :] + 16.0) / 116.0
         X = lab[:, 1:2, :, :] / 500.0 + Y
         Z = Y - lab[:, 2:3, :, :] / 200.0
+        # apply f^-1 (piecewise)
         eps = 0.008856
         Y = torch.where(Y > eps, Y ** 3, (Y - 16.0 / 116.0) / 7.787)
         X = torch.where(X > eps, X ** 3, (X - 16.0 / 116.0) / 7.787)
         Z = torch.where(Z > eps, Z ** 3, (Z - 16.0 / 116.0) / 7.787)
         xyz = torch.cat([X, Y, Z], dim=1)
+        # Apply D65 whitepoint scaling
+        xyz = xyz.clone()
         xyz[:, 0:1, :, :] = xyz[:, 0:1, :, :] * 0.95047
         xyz[:, 2:3, :, :] = xyz[:, 2:3, :, :] * 1.08883
         rgb = torch.zeros_like(xyz)
@@ -226,10 +230,15 @@ class VGGLoss(nn.Module):
         rgb[:, 2:3, :, :] = (0.0556434 * xyz[:, 0:1, :, :] -
                              0.2040259 * xyz[:, 1:2, :, :] +
                              1.0572252 * xyz[:, 2:3, :, :])
-        # gamma correct
-        rgb = torch.where(rgb > 0.0031308,
-                          1.055 * (rgb ** (1.0 / 2.4)) - 0.055,
-                          12.92 * rgb)
+        # gamma correction
+        # sanitize NaN/inf first (replace with numeric safe values)
+        rgb_sane = torch.nan_to_num(rgb, nan=0.0, posinf=1e6, neginf=0.0)
+        # clamp negative values to avoid NaN in pow
+        rgb_for_pow = torch.clamp(rgb_sane, min=1e-10)
+        rgb_pow = rgb_for_pow ** (1.0 / 2.4)
+        # threshold mask (still uses original rgb for linear branch to preserve negatives)
+        mask = rgb_sane > 0.0031308
+        rgb = torch.where(mask, 1.055 * rgb_pow - 0.055, 12.92 * rgb_sane)
         rgb = torch.clamp(rgb, 0.0, 1.0)
         return rgb
 
@@ -252,7 +261,6 @@ def fit(net, trainloader, optimizer, scaler, loss_pixel_fn, loss_vgg_fn, coeff_v
     prefetcher = CUDAPrefetcher(trainloader)
     inputs, targets = prefetcher.next()
     while inputs is not None:
-        optimizer.zero_grad(set_to_none=True)
         with torch.cuda.amp.autocast():
             # TODO: add other losses with relative coeffs to the composite loss_rec: charbonnier instead of L1 and cosine similarity
             out, mu, logvar = net(inputs)
@@ -263,6 +271,7 @@ def fit(net, trainloader, optimizer, scaler, loss_pixel_fn, loss_vgg_fn, coeff_v
             loss_rec = loss_pix + coeff_vgg * loss_vgg
             loss_kld = -0.5 * torch.sum(1 + logvar - mu ** 2 - logvar.exp(), dim=1).mean()
             loss = loss_rec + coeff_kld * loss_kld
+        optimizer.zero_grad(set_to_none=True)
         if not torch.isfinite(loss):
             inputs, targets = prefetcher.next()
             continue
@@ -326,11 +335,8 @@ def objective(trial, trainset, scaler, X):
         split_n += 1
         trainloader = DataLoader(trainset, batch_size=batch_size, sampler=SubsetRandomSampler(train_idx), num_workers=4, pin_memory=True, prefetch_factor=2)
         valloader = DataLoader(trainset, batch_size=batch_size, sampler=SubsetRandomSampler(val_idx), num_workers=4, pin_memory=True, prefetch_factor=2)
-        criterion1 = nn.MSELoss(reduction='mean').to(device, memory_format=torch.channels_last)
-        criterion2 = VGGLoss(layers).to(device, memory_format=torch.channels_last)
-        # prior = compute_ab_prior(trainloader)
-        # weights = make_rebalancing_weights(prior, alpha=0.5)
-        # criterion = nn.CrossEntropyLoss(weight=weights, reduction='mean').to(device, memory_format=torch.channels_last)
+        criterion1 = nn.MSELoss(reduction='mean').to(device)
+        criterion2 = VGGLoss(layers).to(device)
         net = Net(latent_dim).to(device, memory_format=torch.channels_last)
         optimizer = optim.AdamW(net.parameters(), lr=lr)
         scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5)
@@ -401,8 +407,6 @@ class Net(nn.Module):
         pooled = self.pool(encoded) # [B, 256, 1, 1]
         mu_logvar = self.fc_mu_logvar(pooled).squeeze(-1).squeeze(-1) # [B, 2 * latent_dim]
         mu, logvar = mu_logvar.chunk(2, dim=1)
-        # mu = self.fc_mu(encoded)
-        # logvar = self.fc_logvar(encoded)
         z = self.reparameterize(mu, logvar)
         decoder_input = self.decoder_input(z)
         x = self.decoder(decoder_input)
@@ -423,6 +427,48 @@ dummy = torch.zeros(1, 1, SIZE, SIZE).to(device, memory_format=torch.channels_la
 writer.add_graph(net, dummy)
 writer.flush()
 summary(net, input_data=dummy, col_names=('input_size', 'output_size', 'num_params', 'trainable'))
+#%% Unit test: grad flow
+def test_grad_flow(test_net):
+    test_net.train()
+    inputs = torch.rand(4, 1, SIZE, SIZE, device=device, dtype=torch.float32, requires_grad=False)
+    targets = (torch.rand(4, 2, SIZE, SIZE, device=device) * 255.0) - 128.0
+    optimizer = optim.AdamW(test_net.parameters(), lr=1e-4)
+    criterion1 = nn.L1Loss(reduction='mean').to(device)
+    criterion2 = VGGLoss([0,17,26]).to(device)
+    out, mu, logvar = test_net(inputs)
+    out_rescaled = (out + 1.0) / 2.0 * 255.0 - 128.0  # rescale to [-128, 127]
+    loss_pix = criterion1(out_rescaled, targets)
+    print(f"Pixel loss: {loss_pix.item():.4f}")
+    loss_vgg = criterion2(inputs, out_rescaled, targets) * 0.5
+    print(f"VGG loss: {loss_vgg.item():.4f}")
+    loss_kld = -0.5 * torch.sum(1 + logvar - mu ** 2 - logvar.exp(), dim=1).mean() * 0.1
+    print(f"KLD loss: {loss_kld.item():.4f}")
+    loss = loss_pix + loss_vgg + loss_kld
+    print(f"Total loss: {loss.item():.4f}")
+    optimizer.zero_grad()
+    loss.backward()
+    net_has_grad = False
+    for p in test_net.parameters():
+        if p.grad is not None:
+            if float(p.grad.abs().sum()) > 0.0:
+                net_has_grad = True
+                break
+    vgg_params_ok = True
+    for name, p in criterion2.named_parameters():
+        if p.requires_grad:
+            print(f"VGGLoss parameter {name} has requires_grad=True (should be False).")
+            vgg_params_ok = False
+        if p.grad is not None:
+            # Ideally grads are None for frozen params
+            print(f"VGGLoss parameter {name} has non-None grad (should be None).")
+            vgg_params_ok = False
+    print(f"Net received gradient? {net_has_grad}")
+    print(f"VGGLoss params frozen and no grads? {vgg_params_ok}")
+    return net_has_grad, vgg_params_ok
+
+test_net = Net().to(device, memory_format=torch.channels_last)
+ok_net, ok_vgg = test_grad_flow(test_net)
+assert ok_net and ok_vgg, "Unit test failed: check gradients or VGGLoss freezing"
 #%% Hyper parameter tuning
 del dummy
 gc.collect()
@@ -453,8 +499,8 @@ valloader = DataLoader(valset, batch_size=64, shuffle=False, num_workers=4, pin_
 testloader = DataLoader(testset, batch_size=64, shuffle=False, num_workers=4, pin_memory=True, prefetch_factor=2)
 optimizer = optim.AdamW(net.parameters(), lr=1e-3, fused=True)
 scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5)
-criterion1 = nn.L1Loss(reduction='mean').to(device, memory_format=torch.channels_last)
-criterion2 = VGGLoss([0,17,26]).to(device, memory_format=torch.channels_last)
+criterion1 = nn.L1Loss(reduction='mean').to(device)
+criterion2 = VGGLoss([0,17,26]).to(device)
 # prior = compute_ab_prior(trainloader).to(device)
 # weights = make_rebalancing_weights(prior, alpha=0.5)
 # criterion = nn.CrossEntropyLoss(weight=weights, reduction='mean').to(device, memory_format=torch.channels_last)
