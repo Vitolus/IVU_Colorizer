@@ -265,10 +265,9 @@ def fit(net, trainloader, optimizer, scaler, loss_pixel_fn, loss_vgg_fn, coeff_v
             # TODO: add other losses with relative coeffs to the composite loss_rec: charbonnier instead of L1 and cosine similarity
             out, mu, logvar = net(inputs)
             out = (out + 1.0) / 2.0 * 255.0 - 128.0  # rescale to [-128, 127]
-            # TODO: why even if coeff_vgg=0, vgg loss is not 0
-            loss_pix = loss_pixel_fn(out, targets)
-            loss_vgg = loss_vgg_fn(inputs, out, targets)
-            loss_rec = loss_pix + coeff_vgg * loss_vgg
+            loss_rec = loss_pixel_fn(out, targets)
+            if coeff_vgg > 0.0:
+                loss_rec += coeff_vgg * loss_vgg_fn(inputs, out, targets)
             loss_kld = -0.5 * torch.sum(1 + logvar - mu ** 2 - logvar.exp(), dim=1).mean()
             loss = loss_rec + coeff_kld * loss_kld
         optimizer.zero_grad(set_to_none=True)
@@ -303,9 +302,9 @@ def predict(net, valloader, loss_pixel_fn, loss_vgg_fn, coeff_vgg):
         with torch.cuda.amp.autocast():
             out, mu, logvar = net(inputs)
             out = (out + 1.0) / 2.0 * 255.0 - 128.0  # rescale to [-128, 127]
-            loss_pix = loss_pixel_fn(out, targets)
-            loss_vgg = loss_vgg_fn(inputs, out, targets)
-            loss_rec = loss_pix + coeff_vgg * loss_vgg
+            loss_rec = loss_pixel_fn(out, targets)
+            if coeff_vgg > 0.0:
+                loss_rec += coeff_vgg * loss_vgg_fn(inputs, out, targets)
         total_loss += loss_rec.detach()
         count += 1
         sse = nn.MSELoss(reduction='sum')(out, targets)
