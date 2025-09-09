@@ -29,7 +29,6 @@ torch.backends.cudnn.deterministic = True # deterministic mode
 torch.backends.cudnn.benchmark = False # disable auto-tuner to find the best algorithm to use for your hardware
 torch.backends.cuda.matmul.allow_tf32 = True # allow TensorFloat-32 on matmul operations
 torch.backends.cudnn.allow_tf32  = True # allow TensorFloat-32 on convolution operations
-torch.autograd.set_detect_anomaly(True)
 print("Using device: ", device)
 #%%
 def sort_files(folder):
@@ -84,73 +83,6 @@ print(L_test.shape, ab_test.shape)
 L_mean = torch.mean(L_train, dim=[0, 2, 3])
 L_std = torch.std(L_train, dim=[0, 2, 3])
 print(L_mean, L_std)
-#%%
-class VGGLoss(nn.Module):
-    def __init__(self, layers):
-        super(VGGLoss, self).__init__()
-        blocks = []
-        vgg = models.vgg19(weights=models.VGG19_Weights.IMAGENET1K_V1).features
-        for i in range(len(layers)-1):
-            blocks.append(nn.Sequential(*list(vgg.children())[layers[i]:layers[i+1]]))
-        self.blocks = nn.ModuleList(blocks)
-        for block in self.blocks:
-            block.eval()
-            for p in block.parameters():
-                p.requires_grad = False
-        self.blocks = nn.ModuleList(blocks)
-        self.register_buffer("mean", torch.tensor([0.485, 0.456, 0.406]).reshape(1, 3, 1, 1))
-        self.register_buffer("std", torch.tensor([0.229, 0.224, 0.225]).reshape(1, 3, 1, 1))
-
-    def _lab_to_rgb(self, L, ab):
-        lab = torch.cat([L, ab], dim=1) # (B,3,H,W)
-        # convert to XYZ
-        Y = (lab[:, 0:1, :, :] + 16.0) / 116.0
-        X = lab[:, 1:2, :, :] / 500.0 + Y
-        Z = Y - lab[:, 2:3, :, :] / 200.0
-        # apply f^-1 (piecewise)
-        eps = 0.008856
-        Y = torch.where(Y > eps, Y ** 3, (Y - 16.0 / 116.0) / 7.787)
-        X = torch.where(X > eps, X ** 3, (X - 16.0 / 116.0) / 7.787)
-        Z = torch.where(Z > eps, Z ** 3, (Z - 16.0 / 116.0) / 7.787)
-        xyz = torch.cat([X, Y, Z], dim=1)
-        # Apply D65 whitepoint scaling
-        xyz = xyz.clone()
-        xyz[:, 0:1, :, :] = xyz[:, 0:1, :, :] * 0.95047
-        xyz[:, 2:3, :, :] = xyz[:, 2:3, :, :] * 1.08883
-        rgb = torch.zeros_like(xyz)
-        rgb[:, 0:1, :, :] = (3.2404542 * xyz[:, 0:1, :, :] -
-                             1.5371385 * xyz[:, 1:2, :, :] -
-                             0.4985314 * xyz[:, 2:3, :, :])
-        rgb[:, 1:2, :, :] = (-0.9692660 * xyz[:, 0:1, :, :] +
-                             1.8760108 * xyz[:, 1:2, :, :] +
-                             0.0415560 * xyz[:, 2:3, :, :])
-        rgb[:, 2:3, :, :] = (0.0556434 * xyz[:, 0:1, :, :] -
-                             0.2040259 * xyz[:, 1:2, :, :] +
-                             1.0572252 * xyz[:, 2:3, :, :])
-        # gamma correction
-        # sanitize NaN/inf first (replace with numeric safe values)
-        rgb_sane = torch.nan_to_num(rgb, nan=0.0, posinf=1e6, neginf=0.0)
-        # clamp negative values to avoid NaN in pow
-        rgb_for_pow = torch.clamp(rgb_sane, min=1e-10)
-        rgb_pow = rgb_for_pow ** (1.0 / 2.4)
-        # threshold mask (still uses original rgb for linear branch to preserve negatives)
-        mask = rgb_sane > 0.0031308
-        rgb = torch.where(mask, 1.055 * rgb_pow - 0.055, 12.92 * rgb_sane)
-        rgb = torch.clamp(rgb, 0.0, 1.0) # (B, 3, H, W)
-        return rgb
-
-    def forward(self, L, ab_pred, ab_target):
-        L = L * 100.0
-        pred_rgb = (self._lab_to_rgb(L, ab_pred) - self.mean) / self.std
-        target_rgb = (self._lab_to_rgb(L, ab_target) - self.mean) / self.std
-        loss = torch.tensor(0.0, device=device)
-        x = pred_rgb
-        y = target_rgb
-        for block in self.blocks:
-            x = block(x)
-            y = block(y)
-            loss += nn.functional.l1_loss(x, y)
-        return loss
 #%%
 class MyDataset(torch.utils.data.Dataset):
     def __init__(self, L_data, ab_data, L_transform=None):
@@ -215,6 +147,74 @@ class EarlyStopping:
 #%% See VGG19 architecture to select layers for perceptual loss
 print(models.vgg19(weights=models.VGG19_Weights.IMAGENET1K_V1).features)
 #%%
+class VGGLoss(nn.Module):
+    def __init__(self, layers):
+        super(VGGLoss, self).__init__()
+        blocks = []
+        vgg = models.vgg19(weights=models.VGG19_Weights.IMAGENET1K_V1).features
+        for i in range(len(layers)-1):
+            blocks.append(nn.Sequential(*list(vgg.children())[layers[i]:layers[i+1]]))
+        self.blocks = nn.ModuleList(blocks)
+        for block in self.blocks:
+            block.eval()
+            for p in block.parameters():
+                p.requires_grad = False
+        # TODO: check if this is redundant
+        self.blocks = nn.ModuleList(blocks)
+        self.register_buffer("mean", torch.tensor([0.485, 0.456, 0.406]).reshape(1, 3, 1, 1))
+        self.register_buffer("std", torch.tensor([0.229, 0.224, 0.225]).reshape(1, 3, 1, 1))
+
+    def _lab_to_rgb(self, L, ab):
+        lab = torch.cat([L, ab], dim=1)  # (B,3,H,W)
+        # convert to XYZ
+        Y = (lab[:, 0:1, :, :] + 16.0) / 116.0
+        X = lab[:, 1:2, :, :] / 500.0 + Y
+        Z = Y - lab[:, 2:3, :, :] / 200.0
+        # apply f^-1 (piecewise)
+        eps = 0.008856
+        Y = torch.where(Y > eps, Y ** 3, (Y - 16.0 / 116.0) / 7.787)
+        X = torch.where(X > eps, X ** 3, (X - 16.0 / 116.0) / 7.787)
+        Z = torch.where(Z > eps, Z ** 3, (Z - 16.0 / 116.0) / 7.787)
+        xyz = torch.cat([X, Y, Z], dim=1)
+        # Apply D65 whitepoint scaling
+        xyz = xyz.clone()
+        xyz[:, 0:1, :, :] = xyz[:, 0:1, :, :] * 0.95047
+        xyz[:, 2:3, :, :] = xyz[:, 2:3, :, :] * 1.08883
+        rgb = torch.zeros_like(xyz)
+        rgb[:, 0:1, :, :] = (3.2404542 * xyz[:, 0:1, :, :] -
+                             1.5371385 * xyz[:, 1:2, :, :] -
+                             0.4985314 * xyz[:, 2:3, :, :])
+        rgb[:, 1:2, :, :] = (-0.9692660 * xyz[:, 0:1, :, :] +
+                             1.8760108 * xyz[:, 1:2, :, :] +
+                             0.0415560 * xyz[:, 2:3, :, :])
+        rgb[:, 2:3, :, :] = (0.0556434 * xyz[:, 0:1, :, :] -
+                             0.2040259 * xyz[:, 1:2, :, :] +
+                             1.0572252 * xyz[:, 2:3, :, :])
+        # gamma correction
+        # sanitize NaN/inf first (replace with numeric safe values)
+        rgb_sane = torch.nan_to_num(rgb, nan=0.0, posinf=1e6, neginf=0.0)
+        # clamp negative values to avoid NaN in pow
+        rgb_for_pow = torch.clamp(rgb_sane, min=1e-10)
+        rgb_pow = rgb_for_pow ** (1.0 / 2.4)
+        # threshold mask (still uses original rgb for linear branch to preserve negatives)
+        mask = rgb_sane > 0.0031308
+        rgb = torch.where(mask, 1.055 * rgb_pow - 0.055, 12.92 * rgb_sane)
+        rgb = torch.clamp(rgb, 0.0, 1.0) # (B, 3, H, W)
+        return rgb
+
+    def forward(self, L, ab_pred, ab_target):
+        L = L * 100.0
+        pred_rgb = (self._lab_to_rgb(L, ab_pred) - self.mean) / self.std
+        target_rgb = (self._lab_to_rgb(L, ab_target) - self.mean) / self.std
+        loss = torch.tensor(0.0, device=device)
+        x = pred_rgb
+        y = target_rgb
+        for block in self.blocks:
+            x = block(x)
+            y = block(y)
+            loss += nn.functional.l1_loss(x, y)
+        return loss
+
 def fit(net, trainloader, optimizer, scaler, loss_pixel_fn, loss_vgg_fn, coeff_vgg, coeff_kld):
     total_loss, total_sse, pixels, count = torch.tensor(0.0, device=device), torch.tensor(0.0, device=device), 0, 0
     net.train()
@@ -224,7 +224,6 @@ def fit(net, trainloader, optimizer, scaler, loss_pixel_fn, loss_vgg_fn, coeff_v
         with torch.cuda.amp.autocast():
             # TODO: add other losses with relative coeffs to the composite loss_rec: charbonnier instead of L1 and cosine similarity
             out, mu, logvar = net(inputs)
-            inputs = (inputs - L_mean.to(device)) / L_std.to(device) # unstandardize for VGG loss [0, 1]
             out = (out + 1.0) / 2.0 * 255.0 - 128.0  # rescale to [-128, 127]
             loss_rec = loss_pixel_fn(out, targets)
             if coeff_vgg > 0.0:
@@ -262,14 +261,10 @@ def predict(net, valloader, loss_pixel_fn, loss_vgg_fn, coeff_vgg):
     while inputs is not None:
         with torch.cuda.amp.autocast():
             out, mu, logvar = net(inputs)
-            inputs = (inputs - L_mean.to(device)) / L_std.to(device) # unstandardize for VGG loss [0, 1]
             out = (out + 1.0) / 2.0 * 255.0 - 128.0  # rescale to [-128, 127]
             loss_rec = loss_pixel_fn(out, targets)
             if coeff_vgg > 0.0:
                 loss_rec += coeff_vgg * loss_vgg_fn(inputs, out, targets)
-        if not torch.isfinite(loss_rec):
-            inputs, targets = prefetcher.next()
-            continue
         total_loss += loss_rec.detach()
         count += 1
         sse = nn.MSELoss(reduction='sum')(out, targets)
@@ -344,8 +339,6 @@ class Net(nn.Module):
         )
         self.pool = nn.AdaptiveAvgPool2d((1, 1))
         self.fc_mu_logvar = nn.Conv2d(256, 2 * latent_dim, kernel_size=1)
-        # self.fc_mu = nn.Linear(256 * 28 * 28, latent_dim) # 28 is the dimension of the feature map
-        # self.fc_logvar = nn.Linear(256 * 28 * 28, latent_dim)
         self.decoder_input = nn.Linear(latent_dim, 256 * SIZE // 8 * SIZE // 8)
         self.decoder = nn.Sequential(
             nn.Unflatten(1, (256, SIZE // 8, SIZE // 8)),
@@ -544,11 +537,6 @@ def final_predict(net, valloader):
         ins.append(inputs.cpu())
         preds.append(out.cpu())
         truths.append(targets.cpu())
-        # ab_pred_soft = torch.einsum('bchw,cd->bdhw', torch.softmax(out.float(), dim=1), cluster_centers)
-        # preds_soft.append(ab_pred_soft.cpu())
-        # ab_pred_hard = cluster_centers[out.argmax(1)].permute(0, 3, 1, 2)
-        # preds_hard.append(ab_pred_hard.cpu())
-        # truths.append((cluster_centers[targets] + 128).permute(0, 3, 1, 2).cpu())
         inputs, targets = prefetcher.next()
         prog_bar.update(1)
     prog_bar.close()
