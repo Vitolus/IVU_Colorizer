@@ -43,11 +43,11 @@ folder = os.listdir(path)
 folder = sort_files(folder)
 for file in tqdm(folder, desc='Loading color images'):
     img = cv2.imread(os.path.join(path, file), 1)
-    img = img.astype(np.float32) / 255.0 # [0..1]
+    img = img.astype(np.float32) / 255.0 # [0, 1]
     img = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
     img = cv2.resize(img, (SIZE, SIZE))
-    L = img[:, :, 0:1] # (H, W, 1) [0..100]
-    ab = img[:, :, 1:3] # (H, W, 2) [-128..127]
+    L = img[:, :, 0:1] # (H, W, 1) [0, 100]
+    ab = img[:, :, 1:3] # (H, W, 2) [-128, 127]
     input_L.append(L)
     target_ab.append(ab)
 input_L = np.array(input_L) # (N, H, W, 1)
@@ -72,8 +72,8 @@ for _ in range(5):
     plt.axis('off')
     plt.show()
 #%%
-input_L = (torch.from_numpy(input_L) / 100.0).permute(0, 3, 1, 2) # (N, 1, H, W) [0..1]
-target_ab = torch.from_numpy(target_ab).permute(0, 3, 1, 2) # (N, 2, H, W) [-128..127]
+input_L = (torch.from_numpy(input_L) / 100.0).permute(0, 3, 1, 2) # (N, 1, H, W) [0, 1]
+target_ab = torch.from_numpy(target_ab).permute(0, 3, 1, 2) # (N, 2, H, W) [-128, 127]
 L_train, L_test, ab_train, ab_test = train_test_split(input_L, target_ab, test_size=0.2, random_state=seed)
 L_val, L_test, ab_val, ab_test = train_test_split(L_test, ab_test, test_size=0.2, random_state=seed)
 print(L_train.shape, ab_train.shape)
@@ -119,47 +119,6 @@ class CUDAPrefetcher:
         self._preload()
         return L, ab
 #%%
-# cluster_path = '../data/pts_in_hull.npy'
-# assert os.path.exists(cluster_path), "Download pts_in_hull.npy and place next to this script"
-# cluster_centers = torch.from_numpy(np.load(cluster_path)).float() # (313, 2) [-128..127]
-# cc_l2 = (cluster_centers ** 2).sum(dim=1) # (313,)
-# lut_coords  = (((torch.stack(torch.meshgrid(torch.arange(256), torch.arange(256), indexing='xy'), dim=-1).float()) - 128.0)
-#                .reshape(-1, 2)) # (65536, 2) [-128..127]
-#
-# def compute_dist(tensor):
-#     dists = ((tensor ** 2).sum(dim=1, keepdim=True) # (B*H*W, 1)
-#              + cc_l2.reshape(1, -1) # (1, 313)
-#              - 2 * torch.matmul(tensor, cluster_centers.t())) # (B*H*W, 313)
-#     return dists
-#
-# dists = compute_dist(lut_coords)
-# del lut_coords
-# # lut = torch.argmin(dists, dim=1).long() # (65536,) [0..312] LUT for mapping (a, b) to cluster index
-# soft_lut_probs = torch.softmax(-dists, dim=1)  # shape: (65536, 313)
-# lut = torch.argmax(soft_lut_probs, dim=1).long()  # shape: (65536,)
-# del dists
-#%%
-# temp_dataset = MyDataset(train_data, lut)
-# temp_loader = DataLoader(temp_dataset, batch_size=64, shuffle=False, num_workers=4, pin_memory=True, prefetch_factor=2)
-# L_pixel_count, L_sum, L_sum_sq = 0, 0.0, 0.0
-# ab_pixel_count, ab_sum, ab_sum_sq = 0, 0.0, 0.0
-# for l, ab in tqdm(temp_loader, desc='Computing L and ab channel mean and std'):
-#     l = l.float()
-#     ab = ab.float()
-#     L_sum += torch.sum(l)
-#     L_sum_sq += torch.sum(l ** 2)
-#     L_pixel_count += l.numel()
-#     ab_sum += torch.sum(ab)
-#     ab_sum_sq += torch.sum(ab ** 2)
-#     ab_pixel_count += ab.numel()
-# L_mean = (L_sum / L_pixel_count).item()
-# L_std = torch.sqrt((L_sum_sq / L_pixel_count) - (L_mean ** 2)).item()
-# ab_mean = (ab_sum / ab_pixel_count).item()
-# ab_std = torch.sqrt((ab_sum_sq / ab_pixel_count) - (ab_mean ** 2)).item()
-# del temp_dataset, temp_loader, l, ab, L_sum, L_sum_sq, L_pixel_count, ab_sum, ab_sum_sq, ab_pixel_count
-# print(L_mean, L_std)
-# print(ab_mean, ab_std)
-#%%
 trainset = MyDataset(L_train, ab_train, L_transform=transforms.Normalize(mean=L_mean, std=L_std))
 valset = MyDataset(L_val, ab_val, L_transform=transforms.Normalize(mean=L_mean, std=L_std))
 testset = MyDataset(L_test, ab_test, L_transform=transforms.Normalize(mean=L_mean, std=L_std))
@@ -200,6 +159,7 @@ class VGGLoss(nn.Module):
             block.eval()
             for p in block.parameters():
                 p.requires_grad = False
+        # TODO: check if this is redundant
         self.blocks = nn.ModuleList(blocks)
         self.register_buffer("mean", torch.tensor([0.485, 0.456, 0.406]).reshape(1, 3, 1, 1))
         self.register_buffer("std", torch.tensor([0.229, 0.224, 0.225]).reshape(1, 3, 1, 1))
@@ -239,7 +199,7 @@ class VGGLoss(nn.Module):
         # threshold mask (still uses original rgb for linear branch to preserve negatives)
         mask = rgb_sane > 0.0031308
         rgb = torch.where(mask, 1.055 * rgb_pow - 0.055, 12.92 * rgb_sane)
-        rgb = torch.clamp(rgb, 0.0, 1.0)
+        rgb = torch.clamp(rgb, 0.0, 1.0) # (B, 3, H, W)
         return rgb
 
     def forward(self, L, ab_pred, ab_target):
@@ -379,8 +339,6 @@ class Net(nn.Module):
         )
         self.pool = nn.AdaptiveAvgPool2d((1, 1))
         self.fc_mu_logvar = nn.Conv2d(256, 2 * latent_dim, kernel_size=1)
-        # self.fc_mu = nn.Linear(256 * 28 * 28, latent_dim) # 28 is the dimension of the feature map
-        # self.fc_logvar = nn.Linear(256 * 28 * 28, latent_dim)
         self.decoder_input = nn.Linear(latent_dim, 256 * SIZE // 8 * SIZE // 8)
         self.decoder = nn.Sequential(
             nn.Unflatten(1, (256, SIZE // 8, SIZE // 8)),
@@ -500,10 +458,7 @@ optimizer = optim.AdamW(net.parameters(), lr=1e-3, fused=True)
 scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5)
 criterion1 = nn.L1Loss(reduction='mean').to(device)
 criterion2 = VGGLoss([0,17,26]).to(device)
-# prior = compute_ab_prior(trainloader).to(device)
-# weights = make_rebalancing_weights(prior, alpha=0.5)
-# criterion = nn.CrossEntropyLoss(weight=weights, reduction='mean').to(device, memory_format=torch.channels_last)
-del dummy # , prior
+del dummy
 early_stopping = EarlyStopping()
 train_losses, train_rmses, train_psnrs, train_pccs = [], [], [], []
 val_losses, val_rmses, val_psnrs, val_pccs = [], [], [], []
@@ -582,11 +537,6 @@ def final_predict(net, valloader):
         ins.append(inputs.cpu())
         preds.append(out.cpu())
         truths.append(targets.cpu())
-        # ab_pred_soft = torch.einsum('bchw,cd->bdhw', torch.softmax(out.float(), dim=1), cluster_centers)
-        # preds_soft.append(ab_pred_soft.cpu())
-        # ab_pred_hard = cluster_centers[out.argmax(1)].permute(0, 3, 1, 2)
-        # preds_hard.append(ab_pred_hard.cpu())
-        # truths.append((cluster_centers[targets] + 128).permute(0, 3, 1, 2).cpu())
         inputs, targets = prefetcher.next()
         prog_bar.update(1)
     prog_bar.close()
@@ -601,7 +551,7 @@ ins, preds, truths = final_predict(net, testloader)
 # net_script = torch.jit.script(net_script) TODO: fix scripting issue
 # net_script.save('../models/model_and_loss.pt')
 #%%
-ins = (torch.cat(ins, 0) * L_std.reshape(1, -1, 1, 1) + L_mean.reshape(1, -1, 1, 1)) * 100.0 # unstandardize and rescale to [0..100]
+ins = (torch.cat(ins, 0) * L_std.reshape(1, -1, 1, 1) + L_mean.reshape(1, -1, 1, 1)) * 100.0 # unstandardize and rescale to [0, 100]
 preds_rgb = (torch.cat([ins, torch.cat(preds, 0)], 1)
              .permute(0, 2, 3, 1).detach().cpu().numpy()) # (N, H, W, 3)
 preds_rgb = [cv2.cvtColor(img, cv2.COLOR_LAB2RGB) for img in preds_rgb]
