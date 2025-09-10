@@ -94,6 +94,20 @@ class MyDataset(torch.utils.data.Dataset):
 
     def __getitem__(self, idx):
         return self.L_data[idx], self.ab_data[idx]
+
+class DatasetWithFeatures(torch.utils.data.Dataset):
+    def __init__(self, og_dataset, features_dir):
+        self.og_dataset = og_dataset
+        self.features_dir = features_dir
+
+    def __len__(self):
+        return len(self.og_dataset)
+
+    def __getitem__(self, idx):
+        L, ab_target, = self.og_dataset[idx]
+        path = os.path.join(self.features_dir, f"features_{idx}.pt")
+        target_features = torch.load(path)
+        return L, ab_target, target_features
 #%%
 class CUDAPrefetcher:
     def __init__(self, loader):
@@ -460,6 +474,36 @@ print("  Value: ", trial.value)
 print("  Params: ")
 for key, value in trial.params.items():
     print("    {}: {}".format(key, value))
+#%%
+def create_features_file(vgg, out_dir, dataset):
+    dataloader = DataLoader(dataset, batch_size=64, shuffle=False, num_workers=4, pin_memory=True, prefetch_factor=2)
+    item_idx = 0
+    for L_batch, ab_batch in tqdm(dataloader, desc='Extracting VGG features'):
+        L_batch = L_batch.to(device, memory_format=torch.channels_last)
+        ab_batch = ab_batch.to(device, memory_format=torch.channels_last)
+        feature_batch = vgg.extract_features(L_batch, ab_batch)
+        items_in_batch = L_batch.size(0)
+        for i in range(items_in_batch):
+            single_features = [f[i] for f in feature_batch]
+            save_path = os.path.join(out_dir, f"features_{item_idx}.pt")
+            torch.save(single_features, save_path)
+            item_idx += 1
+
+vgg_extractor = VGGLoss([0,17,26]).to(device).eval()
+set_types = ['train', 'val', 'test']
+for set_type in set_types:
+    if set_type == 'train':
+        out_dir = '../data/features/train'
+        os.makedirs(out_dir, exist_ok=True)
+        create_features_file(vgg_extractor, out_dir, trainset)
+    elif set_type == 'val':
+        out_dir = '../data/features/validation'
+        os.makedirs(out_dir, exist_ok=True)
+        create_features_file(vgg_extractor, out_dir, valset)
+    elif set_type == 'test':
+        out_dir = '../data/features/test'
+        os.makedirs(out_dir, exist_ok=True)
+        create_features_file(vgg_extractor, out_dir, testset)
 #%%
 trainloader = DataLoader(trainset, batch_size=64, shuffle=True, num_workers=4, pin_memory=True, prefetch_factor=2)
 valloader = DataLoader(valset, batch_size=64, shuffle=False, num_workers=4, pin_memory=True, prefetch_factor=2)
