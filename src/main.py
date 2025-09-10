@@ -202,16 +202,26 @@ class VGGLoss(nn.Module):
         rgb = torch.clamp(rgb, 0.0, 1.0) # (B, 3, H, W)
         return rgb
 
-    def forward(self, L, ab_pred, ab_target):
+    @torch.no_grad()
+    def extract_features(self, L , ab_target):
+        self.eval()
         L = L * 100.0
-        pred_rgb = (self._lab_to_rgb(L, ab_pred) - self.mean) / self.std
         target_rgb = (self._lab_to_rgb(L, ab_target) - self.mean) / self.std
-        loss = torch.tensor(0.0, device=device)
-        x = pred_rgb
+        features = []
         y = target_rgb
         for block in self.blocks:
-            x = block(x)
             y = block(y)
+            features.append(y.detach().cpu())
+        return features
+
+    def forward(self, L, ab_pred, target_features):
+        L = L * 100.0
+        pred_rgb = (self._lab_to_rgb(L, ab_pred) - self.mean) / self.std
+        loss = torch.tensor(0.0, device=device)
+        x = pred_rgb
+        for i, block in enumerate(self.blocks):
+            x = block(x)
+            y = target_features[i].to(device)
             loss += nn.functional.l1_loss(x, y)
         return loss
 
@@ -252,7 +262,7 @@ def fit(net, trainloader, optimizer, scaler, loss_pixel_fn, loss_vgg_fn, coeff_v
     psnr = 10 * torch.log10((255.0 ** 2) / (mse + eps))
     return (total_loss / count).item(), rmse.item(), psnr.item()
 
-@torch.inference_mode()
+@torch.no_grad()
 def predict(net, valloader, loss_pixel_fn, loss_vgg_fn, coeff_vgg):
     total_loss, total_sse, pixels, count = torch.tensor(0.0, device=device), torch.tensor(0.0, device=device), 0, 0
     net.eval()
@@ -282,7 +292,7 @@ def objective(trial, trainset, scaler, X):
     cycle_length = num_epochs // num_cycles
     final_beta = 0.5
     gamma = trial.suggest_float('gamma', 0.1, 1.0)
-    layers = trial.suggest_categorical('layers', [[0, 17], [0, 17, 26]])
+    layers = trial.suggest_categorical('layers', [[0, 17], [0, 26], [0, 17, 26]])
     lr = trial.suggest_float('lr', 1e-5, 1e-1, log=True)
     batch_size = trial.suggest_categorical('batch_size', [32, 64, 128])
     latent_dim = trial.suggest_categorical('latent_dim', [64, 128, 256, 512])
