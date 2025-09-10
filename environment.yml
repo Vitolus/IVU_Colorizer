@@ -26,7 +26,7 @@ dependencies:
   - brotli-bin=1.1.0=hd590300_1
   - brotli-python=1.1.0=py311hb755f60_1
   - bzip2=1.0.8=hd590300_5
-  - c-ares=1.28.1=hd590300_0
+  - c-ares=1.34.5=hb9d3cd8_0
   - ca-certificates=2025.8.3=hbd8a1cb_0
   - cached-property=1.5.2=hd8ed1ab_1
   - cached_property=1.5.2=pyha770c72_1
@@ -76,7 +76,9 @@ dependencies:
   - grpcio=1.62.2=py311ha6695c7_0
   - h11=0.16.0=pyhd8ed1ab_0
   - h2=4.1.0=pyhd8ed1ab_0
+  - h5py=3.14.0=nompi_py311h0b2f468_101
   - harfbuzz=9.0.0=hfac3d4d_0
+  - hdf5=1.14.6=nompi_h2d575fe_101
   - hpack=4.0.0=pyh9f0ad1d_0
   - httpcore=1.0.9=pyh29332c3_0
   - httpx=0.28.1=pyhd8ed1ab_0
@@ -115,6 +117,7 @@ dependencies:
   - ld_impl_linux-64=2.40=hf3520f5_7
   - lerc=4.0.0=h27087fc_0
   - libabseil=20240116.2=cxx17_h59595ed_0
+  - libaec=1.1.4=h3f801dc_0
   - libblas=3.9.0=22_linux64_openblas
   - libbrotlicommon=1.1.0=hd590300_1
   - libbrotlidec=1.1.0=hd590300_1
@@ -127,13 +130,17 @@ dependencies:
   - libcufile=1.9.1.3=0
   - libcups=2.3.3=hb8b1518_5
   - libcurand=10.3.5.147=0
+  - libcurl=8.14.1=h332b0f4_0
   - libcusolver=11.4.4.55=0
   - libcusparse=12.0.2.55=0
   - libdeflate=1.20=hd590300_0
   - libdrm=2.4.125=hb9d3cd8_0
   - libedit=3.1.20250104=pl5321h7949ede_0
   - libegl=1.7.0=ha4b6fd6_0
+  - libev=4.33=hd590300_2
   - libexpat=2.6.2=h59595ed_0
+  - libfabric=2.2.0=ha770c72_1
+  - libfabric1=2.2.0=h47b3337_1
   - libffi=3.4.2=h7f98852_5
   - libfreetype=2.13.3=ha770c72_1
   - libfreetype6=2.13.3=h48d6fc4_1
@@ -147,7 +154,7 @@ dependencies:
   - libglvnd=1.7.0=ha4b6fd6_0
   - libglx=1.7.0=ha4b6fd6_0
   - libgrpc=1.62.2=h15f2491_0
-  - libhwloc=2.11.0=default_h5622ce7_1000
+  - libhwloc=2.11.2=default_he43201b_1000
   - libiconv=1.17=hd590300_2
   - libjpeg-turbo=3.0.0=hd590300_1
   - liblapack=3.9.0=22_linux64_openblas
@@ -155,6 +162,8 @@ dependencies:
   - libllvm19=19.1.2=ha7bfdaf_0
   - libmagma=2.7.2=h09b5827_2
   - libmagma_sparse=2.7.2=h09b5827_3
+  - libnghttp2=1.67.0=had1ee68_0
+  - libnl=3.11.0=hb9d3cd8_0
   - libnpp=12.0.2.50=0
   - libnsl=2.0.1=hd590300_0
   - libnvjitlink=12.1.105=0
@@ -168,6 +177,7 @@ dependencies:
   - libre2-11=2023.09.01=h5a48ba9_2
   - libsodium=1.0.20=h4ab18f5_0
   - libsqlite=3.46.0=hde9e2c9_0
+  - libssh2=1.11.1=hcf80075_0
   - libstdcxx=15.1.0=h8f9b012_3
   - libstdcxx-ng=15.1.0=h4852527_3
   - libtiff=4.6.0=h1dd3fc0_3
@@ -193,6 +203,9 @@ dependencies:
   - mkl=2023.2.0=h84fe81f_50496
   - mpc=1.3.1=hfe3b2da_0
   - mpfr=4.2.1=h9458935_1
+  - mpi=1.0.1=mpich
+  - mpi4py=4.1.0=py311h2a725c7_102
+  - mpich=4.3.1=h1a8bee6_100
   - mpmath=1.3.0=pyhd8ed1ab_0
   - munkres=1.1.4=pyhd8ed1ab_1
   - mysql-common=8.3.0=h70512c7_5
@@ -248,6 +261,7 @@ dependencies:
   - pyzmq=27.0.0=py311h7deb3e3_0
   - qhull=2020.2=h434a139_5
   - qt6-main=6.7.2=h7d13b96_3
+  - rdma-core=58.0=h7934f7d_0
   - re2=2023.09.01=h7f4b329_2
   - readline=8.2=h8228510_1
   - referencing=0.36.2=pyh29332c3_0
@@ -258,7 +272,6 @@ dependencies:
   - scikit-learn=1.7.1=py311hc3e1efb_0
   - scipy=1.16.0=py311h2d3ef60_0
   - send2trash=1.8.3=pyh0d859eb_1
-  - setuptools=70.1.1=pyhd8ed1ab_0
   - six=1.16.0=pyh6c4a22f_0
   - sleef=3.5.1=h9b69904_2
   - sniffio=1.3.1=pyhd8ed1ab_1
@@ -266,7 +279,7 @@ dependencies:
   - sqlalchemy=2.0.31=py311h331c9d8_0
   - stack_data=0.6.3=pyhd8ed1ab_1
   - sympy=1.12.1=pypyh2585a3b_103
-  - tbb=2021.12.0=h434a139_2
+  - tbb=2021.13.0=hceb3a55_1
   - tensorboard=2.17.1=pyhd8ed1ab_0
   - tensorboard-data-server=0.7.0=py311h63ff55d_1
   - terminado=0.18.1=pyh0d859eb_0
@@ -286,6 +299,7 @@ dependencies:
   - typing_extensions=4.12.2=pyha770c72_0
   - typing_utils=0.1.0=pyhd8ed1ab_1
   - tzdata=2024a=h0c530f3_0
+  - ucx=1.18.1=h1369271_0
   - unicodedata2=16.0.0=py311h9ecbd09_0
   - uri-template=1.3.0=pyhd8ed1ab_1
   - urllib3=2.2.2=pyhd8ed1ab_1
@@ -320,9 +334,9 @@ dependencies:
   - zeromq=4.3.5=h3b0a872_7
   - zipp=3.19.2=pyhd8ed1ab_0
   - zlib=1.3.1=h4ab18f5_1
-  - zstandard=0.22.0=py311hb6f056b_1
-  - zstd=1.5.6=ha6fb4c9_0
+  - zstandard=0.24.0=py311h4854a17_1
+  - zstd=1.5.7=hb8e6e7a_2
   - pip:
       - opencv-python==4.10.0.84
+      - setuptools==80.9.0
       - triton==3.4.0
-prefix: /home/vito/miniconda3/envs/pyatom
