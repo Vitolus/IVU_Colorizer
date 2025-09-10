@@ -3,6 +3,7 @@ import gc
 import os
 import re
 import cv2
+import h5py
 from tqdm.notebook import tqdm
 import optuna
 from optuna.trial import TrialState
@@ -99,15 +100,23 @@ class DatasetWithFeatures(torch.utils.data.Dataset):
     def __init__(self, og_dataset, features_dir):
         self.og_dataset = og_dataset
         self.features_dir = features_dir
+        self.feature_file = None
 
     def __len__(self):
         return len(self.og_dataset)
 
     def __getitem__(self, idx):
+        if self.feature_file is None:
+            self.feature_file = h5py.File(self.features_dir, "r")
         L, ab_target, = self.og_dataset[idx]
-        path = os.path.join(self.features_dir, f"features_{idx}.pt")
-        target_features = torch.load(path)
+        group = self.feature_file[f"sample_{idx}"]
+        target_features = [torch.from_numpy(group[f'layer_{j}'][:]) for j in range(len(group))]
         return L, ab_target, target_features
+
+    def __del__(self):
+        if self.feature_file is not None:
+            self.feature_file.close()
+            self.feature_file = None
 #%%
 class CUDAPrefetcher:
     def __init__(self, loader):
@@ -128,12 +137,12 @@ class CUDAPrefetcher:
             return
         with torch.cuda.stream(self.stream):
             self.next_L = self.next_L.to(device, memory_format=torch.channels_last, non_blocking=True)
-            self.next_ab = self.next_ab.to(device, non_blocking=True)
-            self.next_features = torch.tensor([f.to(device, non_blocking=True) for f in self.next_features])
+            self.next_ab = self.next_ab.to(device, memory_format=torch.channels_last, non_blocking=True)
+            self.next_features = self.next_features
 
     def next(self):
         torch.cuda.current_stream().wait_stream(self.stream)
-        L, ab = self.next_L, self.next_ab, features = self.next_features
+        L, ab, features = self.next_L, self.next_ab, self.next_features
         self._preload()
         return L, ab, features
 #%%
@@ -221,7 +230,7 @@ class VGGLoss(nn.Module):
         return rgb
 
     @torch.no_grad()
-    def extract_features(self, L , ab_target):
+    def extract_features(self, L, ab_target):
         self.eval()
         L = L
         target_rgb = (self._lab_to_rgb(L, ab_target) - self.mean) / self.std
@@ -239,7 +248,7 @@ class VGGLoss(nn.Module):
         x = pred_rgb
         for i, block in enumerate(self.blocks):
             x = block(x)
-            y = target_features[i].to(device)
+            y = target_features[i].to(device, memory_format=torch.channels_last, non_blocking=True)
             loss += nn.functional.l1_loss(x, y)
         return loss
 
@@ -253,7 +262,7 @@ def fit(net, trainloader, optimizer, scaler, loss_pixel_fn, loss_vgg_fn, coeff_v
             # TODO: add other losses with relative coeffs to the composite loss_rec: charbonnier instead of L1 and cosine similarity
             out, mu, logvar = net(inputs)
             out = (out + 1.0) / 2.0 * 255.0 - 128.0  # rescale to [-128, 127]
-            inputs = (inputs * L_std.reshape(1, -1, 1, 1) + L_mean.reshape(1, -1, 1, 1)) * 100.0
+            inputs = (inputs * L_std + L_mean) * 100.0
             loss_rec = loss_pixel_fn(out, targets)
             if coeff_vgg > 0.0:
                 loss_rec += coeff_vgg * loss_vgg_fn(inputs, out, targets_features)
@@ -291,7 +300,7 @@ def predict(net, valloader, loss_pixel_fn, loss_vgg_fn, coeff_vgg):
         with torch.cuda.amp.autocast():
             out, mu, logvar = net(inputs)
             out = (out + 1.0) / 2.0 * 255.0 - 128.0  # rescale to [-128, 127]
-            inputs = (inputs * L_std.reshape(1, -1, 1, 1) + L_mean.reshape(1, -1, 1, 1)) * 100.0
+            inputs = (inputs * L_std + L_mean) * 100.0
             loss_rec = loss_pixel_fn(out, targets)
             if coeff_vgg > 0.0:
                 loss_rec += coeff_vgg * loss_vgg_fn(inputs, out, targets_features)
@@ -484,38 +493,42 @@ print("  Params: ")
 for key, value in trial.params.items():
     print("    {}: {}".format(key, value))
 #%%
+@torch.no_grad()
 def create_features_file(vgg, out_dir, dataset):
+    h5_path = os.path.join(out_dir, "features.h5")
+    if os.path.exists(h5_path):
+        print(f"HDF5 feature file already exists at {h5_path}. Skipping feature extraction.")
+        return
     dataloader = DataLoader(dataset, batch_size=64, shuffle=False, num_workers=4, pin_memory=True, prefetch_factor=2)
-    item_idx = 0
-    for L_batch, ab_batch in tqdm(dataloader, desc='Extracting VGG features'):
-        L_batch = L_batch.to(device, memory_format=torch.channels_last)
-        ab_batch = ab_batch.to(device, memory_format=torch.channels_last)
-        feature_batch = vgg.extract_features(L_batch, ab_batch)
-        items_in_batch = L_batch.size(0)
-        for i in range(items_in_batch):
-            single_features = [f[i] for f in feature_batch]
-            save_path = os.path.join(out_dir, f"features_{item_idx}.pt")
-            torch.save(single_features, save_path)
-            item_idx += 1
+    with (h5py.File(h5_path, 'w') as h5f):
+        item_idx = 0
+        for L_batch, ab_batch in tqdm(dataloader, desc='Extracting VGG features'):
+            L_batch = (L_batch.to(device, memory_format=torch.channels_last, non_blocking=True) * L_std + L_mean) * 100.0
+            ab_batch = ab_batch.to(device, memory_format=torch.channels_last, non_blocking=True)
+            feature_batch = vgg.extract_features(L_batch, ab_batch)
+            items_in_batch = L_batch.size(0)
+            for i in range(items_in_batch):
+                # Convert list of tensors to a list of numpy arrays
+                single_features_np = [f[i].cpu().numpy() for f in feature_batch]
+                # Store each feature map as a dataset within a group for the sample
+                group = h5f.create_group(f'sample_{item_idx}')
+                for j, feature_np in enumerate(single_features_np):
+                    group.create_dataset(f'layer_{j}', data=feature_np, compression="gzip")
+                item_idx += 1
 
 vgg_extractor = VGGLoss([0,17,26]).to(device).eval()
-set_types = ['train', 'val', 'test']
-for set_type in set_types:
-    if set_type == 'train':
-        out_dir = '../data/features/train'
-        os.makedirs(out_dir, exist_ok=True)
-        create_features_file(vgg_extractor, out_dir, trainset)
-    elif set_type == 'val':
-        out_dir = '../data/features/validation'
-        os.makedirs(out_dir, exist_ok=True)
-        create_features_file(vgg_extractor, out_dir, valset)
-    elif set_type == 'test':
-        out_dir = '../data/features/test'
-        os.makedirs(out_dir, exist_ok=True)
-        create_features_file(vgg_extractor, out_dir, testset)
-trainset = DatasetWithFeatures(trainset, '../data/features/train')
-valset = DatasetWithFeatures(valset, '../data/features/validation')
-testset = DatasetWithFeatures(testset, '../data/features/test')
+out_dir = '../data/features/train'
+os.makedirs(out_dir, exist_ok=True)
+create_features_file(vgg_extractor, out_dir, trainset)
+trainset = DatasetWithFeatures(trainset, '../data/features/train/features.h5')
+out_dir = '../data/features/validation'
+os.makedirs(out_dir, exist_ok=True)
+create_features_file(vgg_extractor, out_dir, valset)
+valset = DatasetWithFeatures(valset, '../data/features/validation/features.h5')
+out_dir = '../data/features/test'
+os.makedirs(out_dir, exist_ok=True)
+create_features_file(vgg_extractor, out_dir, testset)
+testset = DatasetWithFeatures(testset, '../data/features/test/features.h5')
 #%%
 trainloader = DataLoader(trainset, batch_size=64, shuffle=True, num_workers=4, pin_memory=True, prefetch_factor=2)
 valloader = DataLoader(valset, batch_size=64, shuffle=False, num_workers=4, pin_memory=True, prefetch_factor=2)
