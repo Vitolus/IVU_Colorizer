@@ -97,25 +97,32 @@ class MyDataset(torch.utils.data.Dataset):
         return self.L_data[idx], self.ab_data[idx]
 
 class DatasetWithFeatures(torch.utils.data.Dataset):
-    def __init__(self, og_dataset, features_dir):
+    def __init__(self, og_dataset, h5_path, num_blocks):
         self.og_dataset = og_dataset
-        self.features_dir = features_dir
-        self.feature_file = None
+        self.h5_path = h5_path
+        self.num_blocks = num_blocks
+        self.feature_file = None  # lazy open
 
     def __len__(self):
         return len(self.og_dataset)
 
     def __getitem__(self, idx):
         if self.feature_file is None:
-            self.feature_file = h5py.File(self.features_dir, "r")
+            # open in read-only mode, lazy to allow DataLoader workers
+            self.feature_file = h5py.File(self.h5_path, "r")
         L, ab_target, = self.og_dataset[idx]
-        group = self.feature_file[f"sample_{idx}"]
-        target_features = [torch.from_numpy(group[f'layer_{j}'][:]) for j in range(len(group))]
+        target_features = []
+        for j in range(self.num_blocks):
+            feature = self.feature_file[f"block{j}"][idx] # (C, H, W)
+            target_features.append(torch.from_numpy(feature))
         return L, ab_target, target_features
 
     def __del__(self):
         if self.feature_file is not None:
-            self.feature_file.close()
+            try:
+                self.feature_file.close()
+            except:
+                pass
             self.feature_file = None
 #%%
 class CUDAPrefetcher:
@@ -497,38 +504,40 @@ for key, value in trial.params.items():
 def create_features_file(vgg, out_dir, dataset):
     h5_path = os.path.join(out_dir, "features.h5")
     if os.path.exists(h5_path):
-        print(f"HDF5 feature file already exists at {h5_path}. Skipping feature extraction.")
-        return
+        os.remove(h5_path)
     dataloader = DataLoader(dataset, batch_size=64, shuffle=False, num_workers=4, pin_memory=True, prefetch_factor=2)
     with (h5py.File(h5_path, 'w') as h5f):
-        item_idx = 0
-        for L_batch, ab_batch in tqdm(dataloader, desc='Extracting VGG features'):
-            L_batch = (L_batch.to(device, memory_format=torch.channels_last, non_blocking=True) * L_std + L_mean) * 100.0
-            ab_batch = ab_batch.to(device, memory_format=torch.channels_last, non_blocking=True)
-            feature_batch = vgg.extract_features(L_batch, ab_batch)
-            items_in_batch = L_batch.size(0)
-            for i in range(items_in_batch):
-                # Convert list of tensors to a list of numpy arrays
-                single_features_np = [f[i].cpu().numpy() for f in feature_batch]
-                # Store each feature map as a dataset within a group for the sample
-                group = h5f.create_group(f'sample_{item_idx}')
-                for j, feature_np in enumerate(single_features_np):
-                    group.create_dataset(f'layer_{j}', data=feature_np, compression="gzip")
-                item_idx += 1
+        L_batch, ab_batch = next(iter(dataloader))
+        L_batch = (L_batch.to(device, memory_format=torch.channels_last, non_blocking=True) * L_std + L_mean) * 100.0
+        ab_batch = ab_batch.to(device, memory_format=torch.channels_last, non_blocking=True)
+        feature_batch = vgg.extract_features(L_batch, ab_batch)
+        datasets = {}
+        for i, f in enumerate(feature_batch):
+            shape = (len(dataset),) + tuple(f.shape[1:])
+            datasets[f"block{i}"] = h5f.create_dataset(f"block{i}", shape, dtype='float32')
+        idx = 0
+        for L, ab in tqdm(dataloader, desc="Extracting features"):
+            L = (L.to(device, memory_format=torch.channels_last, non_blocking=True) * L_std + L_mean) * 100.0
+            ab = ab.to(device, memory_format=torch.channels_last, non_blocking=True)
+            features = vgg.extract_features(L, ab)
+            bs = L.size(0)
+            for i, f in enumerate(features):
+                datasets[f"block{i}"][idx:idx+bs] = f.numpy()
+            idx += bs
 
 vgg_extractor = VGGLoss([0,17,26]).to(device).eval()
 out_dir = '../data/features/train'
 os.makedirs(out_dir, exist_ok=True)
 create_features_file(vgg_extractor, out_dir, trainset)
-trainset = DatasetWithFeatures(trainset, '../data/features/train/features.h5')
+trainset = DatasetWithFeatures(trainset, '../data/features/train/features.h5', num_blocks=1)
 out_dir = '../data/features/validation'
 os.makedirs(out_dir, exist_ok=True)
 create_features_file(vgg_extractor, out_dir, valset)
-valset = DatasetWithFeatures(valset, '../data/features/validation/features.h5')
+valset = DatasetWithFeatures(valset, '../data/features/validation/features.h5', num_blocks=1)
 out_dir = '../data/features/test'
 os.makedirs(out_dir, exist_ok=True)
 create_features_file(vgg_extractor, out_dir, testset)
-testset = DatasetWithFeatures(testset, '../data/features/test/features.h5')
+testset = DatasetWithFeatures(testset, '../data/features/test/features.h5', num_blocks=1)
 #%%
 trainloader = DataLoader(trainset, batch_size=64, shuffle=True, num_workers=4, pin_memory=True, prefetch_factor=2)
 valloader = DataLoader(valset, batch_size=64, shuffle=False, num_workers=4, pin_memory=True, prefetch_factor=2)
@@ -607,7 +616,7 @@ def final_predict(net, valloader):
     net.eval()
     ins, preds, truths = [], [], []
     prefetcher = CUDAPrefetcher(valloader)
-    inputs, targets = prefetcher.next()
+    inputs, targets, _ = prefetcher.next()
     prog_bar = tqdm(total=len(valloader), desc='Final Predicting', leave=False)
     while inputs is not None:
         with torch.cuda.amp.autocast():
@@ -616,7 +625,7 @@ def final_predict(net, valloader):
         ins.append(inputs.cpu())
         preds.append(out.cpu())
         truths.append(targets.cpu())
-        inputs, targets = prefetcher.next()
+        inputs, targets, _ = prefetcher.next()
         prog_bar.update(1)
     prog_bar.close()
     return ins, preds, truths
