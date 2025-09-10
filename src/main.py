@@ -115,23 +115,27 @@ class CUDAPrefetcher:
         self.stream = torch.cuda.Stream()
         self.next_L = None
         self.next_ab = None
+        self.next_features = None
         self._preload()
 
     def _preload(self):
         try:
-            self.next_L, self.next_ab = next(self.loader)
+            self.next_L, self.next_ab, self.next_features = next(self.loader)
         except StopIteration:
             self.next_L = None
+            self.next_ab = None
+            self.next_features = None
             return
         with torch.cuda.stream(self.stream):
             self.next_L = self.next_L.to(device, memory_format=torch.channels_last, non_blocking=True)
             self.next_ab = self.next_ab.to(device, non_blocking=True)
+            self.next_features = torch.tensor([f.to(device, non_blocking=True) for f in self.next_features])
 
     def next(self):
         torch.cuda.current_stream().wait_stream(self.stream)
-        L, ab = self.next_L, self.next_ab
+        L, ab = self.next_L, self.next_ab, features = self.next_features
         self._preload()
-        return L, ab
+        return L, ab, features
 #%%
 trainset = MyDataset(L_train, ab_train, L_transform=transforms.Normalize(mean=L_mean, std=L_std))
 valset = MyDataset(L_val, ab_val, L_transform=transforms.Normalize(mean=L_mean, std=L_std))
@@ -219,7 +223,7 @@ class VGGLoss(nn.Module):
     @torch.no_grad()
     def extract_features(self, L , ab_target):
         self.eval()
-        L = L * 100.0
+        L = L
         target_rgb = (self._lab_to_rgb(L, ab_target) - self.mean) / self.std
         features = []
         y = target_rgb
@@ -229,7 +233,7 @@ class VGGLoss(nn.Module):
         return features
 
     def forward(self, L, ab_pred, target_features):
-        L = L * 100.0
+        L = L
         pred_rgb = (self._lab_to_rgb(L, ab_pred) - self.mean) / self.std
         loss = torch.tensor(0.0, device=device)
         x = pred_rgb
@@ -243,20 +247,21 @@ def fit(net, trainloader, optimizer, scaler, loss_pixel_fn, loss_vgg_fn, coeff_v
     total_loss, total_sse, pixels, count = torch.tensor(0.0, device=device), torch.tensor(0.0, device=device), 0, 0
     net.train()
     prefetcher = CUDAPrefetcher(trainloader)
-    inputs, targets = prefetcher.next()
+    inputs, targets, targets_features = prefetcher.next()
     while inputs is not None:
         with torch.cuda.amp.autocast():
             # TODO: add other losses with relative coeffs to the composite loss_rec: charbonnier instead of L1 and cosine similarity
             out, mu, logvar = net(inputs)
             out = (out + 1.0) / 2.0 * 255.0 - 128.0  # rescale to [-128, 127]
+            inputs = (inputs * L_std.reshape(1, -1, 1, 1) + L_mean.reshape(1, -1, 1, 1)) * 100.0
             loss_rec = loss_pixel_fn(out, targets)
             if coeff_vgg > 0.0:
-                loss_rec += coeff_vgg * loss_vgg_fn(inputs, out, targets)
+                loss_rec += coeff_vgg * loss_vgg_fn(inputs, out, targets_features)
             loss_kld = -0.5 * torch.sum(1 + logvar - mu ** 2 - logvar.exp(), dim=1).mean()
             loss = loss_rec + coeff_kld * loss_kld
         optimizer.zero_grad(set_to_none=True)
         if not torch.isfinite(loss):
-            inputs, targets = prefetcher.next()
+            inputs, targets, targets_features = prefetcher.next()
             continue
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
@@ -269,7 +274,7 @@ def fit(net, trainloader, optimizer, scaler, loss_pixel_fn, loss_vgg_fn, coeff_v
             sse = nn.MSELoss(reduction='sum')(out, targets)
             total_sse += sse
             pixels += targets.numel()
-        inputs, targets = prefetcher.next()
+        inputs, targets, targets_features = prefetcher.next()
     mse = total_sse / pixels
     rmse = torch.sqrt(mse)
     eps = 1e-10
@@ -281,20 +286,24 @@ def predict(net, valloader, loss_pixel_fn, loss_vgg_fn, coeff_vgg):
     total_loss, total_sse, pixels, count = torch.tensor(0.0, device=device), torch.tensor(0.0, device=device), 0, 0
     net.eval()
     prefetcher = CUDAPrefetcher(valloader)
-    inputs, targets = prefetcher.next()
+    inputs, targets, targets_features = prefetcher.next()
     while inputs is not None:
         with torch.cuda.amp.autocast():
             out, mu, logvar = net(inputs)
             out = (out + 1.0) / 2.0 * 255.0 - 128.0  # rescale to [-128, 127]
+            inputs = (inputs * L_std.reshape(1, -1, 1, 1) + L_mean.reshape(1, -1, 1, 1)) * 100.0
             loss_rec = loss_pixel_fn(out, targets)
             if coeff_vgg > 0.0:
-                loss_rec += coeff_vgg * loss_vgg_fn(inputs, out, targets)
+                loss_rec += coeff_vgg * loss_vgg_fn(inputs, out, targets_features)
+        if not torch.isfinite(loss_rec):
+            inputs, targets, targets_features = prefetcher.next()
+            continue
         total_loss += loss_rec.detach()
         count += 1
         sse = nn.MSELoss(reduction='sum')(out, targets)
         total_sse += sse
         pixels += targets.numel()
-        inputs, targets = prefetcher.next()
+        inputs, targets, targets_features = prefetcher.next()
     mse = total_sse / pixels
     rmse = torch.sqrt(mse)
     eps = 1e-10
@@ -504,6 +513,9 @@ for set_type in set_types:
         out_dir = '../data/features/test'
         os.makedirs(out_dir, exist_ok=True)
         create_features_file(vgg_extractor, out_dir, testset)
+trainset = DatasetWithFeatures(trainset, '../data/features/train')
+valset = DatasetWithFeatures(valset, '../data/features/validation')
+testset = DatasetWithFeatures(testset, '../data/features/test')
 #%%
 trainloader = DataLoader(trainset, batch_size=64, shuffle=True, num_workers=4, pin_memory=True, prefetch_factor=2)
 valloader = DataLoader(valset, batch_size=64, shuffle=False, num_workers=4, pin_memory=True, prefetch_factor=2)
