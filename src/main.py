@@ -345,7 +345,7 @@ def objective(trial, trainset, scaler, X):
         valloader = DataLoader(trainset, batch_size=batch_size, sampler=SubsetRandomSampler(val_idx), num_workers=4, pin_memory=True, prefetch_factor=2)
         criterion1 = nn.MSELoss(reduction='mean').to(device)
         criterion2 = VGGLoss(layers).to(device)
-        net = Net(latent_dim).to(device, memory_format=torch.channels_last)
+        net = Net(latent_dim).to(device)
         optimizer = optim.AdamW(net.parameters(), lr=lr)
         scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5)
         for epoch in range(50):
@@ -425,7 +425,7 @@ net = Net().eval()
 #     ['conv4', 'bnorm2'],
 #     ['conv5', 'bnorm3']
 # ], inplace=True)
-net = net.to(device, memory_format=torch.channels_last)
+net = net.to(device)
 for m in net.modules():
     if isinstance(m, (torch.nn.Conv2d, torch.nn.ConvTranspose2d)):
         m.weight = torch.nn.Parameter(m.weight.to(memory_format=torch.channels_last))
@@ -440,7 +440,7 @@ def test_grad_flow(test_net):
     targets = (torch.rand(4, 2, SIZE, SIZE, device=device) * 255.0) - 128.0
     optimizer = optim.AdamW(test_net.parameters(), lr=1e-4)
     criterion1 = nn.L1Loss(reduction='mean').to(device)
-    criterion2 = VGGLoss([0,17,26]).to(device)
+    criterion2 = VGGLoss(layers).to(device)
     out, mu, logvar = test_net(inputs)
     out_rescaled = (out + 1.0) / 2.0 * 255.0 - 128.0  # rescale to [-128, 127]
     loss_pix = criterion1(out_rescaled, targets)
@@ -472,7 +472,7 @@ def test_grad_flow(test_net):
     print(f"VGGLoss params frozen and no grads? {vgg_params_ok}")
     return net_has_grad, vgg_params_ok
 
-test_net = Net().to(device, memory_format=torch.channels_last)
+test_net = Net().to(device)
 ok_net, ok_vgg = test_grad_flow(test_net)
 assert ok_net and ok_vgg, "Unit test failed: check gradients or VGGLoss freezing"
 #%% Hyper parameter tuning
@@ -525,19 +525,20 @@ def create_features_file(vgg, out_dir, dataset):
                 datasets[f"block{i}"][idx:idx+bs] = f.numpy()
             idx += bs
 
-vgg_extractor = VGGLoss([0,17,26]).to(device).eval()
+layers = [0, 17, 26]
+vgg_extractor = VGGLoss(layers).to(device).eval()
 out_dir = '../data/features/train'
 os.makedirs(out_dir, exist_ok=True)
 create_features_file(vgg_extractor, out_dir, trainset)
-trainset = DatasetWithFeatures(trainset, '../data/features/train/features.h5', num_blocks=1)
+trainset = DatasetWithFeatures(trainset, '../data/features/train/features.h5', num_blocks=len(layers)-1)
 out_dir = '../data/features/validation'
 os.makedirs(out_dir, exist_ok=True)
 create_features_file(vgg_extractor, out_dir, valset)
-valset = DatasetWithFeatures(valset, '../data/features/validation/features.h5', num_blocks=1)
+valset = DatasetWithFeatures(valset, '../data/features/validation/features.h5', num_blocks=len(layers)-1)
 out_dir = '../data/features/test'
 os.makedirs(out_dir, exist_ok=True)
 create_features_file(vgg_extractor, out_dir, testset)
-testset = DatasetWithFeatures(testset, '../data/features/test/features.h5', num_blocks=1)
+testset = DatasetWithFeatures(testset, '../data/features/test/features.h5', num_blocks=len(layers)-1)
 #%%
 trainloader = DataLoader(trainset, batch_size=64, shuffle=True, num_workers=4, pin_memory=True, prefetch_factor=2)
 valloader = DataLoader(valset, batch_size=64, shuffle=False, num_workers=4, pin_memory=True, prefetch_factor=2)
@@ -545,7 +546,7 @@ testloader = DataLoader(testset, batch_size=64, shuffle=False, num_workers=4, pi
 optimizer = optim.AdamW(net.parameters(), lr=1e-3, fused=True)
 scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5)
 criterion1 = nn.L1Loss(reduction='mean').to(device)
-criterion2 = VGGLoss([0,17,26]).to(device)
+criterion2 = VGGLoss(layers).to(device)
 del dummy
 early_stopping = EarlyStopping()
 train_losses, train_rmses, train_psnrs, train_pccs = [], [], [], []
