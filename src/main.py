@@ -3,7 +3,8 @@ import gc
 import os
 import re
 import cv2
-import h5py
+import lmdb
+import pyarrow as pa
 from tqdm.notebook import tqdm
 import optuna
 from optuna.trial import TrialState
@@ -97,34 +98,28 @@ class MyDataset(torch.utils.data.Dataset):
         return self.L_data[idx], self.ab_data[idx]
 
 class DatasetWithFeatures(torch.utils.data.Dataset):
-    def __init__(self, og_dataset, h5_path, num_blocks):
+    def __init__(self, og_dataset, lmdb_path):
         self.og_dataset = og_dataset
-        self.h5_path = h5_path
-        self.num_blocks = num_blocks
-        self.feature_file = None  # lazy open
+        self.lmdb_path = lmdb_path
+        self.env = None
+        self.txn = None
 
     def __len__(self):
         return len(self.og_dataset)
 
     def __getitem__(self, idx):
-        if self.feature_file is None:
-            worker_info = torch.utils.data.get_worker_info()
-            # open in read-only mode, lazy to allow DataLoader workers
-            self.feature_file = h5py.File(self.h5_path, "r")
+        if self.env is None:
+            self.env = lmdb.open(self.lmdb_path, readonly=True, lock=False, readahead=False)
+            self.txn = self.env.begin()
         L, ab_target = self.og_dataset[idx]
-        target_features = []
-        for j in range(self.num_blocks):
-            feature = self.feature_file[f"block{j}"][idx] # (C, H, W)
-            target_features.append(torch.from_numpy(feature))
+        feature_serialized = self.txn.get(f"{idx}".encode())
+        target_features = pa.deserialize(feature_serialized)
         return L, ab_target, target_features
 
     def __del__(self):
-        if self.feature_file is not None:
-            try:
-                self.feature_file.close()
-            except:
-                pass
-            self.feature_file = None
+        if self.env is not None:
+            self.env.close()
+            self.env = None
 #%%
 class CUDAPrefetcher:
     def __init__(self, loader):
@@ -461,28 +456,28 @@ for key, value in trial.params.items():
 #%%
 @torch.no_grad()
 def create_features_file(vgg, out_dir, dataset):
-    h5_path = os.path.join(out_dir, "features.h5")
-    if os.path.exists(h5_path):
-        os.remove(h5_path)
-    dataloader = DataLoader(dataset, batch_size=64, shuffle=False, num_workers=4, pin_memory=True, prefetch_factor=2)
-    with (h5py.File(h5_path, 'w') as h5f):
-        L_batch, ab_batch = next(iter(dataloader))
-        L_batch = (L_batch.to(device, memory_format=torch.channels_last, non_blocking=True) * L_std + L_mean) * 100.0
-        ab_batch = ab_batch.to(device, memory_format=torch.channels_last, non_blocking=True)
-        feature_batch = vgg.extract_features(L_batch, ab_batch)
-        datasets = {}
-        for i, f in enumerate(feature_batch):
-            shape = (len(dataset),) + tuple(f.shape[1:])
-            datasets[f"block{i}"] = h5f.create_dataset(f"block{i}", shape, dtype='float32')
-        idx = 0
-        for L, ab in tqdm(dataloader, desc="Extracting features"):
-            L = (L.to(device, memory_format=torch.channels_last, non_blocking=True) * L_std + L_mean) * 100.0
-            ab = ab.to(device, memory_format=torch.channels_last, non_blocking=True)
-            features = vgg.extract_features(L, ab)
-            bs = L.size(0)
-            for i, f in enumerate(features):
-                datasets[f"block{i}"][idx:idx+bs] = f.numpy()
-            idx += bs
+    lmdb_path = os.path.join(out_dir, "features.lmdb")
+    env = None
+    if os.path.exists(lmdb_path):
+        os.remove(lmdb_path)
+    try:
+        env = lmdb.open(lmdb_path, map_size=1099511627776)  # ~1TB
+        dataloader = DataLoader(dataset, batch_size=64, shuffle=False, num_workers=4, pin_memory=True, prefetch_factor=2)
+        with env.begin(write=True) as txn:
+            idx = 0
+            for L_batch, ab_batch in tqdm(dataloader, desc="Extracting features to LMDB"):
+                L_batch = (L_batch.to(device, memory_format=torch.channels_last, non_blocking=True) * L_std + L_mean) * 100.0
+                ab_batch = ab_batch.to(device, memory_format=torch.channels_last, non_blocking=True)
+                feature_batch = vgg.extract_features(L_batch, ab_batch)
+                bs = L_batch.size(0)
+                for i in range(bs):
+                    single_features = [f[i].numpy() for f in feature_batch]
+                    feature_serialized = pa.serialize(single_features).to_buffer()
+                    txn.put(f"{idx}".encode(), feature_serialized)
+                    idx += 1
+    finally:
+        if env is not None:
+            env.close()
 
 layers = [0, 17, 26]
 vgg_extractor = VGGLoss(layers).to(device).eval()
