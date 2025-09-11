@@ -108,9 +108,10 @@ class DatasetWithFeatures(torch.utils.data.Dataset):
 
     def __getitem__(self, idx):
         if self.feature_file is None:
+            worker_info = torch.utils.data.get_worker_info()
             # open in read-only mode, lazy to allow DataLoader workers
             self.feature_file = h5py.File(self.h5_path, "r")
-        L, ab_target, = self.og_dataset[idx]
+        L, ab_target = self.og_dataset[idx]
         target_features = []
         for j in range(self.num_blocks):
             feature = self.feature_file[f"block{j}"][idx] # (C, H, W)
@@ -145,7 +146,7 @@ class CUDAPrefetcher:
         with torch.cuda.stream(self.stream):
             self.next_L = self.next_L.to(device, memory_format=torch.channels_last, non_blocking=True)
             self.next_ab = self.next_ab.to(device, memory_format=torch.channels_last, non_blocking=True)
-            self.next_features = self.next_features
+            self.next_features = [f.to(device, memory_format=torch.channels_last, non_blocking=True) for f in self.next_features]
 
     def next(self):
         torch.cuda.current_stream().wait_stream(self.stream)
@@ -255,7 +256,7 @@ class VGGLoss(nn.Module):
         x = pred_rgb
         for i, block in enumerate(self.blocks):
             x = block(x)
-            y = target_features[i].to(device, memory_format=torch.channels_last, non_blocking=True)
+            y = target_features[i].to(device, non_blocking=True)
             loss += nn.functional.l1_loss(x, y)
         return loss
 
@@ -433,48 +434,6 @@ dummy = torch.zeros(1, 1, SIZE, SIZE).to(device, memory_format=torch.channels_la
 writer.add_graph(net, dummy)
 writer.flush()
 summary(net, input_data=dummy, col_names=('input_size', 'output_size', 'num_params', 'trainable'))
-#%% Unit test: grad flow
-def test_grad_flow(test_net):
-    test_net.train()
-    inputs = torch.rand(4, 1, SIZE, SIZE, device=device, dtype=torch.float32, requires_grad=False)
-    targets = (torch.rand(4, 2, SIZE, SIZE, device=device) * 255.0) - 128.0
-    optimizer = optim.AdamW(test_net.parameters(), lr=1e-4)
-    criterion1 = nn.L1Loss(reduction='mean').to(device)
-    criterion2 = VGGLoss(layers).to(device)
-    out, mu, logvar = test_net(inputs)
-    out_rescaled = (out + 1.0) / 2.0 * 255.0 - 128.0  # rescale to [-128, 127]
-    loss_pix = criterion1(out_rescaled, targets)
-    print(f"Pixel loss: {loss_pix.item():.4f}")
-    loss_vgg = criterion2(inputs, out_rescaled, targets) * 0.5
-    print(f"VGG loss: {loss_vgg.item():.4f}")
-    loss_kld = -0.5 * torch.sum(1 + logvar - mu ** 2 - logvar.exp(), dim=1).mean() * 0.1
-    print(f"KLD loss: {loss_kld.item():.4f}")
-    loss = loss_pix + loss_vgg + loss_kld
-    print(f"Total loss: {loss.item():.4f}")
-    optimizer.zero_grad()
-    loss.backward()
-    net_has_grad = False
-    for p in test_net.parameters():
-        if p.grad is not None:
-            if float(p.grad.abs().sum()) > 0.0:
-                net_has_grad = True
-                break
-    vgg_params_ok = True
-    for name, p in criterion2.named_parameters():
-        if p.requires_grad:
-            print(f"VGGLoss parameter {name} has requires_grad=True (should be False).")
-            vgg_params_ok = False
-        if p.grad is not None:
-            # Ideally grads are None for frozen params
-            print(f"VGGLoss parameter {name} has non-None grad (should be None).")
-            vgg_params_ok = False
-    print(f"Net received gradient? {net_has_grad}")
-    print(f"VGGLoss params frozen and no grads? {vgg_params_ok}")
-    return net_has_grad, vgg_params_ok
-
-test_net = Net().to(device)
-ok_net, ok_vgg = test_grad_flow(test_net)
-assert ok_net and ok_vgg, "Unit test failed: check gradients or VGGLoss freezing"
 #%% Hyper parameter tuning
 del dummy
 gc.collect()
@@ -530,15 +489,124 @@ vgg_extractor = VGGLoss(layers).to(device).eval()
 out_dir = '../data/features/train'
 os.makedirs(out_dir, exist_ok=True)
 create_features_file(vgg_extractor, out_dir, trainset)
-trainset = DatasetWithFeatures(trainset, '../data/features/train/features.h5', num_blocks=len(layers)-1)
 out_dir = '../data/features/validation'
 os.makedirs(out_dir, exist_ok=True)
 create_features_file(vgg_extractor, out_dir, valset)
-valset = DatasetWithFeatures(valset, '../data/features/validation/features.h5', num_blocks=len(layers)-1)
 out_dir = '../data/features/test'
 os.makedirs(out_dir, exist_ok=True)
 create_features_file(vgg_extractor, out_dir, testset)
+trainset = DatasetWithFeatures(trainset, '../data/features/train/features.h5', num_blocks=len(layers)-1)
+valset = DatasetWithFeatures(valset, '../data/features/validation/features.h5', num_blocks=len(layers)-1)
 testset = DatasetWithFeatures(testset, '../data/features/test/features.h5', num_blocks=len(layers)-1)
+#%% Unit test: grad flow
+def test_grad_flow(test_net):
+    test_net.train()
+    scaler = torch.cuda.amp.GradScaler()
+    # with shuffle True it takes a bit longer
+    loader = DataLoader(trainset, batch_size=64, shuffle=False, num_workers=0, pin_memory=True)
+    prefetcher = CUDAPrefetcher(loader)
+    optimizer = optim.AdamW(test_net.parameters(), lr=1e-4)
+    criterion1 = nn.L1Loss(reduction='mean').to(device)
+    criterion2 = VGGLoss([0, 17, 26]).to(device)
+    num_batches = len(loader)
+    pbar = tqdm(total=num_batches, desc="Prefetching")
+    inputs, targets, features = prefetcher.next()
+    with torch.cuda.amp.autocast():
+        out, mu, logvar = test_net(inputs)
+        out_rescaled = (out + 1.0) / 2.0 * 255.0 - 128.0  # rescale to [-128, 127]
+        inputs = (inputs * L_std + L_mean) * 100.0
+        loss_pix = criterion1(out_rescaled, targets)
+        print(f"Pixel loss: {loss_pix.item():.4f}")
+        loss_vgg = criterion2(inputs, out_rescaled, features) * 1.0
+        print(f"VGG loss: {loss_vgg.item():.4f}")
+        loss_kld = -0.5 * torch.sum(1 + logvar - mu ** 2 - logvar.exp(), dim=1).mean() * 0.2
+        print(f"KLD loss: {loss_kld.item():.4f}")
+        loss = loss_pix + loss_vgg + loss_kld
+        print(f"Total loss: {loss.item():.4f}")
+    optimizer.zero_grad(set_to_none=True)
+    scaler.scale(loss).backward()
+    scaler.unscale_(optimizer)
+    nn.utils.clip_grad_norm_(net.parameters(), 2)
+    scaler.step(optimizer)
+    scaler.update()
+    pbar.update(1)
+    inputs, targets, features = prefetcher.next()
+    net_has_grad = False
+    for p in test_net.parameters():
+        if p.grad is not None:
+            if float(p.grad.abs().sum()) > 0.0:
+                net_has_grad = True
+                break
+    vgg_params_ok = True
+    for name, p in criterion2.named_parameters():
+        if p.requires_grad:
+            print(f"VGGLoss parameter {name} has requires_grad=True (should be False).")
+            vgg_params_ok = False
+        if p.grad is not None:
+            # Ideally grads are None for frozen params
+            print(f"VGGLoss parameter {name} has non-None grad (should be None).")
+            vgg_params_ok = False
+    print(f"Net received gradient? {net_has_grad}")
+    print(f"VGGLoss params frozen and no grads? {vgg_params_ok}")
+    pbar.close()
+    return net_has_grad, vgg_params_ok
+
+test_net = Net().to(device)
+ok_net, ok_vgg = test_grad_flow(test_net)
+assert ok_net and ok_vgg, "Unit test failed: check gradients or VGGLoss freezing"
+gc.collect()
+torch.cuda.empty_cache()
+#%% Test fit to check if it gets stuck somewhere
+def test_fit(test_net):
+    coeff_vgg = 1.0
+    coeff_kld = 0.2
+    total_loss, total_sse, pixels, count = torch.tensor(0.0, device=device), torch.tensor(0.0, device=device), 0, 0
+    optimizer = optim.AdamW(test_net.parameters(), lr=1e-4)
+    criterion1 = nn.L1Loss(reduction='mean').to(device)
+    criterion2 = VGGLoss([0, 17, 26]).to(device)
+    test_net.train()
+    scaler = torch.cuda.amp.GradScaler()
+    loader = DataLoader(trainset, batch_size=64, shuffle=False, num_workers=0, pin_memory=True)
+    prefetcher = CUDAPrefetcher(loader)
+    num_batches = len(loader)
+    pbar = tqdm(total=num_batches, desc="Prefetching")
+    inputs, targets, targets_features = prefetcher.next()
+    while inputs is not None:
+        with torch.cuda.amp.autocast():
+            out, mu, logvar = test_net(inputs)
+            out_rescaled = (out + 1.0) / 2.0 * 255.0 - 128.0  # rescale to [-128, 127]
+            inputs = (inputs * L_std + L_mean) * 100.0
+            loss_rec = criterion1(out_rescaled, targets)
+            if coeff_vgg > 0.0:
+                loss_rec += coeff_vgg * criterion2(inputs, out_rescaled, targets_features)
+            loss_kld = -0.5 * torch.sum(1 + logvar - mu ** 2 - logvar.exp(), dim=1).mean()
+            loss = loss_rec + coeff_kld * loss_kld
+        optimizer.zero_grad(set_to_none=True)
+        scaler.scale(loss).backward()
+        scaler.unscale_(optimizer)
+        nn.utils.clip_grad_norm_(net.parameters(), 2)
+        scaler.step(optimizer)
+        scaler.update()
+        with torch.no_grad():
+            total_loss += loss_rec.detach()
+            count += 1
+            sse = nn.MSELoss(reduction='sum')(out, targets)
+            total_sse += sse
+            pixels += targets.numel()
+        pbar.update(1)
+        inputs, targets, targets_features = prefetcher.next()
+    pbar.close()
+    mse = total_sse / pixels
+    rmse = torch.sqrt(mse)
+    eps = 1e-10
+    psnr = 10 * torch.log10((255.0 ** 2) / (mse + eps))
+    return (total_loss / count).item(), rmse.item(), psnr.item()
+
+test_net = Net().to(device)
+test_loss, test_rmse, test_psnr = test_fit(test_net)
+print(f"Total loss: {test_loss:.4f}, Total rmse: {test_rmse:.4f}, Total psnr: {test_psnr:.4f}")
+gc.collect()
+torch.cuda.empty_cache()
 #%%
 trainloader = DataLoader(trainset, batch_size=64, shuffle=True, num_workers=4, pin_memory=True, prefetch_factor=2)
 valloader = DataLoader(valset, batch_size=64, shuffle=False, num_workers=4, pin_memory=True, prefetch_factor=2)
