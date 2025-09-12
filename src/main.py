@@ -441,7 +441,7 @@ gc.collect()
 torch.cuda.empty_cache()
 X = np.zeros(len(trainset))
 torch.cuda.empty_cache()
-scaler = torch.cuda.amp.GradScaler()
+scaler = torch.amp.GradScaler(device)
 study = optuna.create_study(direction='minimize', pruner=optuna.pruners.MedianPruner())
 study.optimize(lambda trial: objective(trial, trainset, scaler, X), n_trials=5)
 #%%
@@ -467,24 +467,21 @@ def create_features_file(vgg, out_dir, dataset):
     if os.path.exists(lmdb_path):
         shutil.rmtree(lmdb_path)
     try:
-        env = lmdb.open(lmdb_path, map_size=800000000000)  # ~700GB
+        env = lmdb.open(lmdb_path, map_size=800000000000) # ~700GB
         dataloader = DataLoader(dataset, batch_size=64, shuffle=False, num_workers=4, pin_memory=True, prefetch_factor=2)
+        # This will be the global sample index
+        idx = 0
         with env.begin(write=True) as txn:
-            for idx, (L_batch, ab_batch) in enumerate(tqdm(dataloader, desc="Extracting features to LMDB")):
-                try:
-                    L_batch = (L_batch.to(device, memory_format=torch.channels_last, non_blocking=True) * L_std + L_mean) * 100.0
-                    ab_batch = ab_batch.to(device, memory_format=torch.channels_last, non_blocking=True)
-                    feature_batch = vgg.extract_features(L_batch, ab_batch)
-                    bs = L_batch.size(0)
-                    for i in range(bs):
-                        single_features = [f[i].numpy() for f in feature_batch]
-                        feature_serialized = pickle.dumps(single_features)
-                        txn.put(f"{idx}".encode(), feature_serialized)
-                except Exception as e:
-                    print(f"Error processing batch {idx+1}: {e}")
-                    with open("error_log.txt", "a") as f:
-                        f.write(f"Error at batch {idx+1}, index {idx*bs} to {idx*bs+bs-1}\n")
-                    continue # Skip this batch
+            for L_batch, ab_batch in tqdm(dataloader, desc="Extracting features to LMDB"):
+                L_batch = (L_batch.to(device, memory_format=torch.channels_last, non_blocking=True) * L_std + L_mean) * 100.0
+                ab_batch = ab_batch.to(device, memory_format=torch.channels_last, non_blocking=True)
+                feature_batch = vgg.extract_features(L_batch, ab_batch)
+                bs = L_batch.size(0)
+                for i in range(bs):
+                    single_features = [f[i].numpy() for f in feature_batch]
+                    feature_serialized = pickle.dumps(single_features)
+                    txn.put(f"{idx}".encode(), feature_serialized)
+                    idx += 1
     finally:
         if env is not None:
             env.close()
@@ -506,7 +503,7 @@ testset = DatasetWithFeatures(testset, '../data/features/test/features.lmdb')
 #%% Unit test: grad flow
 def test_grad_flow(test_net):
     test_net.train()
-    scaler = torch.cuda.amp.GradScaler()
+    scaler = torch.amp.GradScaler(device)
     # with shuffle True it takes a bit longer
     loader = DataLoader(trainset, batch_size=64, shuffle=False, num_workers=0, pin_memory=True)
     prefetcher = CUDAPrefetcher(loader)
@@ -570,7 +567,7 @@ def test_fit(test_net):
     criterion1 = nn.L1Loss(reduction='mean').to(device)
     criterion2 = VGGLoss([0, 17, 26]).to(device)
     test_net.train()
-    scaler = torch.cuda.amp.GradScaler()
+    scaler = torch.amp.GradScaler(device)
     loader = DataLoader(trainset, batch_size=64, shuffle=False, num_workers=0, pin_memory=True)
     prefetcher = CUDAPrefetcher(loader)
     num_batches = len(loader)
@@ -648,7 +645,7 @@ line1, = ax.plot([], [], label='Train Loss')
 line2, = ax.plot([], [], label='Val Loss')
 ax.legend()
 
-scaler = torch.cuda.amp.GradScaler()
+scaler = torch.amp.GradScaler(device)
 for epoch in prog_bar:
     cycle_pos = epoch % cycle_length
     coeff_kld = final_coeff_kld * (0.5 * (1 + np.cos(np.pi * (1 - cycle_pos / cycle_length))))
