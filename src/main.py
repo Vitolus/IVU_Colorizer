@@ -125,7 +125,9 @@ class DatasetWithFeatures(torch.utils.data.Dataset):
 class CUDAPrefetcher:
     def __init__(self, loader):
         self.loader = iter(loader)
-        self.stream = torch.cuda.Stream()
+        self.stream = None
+        if torch.cuda.is_available():
+            self.stream = torch.cuda.Stream()
         self.next_L = None
         self.next_ab = None
         self.next_features = None
@@ -139,13 +141,16 @@ class CUDAPrefetcher:
             self.next_ab = None
             self.next_features = None
             return
-        with torch.cuda.stream(self.stream):
-            self.next_L = self.next_L.to(device, memory_format=torch.channels_last, non_blocking=True)
-            self.next_ab = self.next_ab.to(device, memory_format=torch.channels_last, non_blocking=True)
-            self.next_features = [f.to(device, memory_format=torch.channels_last, non_blocking=True) for f in self.next_features]
+        if self.stream: # Check if a CUDA stream exists
+            with torch.cuda.stream(self.stream):
+                self.next_L = self.next_L.to(device, memory_format=torch.channels_last, non_blocking=True)
+                self.next_ab = self.next_ab.to(device, memory_format=torch.channels_last, non_blocking=True)
+                self.next_features = [f.to(device, non_blocking=True) for f in self.next_features]
+        # If no stream, the data remains on the CPU, which is fine for CPU-only runs
 
     def next(self):
-        torch.cuda.current_stream().wait_stream(self.stream)
+        if self.stream: # Wait for the stream only if it exists
+            torch.cuda.current_stream().wait_stream(self.stream)
         L, ab, features = self.next_L, self.next_ab, self.next_features
         self._preload()
         return L, ab, features
