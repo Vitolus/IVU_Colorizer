@@ -4,7 +4,8 @@ import os
 import re
 import cv2
 import lmdb
-import pyarrow as pa
+import pickle
+import shutil
 from tqdm.notebook import tqdm
 import optuna
 from optuna.trial import TrialState
@@ -113,7 +114,7 @@ class DatasetWithFeatures(torch.utils.data.Dataset):
             self.txn = self.env.begin()
         L, ab_target = self.og_dataset[idx]
         feature_serialized = self.txn.get(f"{idx}".encode())
-        target_features = pa.deserialize(feature_serialized)
+        target_features = pickle.loads(feature_serialized)
         return L, ab_target, target_features
 
     def __del__(self):
@@ -459,22 +460,26 @@ def create_features_file(vgg, out_dir, dataset):
     lmdb_path = os.path.join(out_dir, "features.lmdb")
     env = None
     if os.path.exists(lmdb_path):
-        os.remove(lmdb_path)
+        shutil.rmtree(lmdb_path)
     try:
-        env = lmdb.open(lmdb_path, map_size=1099511627776)  # ~1TB
+        env = lmdb.open(lmdb_path, map_size=800000000000)  # ~700GB
         dataloader = DataLoader(dataset, batch_size=64, shuffle=False, num_workers=4, pin_memory=True, prefetch_factor=2)
         with env.begin(write=True) as txn:
-            idx = 0
-            for L_batch, ab_batch in tqdm(dataloader, desc="Extracting features to LMDB"):
-                L_batch = (L_batch.to(device, memory_format=torch.channels_last, non_blocking=True) * L_std + L_mean) * 100.0
-                ab_batch = ab_batch.to(device, memory_format=torch.channels_last, non_blocking=True)
-                feature_batch = vgg.extract_features(L_batch, ab_batch)
-                bs = L_batch.size(0)
-                for i in range(bs):
-                    single_features = [f[i].numpy() for f in feature_batch]
-                    feature_serialized = pa.serialize(single_features).to_buffer()
-                    txn.put(f"{idx}".encode(), feature_serialized)
-                    idx += 1
+            for idx, (L_batch, ab_batch) in enumerate(tqdm(dataloader, desc="Extracting features to LMDB")):
+                try:
+                    L_batch = (L_batch.to(device, memory_format=torch.channels_last, non_blocking=True) * L_std + L_mean) * 100.0
+                    ab_batch = ab_batch.to(device, memory_format=torch.channels_last, non_blocking=True)
+                    feature_batch = vgg.extract_features(L_batch, ab_batch)
+                    bs = L_batch.size(0)
+                    for i in range(bs):
+                        single_features = [f[i].numpy() for f in feature_batch]
+                        feature_serialized = pickle.dumps(single_features)
+                        txn.put(f"{idx}".encode(), feature_serialized)
+                except Exception as e:
+                    print(f"Error processing batch {idx+1}: {e}")
+                    with open("error_log.txt", "a") as f:
+                        f.write(f"Error at batch {idx+1}, index {idx*bs} to {idx*bs+bs-1}\n")
+                    continue # Skip this batch
     finally:
         if env is not None:
             env.close()
@@ -490,9 +495,9 @@ create_features_file(vgg_extractor, out_dir, valset)
 out_dir = '../data/features/test'
 os.makedirs(out_dir, exist_ok=True)
 create_features_file(vgg_extractor, out_dir, testset)
-trainset = DatasetWithFeatures(trainset, '../data/features/train/features.h5', num_blocks=len(layers)-1)
-valset = DatasetWithFeatures(valset, '../data/features/validation/features.h5', num_blocks=len(layers)-1)
-testset = DatasetWithFeatures(testset, '../data/features/test/features.h5', num_blocks=len(layers)-1)
+trainset = DatasetWithFeatures(trainset, '../data/features/train/features.lmdb')
+valset = DatasetWithFeatures(valset, '../data/features/validation/features.lmdb')
+testset = DatasetWithFeatures(testset, '../data/features/test/features.lmdb')
 #%% Unit test: grad flow
 def test_grad_flow(test_net):
     test_net.train()
