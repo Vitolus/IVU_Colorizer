@@ -844,14 +844,14 @@ def final_predict(net, testloader):
     prefetcher = CUDAPrefetcher(testloader)
     # prefetcher = CUDAPrefetcherWithFeatures(testloader)
     inputs, targets, *_ = prefetcher.next()
-    prog_bar = tqdm(total=len(valloader), desc='Final Predicting', leave=False)
+    prog_bar = tqdm(total=len(testloader), desc='Final Predicting')
     while inputs is not None:
         with torch.amp.autocast(device):
             out, *_ = net(inputs)
             out = (out + 1.0) / 2.0 * 255.0 - 128.0  # rescale to [-128, 127]
-        ins.append(inputs.cpu())
-        preds.append(out.cpu())
-        truths.append(targets.cpu())
+        ins.append(inputs)
+        preds.append(out)
+        truths.append(targets)
         inputs, targets, *_ = prefetcher.next()
         prog_bar.update(1)
     prog_bar.close()
