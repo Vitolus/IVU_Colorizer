@@ -6,6 +6,8 @@ import cv2
 import lmdb
 import pickle
 import shutil
+
+from sqlalchemy.testing.suite.test_reflection import metadata
 from tqdm.notebook import tqdm
 import optuna
 from optuna.trial import TrialState
@@ -114,8 +116,20 @@ class DatasetWithFeatures(torch.utils.data.Dataset):
             self.txn = self.env.begin()
         L, ab_target = self.og_dataset[idx]
         feature_serialized = self.txn.get(f"{idx}".encode())
-        target_features = pickle.loads(feature_serialized)
-        return L, ab_target, target_features
+        metadata_len = int.from_bytes(feature_serialized[:4], 'little')
+        metadata = pickle.loads(feature_serialized[4:4 + metadata_len])
+        shapes = metadata["shapes"]
+        dtypes = metadata["dtypes"]
+        data_bytes = feature_serialized[4 + metadata_len:]
+        target_features = []
+        current_offset = 0
+        for shape, dtype in zip(shapes, dtypes):
+            num_bytes = np.prod(shape) * np.dtype(dtype).itemsize
+            arr = np.frombuffer(data_bytes, dtype=dtype, count=np.prod(shape), offset=current_offset).reshape(shape)
+            target_features.append(arr)
+            current_offset +=num_bytes
+            # without copy() it is read-only
+        return L, ab_target, [torch.from_numpy(arr.copy()) for arr in target_features]
 
     def __del__(self):
         if self.env is not None:
@@ -267,7 +281,7 @@ def fit(net, trainloader, optimizer, scaler, loss_pixel_fn, loss_vgg_fn, coeff_v
     prefetcher = CUDAPrefetcher(trainloader)
     inputs, targets, targets_features = prefetcher.next()
     while inputs is not None:
-        with torch.cuda.amp.autocast():
+        with torch.amp.autocast(device):
             # TODO: add other losses with relative coeffs to the composite loss_rec: charbonnier instead of L1 and cosine similarity
             out, mu, logvar = net(inputs)
             out = (out + 1.0) / 2.0 * 255.0 - 128.0  # rescale to [-128, 127]
@@ -306,7 +320,7 @@ def predict(net, valloader, loss_pixel_fn, loss_vgg_fn, coeff_vgg):
     prefetcher = CUDAPrefetcher(valloader)
     inputs, targets, targets_features = prefetcher.next()
     while inputs is not None:
-        with torch.cuda.amp.autocast():
+        with torch.amp.autocast(device):
             out, mu, logvar = net(inputs)
             out = (out + 1.0) / 2.0 * 255.0 - 128.0  # rescale to [-128, 127]
             inputs = (inputs * L_std + L_mean) * 100.0
@@ -463,25 +477,38 @@ for key, value in trial.params.items():
 @torch.no_grad()
 def create_features_file(vgg, out_dir, dataset):
     lmdb_path = os.path.join(out_dir, "features.lmdb")
-    env = None
     if os.path.exists(lmdb_path):
         shutil.rmtree(lmdb_path)
+    env = None
     try:
         env = lmdb.open(lmdb_path, map_size=800000000000) # ~700GB
         dataloader = DataLoader(dataset, batch_size=64, shuffle=False, num_workers=4, pin_memory=True, prefetch_factor=2)
-        # This will be the global sample index
         idx = 0
-        with env.begin(write=True) as txn:
-            for L_batch, ab_batch in tqdm(dataloader, desc="Extracting features to LMDB"):
-                L_batch = (L_batch.to(device, memory_format=torch.channels_last, non_blocking=True) * L_std + L_mean) * 100.0
-                ab_batch = ab_batch.to(device, memory_format=torch.channels_last, non_blocking=True)
-                feature_batch = vgg.extract_features(L_batch, ab_batch)
-                bs = L_batch.size(0)
-                for i in range(bs):
-                    single_features = [f[i].numpy() for f in feature_batch]
-                    feature_serialized = pickle.dumps(single_features)
-                    txn.put(f"{idx}".encode(), feature_serialized)
-                    idx += 1
+        BATCHES_PER_TRANSACTION = 15
+        txn = env.begin(write=True)  # Start the very first transaction here
+        for batch_idx, (L_batch, ab_batch) in enumerate(tqdm(dataloader, desc="Extracting features to LMDB")):
+            # Check if it's time to commit and start a new transaction
+            if batch_idx > 0 and batch_idx % BATCHES_PER_TRANSACTION == 0:
+                txn.commit()
+                txn = env.begin(write=True)
+            L_batch = (L_batch.to(device, memory_format=torch.channels_last,non_blocking=True) * L_std + L_mean) * 100.0
+            ab_batch = ab_batch.to(device, memory_format=torch.channels_last, non_blocking=True)
+            feature_batch = vgg.extract_features(L_batch, ab_batch)
+            bs = L_batch.size(0)
+            for i in range(bs):
+                single_features = [f[i].numpy() for f in feature_batch]
+                metadata = {
+                    'shapes': [arr.shape for arr in single_features],
+                    'dtypes': [str(arr.dtype) for arr in single_features]
+                }
+                metadata_bytes = pickle.dumps(metadata)
+                data_bytes = b''.join([arr.tobytes() for arr in single_features])
+                metadata_len = len(metadata_bytes)
+                feature_serialized = metadata_len.to_bytes(4, 'little') + metadata_bytes + data_bytes
+                txn.put(f"{idx}".encode(), feature_serialized)
+                idx += 1
+        # Final commit to ensure all remaining changes are saved
+        txn.commit()
     finally:
         if env is not None:
             env.close()
@@ -513,7 +540,7 @@ def test_grad_flow(test_net):
     num_batches = len(loader)
     pbar = tqdm(total=num_batches, desc="Prefetching")
     inputs, targets, features = prefetcher.next()
-    with torch.cuda.amp.autocast():
+    with torch.amp.autocast(device):
         out, mu, logvar = test_net(inputs)
         out_rescaled = (out + 1.0) / 2.0 * 255.0 - 128.0  # rescale to [-128, 127]
         inputs = (inputs * L_std + L_mean) * 100.0
@@ -574,7 +601,7 @@ def test_fit(test_net):
     pbar = tqdm(total=num_batches, desc="Prefetching")
     inputs, targets, targets_features = prefetcher.next()
     while inputs is not None:
-        with torch.cuda.amp.autocast():
+        with torch.amp.autocast(device):
             out, mu, logvar = test_net(inputs)
             out_rescaled = (out + 1.0) / 2.0 * 255.0 - 128.0  # rescale to [-128, 127]
             inputs = (inputs * L_std + L_mean) * 100.0
@@ -690,7 +717,7 @@ def final_predict(net, valloader):
     inputs, targets, _ = prefetcher.next()
     prog_bar = tqdm(total=len(valloader), desc='Final Predicting', leave=False)
     while inputs is not None:
-        with torch.cuda.amp.autocast():
+        with torch.amp.autocast(device):
             out, *_ = net(inputs)
             out = (out + 1.0) / 2.0 * 255.0 - 128.0  # rescale to [-128, 127]
         ins.append(inputs.cpu())
