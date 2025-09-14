@@ -379,7 +379,7 @@ def fit(net, trainloader, optimizer, scaler, loss_vgg_fn, coeff_char, coeff_vgg,
     # inputs, targets, targets_features = prefetcher.next()
     while inputs is not None:
         with torch.amp.autocast(device, dtype=torch.bfloat16):
-            out, mu, logvar = test_net(inputs)
+            out, mu, logvar = net(inputs)
             out_rescaled = (out + 1.0) / 2.0 * 255.0 - 128.0  # rescale to [-128, 127]
             inputs = (inputs * L_std + L_mean) * 100.0
             # TODO: add other losses with relative coeffs to the composite loss_rec: charbonnier instead of L1 and cosine similarity
@@ -400,7 +400,7 @@ def fit(net, trainloader, optimizer, scaler, loss_vgg_fn, coeff_char, coeff_vgg,
             continue
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
-        nn.utils.clip_grad_norm_(net.parameters(), 2)
+        nn.utils.clip_grad_norm_(net.parameters(), 3)
         scaler.step(optimizer)
         scaler.update()
         with torch.no_grad():
@@ -725,7 +725,7 @@ def test_fit(test_net):
     coeff_vgg = 1.0
     coeff_kld = 0.2
     total_loss, total_sse, pixels, count = torch.tensor(0.0, device=device), torch.tensor(0.0, device=device), 0, 0
-    optimizer = optim.AdamW(test_net.parameters(), lr=1e-4)
+    optimizer = optim.AdamW(test_net.parameters(), lr=1e-4, fused=True)
     loss_vgg_fn = VGGLoss(layers).to(device)
     # loss_vgg_fn = VGGLossWithFeatures(layers).to(device)
     test_net.train()
@@ -765,7 +765,7 @@ def test_fit(test_net):
         with torch.no_grad():
             total_loss += loss.detach()
             count += 1
-            sse = nn.functional.mse_loss(out, targets, reduction='sum')
+            sse = nn.functional.mse_loss(out_rescaled, targets, reduction='sum')
             total_sse += sse
             pixels += targets.numel()
         pbar.set_postfix({'loss': (total_loss / count).item()})
