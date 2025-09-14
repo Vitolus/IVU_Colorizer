@@ -370,7 +370,7 @@ class VGGLossWithFeatures(nn.Module):
             loss += nn.functional.l1_loss(x, y)
         return loss
 #%%
-def fit(net, trainloader, optimizer, scaler, loss_vgg_fn, coeff_char, coeff_vgg, coeff_kld):
+def fit(net, trainloader, optimizer, scaler, loss_vgg_fn, coeff_char, coeff_vgg, coeff_cos, coeff_kld):
     total_loss, total_sse, pixels, count = torch.tensor(0.0, device=device), torch.tensor(0.0, device=device), 0, 0
     net.train()
     prefetcher = CUDAPrefetcher(trainloader)
@@ -378,14 +378,16 @@ def fit(net, trainloader, optimizer, scaler, loss_vgg_fn, coeff_char, coeff_vgg,
     inputs, targets = prefetcher.next()
     # inputs, targets, targets_features = prefetcher.next()
     while inputs is not None:
-        with torch.amp.autocast(device):
-            out, mu, logvar = net(inputs)
+        with torch.amp.autocast(device, dtype=torch.bfloat16):
+            out, mu, logvar = test_net(inputs)
             out_rescaled = (out + 1.0) / 2.0 * 255.0 - 128.0  # rescale to [-128, 127]
             inputs = (inputs * L_std + L_mean) * 100.0
             # TODO: add other losses with relative coeffs to the composite loss_rec: charbonnier instead of L1 and cosine similarity
             loss_rec = torch.tensor(0.0, device=device)
             if coeff_char > 0.0:
                 loss_rec += (lambda x, y: torch.mean(torch.sqrt((x - y) ** 2 + 1e-6 ** 2)))(out_rescaled, targets) * coeff_char
+            if coeff_cos > 0.0:
+                loss_rec += (1 - nn.functional.cosine_similarity(out_rescaled, targets)).mean() * coeff_cos
             if coeff_vgg > 0.0:
                 loss_rec += loss_vgg_fn(inputs, out_rescaled, targets) * coeff_vgg
                 # loss_rec += coeff_vgg * loss_vgg_fn(inputs, out, targets_features)
@@ -402,7 +404,7 @@ def fit(net, trainloader, optimizer, scaler, loss_vgg_fn, coeff_char, coeff_vgg,
         scaler.step(optimizer)
         scaler.update()
         with torch.no_grad():
-            total_loss += loss_rec.detach()
+            total_loss += loss.detach()
             count += 1
             sse = nn.functional.mse_loss(out_rescaled, targets, reduction='sum')
             total_sse += sse
@@ -415,7 +417,7 @@ def fit(net, trainloader, optimizer, scaler, loss_vgg_fn, coeff_char, coeff_vgg,
     return (total_loss / count).item(), rmse.item(), psnr.item()
 
 @torch.no_grad()
-def predict(net, valloader, loss_vgg_fn, coeff_char, coeff_vgg):
+def predict(net, valloader, loss_vgg_fn, coeff_char, coeff_cos, coeff_vgg, coeff_kld):
     total_loss, total_sse, pixels, count = torch.tensor(0.0, device=device), torch.tensor(0.0, device=device), 0, 0
     net.eval()
     prefetcher = CUDAPrefetcher(valloader)
@@ -423,21 +425,25 @@ def predict(net, valloader, loss_vgg_fn, coeff_char, coeff_vgg):
     inputs, targets = prefetcher.next()
     # inputs, targets, targets_features = prefetcher.next()
     while inputs is not None:
-        with torch.amp.autocast(device):
+        with torch.amp.autocast(device, dtype=torch.bfloat16):
             out, mu, logvar = net(inputs)
             out_rescaled = (out + 1.0) / 2.0 * 255.0 - 128.0  # rescale to [-128, 127]
             inputs = (inputs * L_std + L_mean) * 100.0
             loss_rec = torch.tensor(0.0, device=device)
             if coeff_char > 0.0:
-                loss_rec += (lambda x, y: torch.mean(torch.sqrt((x - y) ** 2 + 1e-6 ** 2)))(out_rescaled, targets)
+                loss_rec += (lambda x, y: torch.mean(torch.sqrt((x - y) ** 2 + 1e-6 ** 2)))(out_rescaled, targets) * coeff_char
+            if coeff_cos > 0.0:
+                loss_rec += (1 - nn.functional.cosine_similarity(out_rescaled, targets)).mean() * coeff_cos
             if coeff_vgg > 0.0:
-                loss_rec += coeff_vgg * loss_vgg_fn(inputs, out_rescaled, targets)
+                loss_rec += loss_vgg_fn(inputs, out_rescaled, targets) * coeff_vgg
                 # loss_rec += coeff_vgg * loss_vgg_fn(inputs, out, targets_features)
-        if not torch.isfinite(loss_rec):
+            loss_kld = -0.5 * torch.sum(1 + logvar - mu ** 2 - logvar.exp(), dim=1).mean()
+            loss = loss_rec + coeff_kld * loss_kld
+        if not torch.isfinite(loss):
             inputs, targets = prefetcher.next()
             # inputs, targets, targets_features = prefetcher.next()
             continue
-        total_loss += loss_rec.detach()
+        total_loss += loss.detach()
         count += 1
         sse = nn.functional.mse_loss(out_rescaled, targets, reduction='sum')
         total_sse += sse
@@ -556,8 +562,8 @@ dummy = torch.zeros(1, 1, SIZE, SIZE).to(device, memory_format=torch.channels_la
 writer.add_graph(net, dummy)
 writer.flush()
 summary(net, input_data=dummy, col_names=('input_size', 'output_size', 'num_params', 'trainable'))
-#%% Hyper parameter tuning
 del dummy
+#%% Hyper parameter tuning
 gc.collect()
 torch.cuda.empty_cache()
 X = np.zeros(len(trainset))
@@ -647,37 +653,39 @@ def test_grad_flow(test_net):
     test_net.train()
     scaler = torch.amp.GradScaler(device)
     # with shuffle True it takes a bit longer
-    loader = DataLoader(trainset, batch_size=64, shuffle=False, num_workers=4, pin_memory=True)
+    loader = DataLoader(trainset, batch_size=64, shuffle=True, num_workers=4, pin_memory=True)
     print('prefetcher pre')
     prefetcher = CUDAPrefetcher(loader)
     # prefetcher = CUDAPrefetcherWithFeatures(loader)
     print('prefetcher post')
     optimizer = optim.AdamW(test_net.parameters(), lr=1e-4)
-    criterion2 = VGGLoss([0, 17, 26]).to(device)
-    # criterion2 = VGGLossWithFeatures([0, 17, 26]).to(device)
+    criterion2 = VGGLoss(layers).to(device)
+    # criterion2 = VGGLossWithFeatures(layers).to(device)
     num_batches = len(loader)
     pbar = tqdm(total=num_batches, desc="Prefetching")
     print('prefetcher next pre')
     inputs, targets = prefetcher.next()
     # inputs, targets, features = prefetcher.next()
     print('prefetcher next post')
-    with torch.amp.autocast(device):
+    with torch.amp.autocast(device, dtype=torch.bfloat16):
         out, mu, logvar = test_net(inputs)
         out_rescaled = (out + 1.0) / 2.0 * 255.0 - 128.0  # rescale to [-128, 127]
         inputs = (inputs * L_std + L_mean) * 100.0
-        loss_pix = (lambda x, y: torch.mean(torch.sqrt((x - y) ** 2 + 1e-6 ** 2)))(out_rescaled, targets)
+        loss_pix = (lambda x, y: torch.mean(torch.sqrt((x - y) ** 2 + 1e-6 ** 2)))(out_rescaled, targets) * 1.0
         print(f"Pixel loss: {loss_pix.item():.4f}")
+        loss_cos = (1- nn.functional.cosine_similarity(out_rescaled, targets)).mean() * 1.0
+        print(f"Cosine loss: {loss_cos.item():.4f}")
         loss_vgg = criterion2(inputs, out_rescaled, targets) * 1.0
         # loss_vgg = criterion2(inputs, out_rescaled, features) * 1.0
         print(f"VGG loss: {loss_vgg.item():.4f}")
         loss_kld = -0.5 * torch.sum(1 + logvar - mu ** 2 - logvar.exp(), dim=1).mean() * 0.2
         print(f"KLD loss: {loss_kld.item():.4f}")
-        loss = loss_pix + loss_vgg + loss_kld
+        loss = loss_pix + loss_cos + loss_vgg + loss_kld
         print(f"Total loss: {loss.item():.4f}")
     optimizer.zero_grad(set_to_none=True)
     scaler.scale(loss).backward()
     scaler.unscale_(optimizer)
-    nn.utils.clip_grad_norm_(net.parameters(), 2)
+    nn.utils.clip_grad_norm_(test_net.parameters(), 3)
     scaler.step(optimizer)
     scaler.update()
     pbar.update(1)
@@ -712,12 +720,14 @@ gc.collect()
 torch.cuda.empty_cache()
 #%% Test fit to check if it gets stuck somewhere
 def test_fit(test_net):
+    coeff_char = 1.0
+    coeff_cos = 1.0
     coeff_vgg = 1.0
     coeff_kld = 0.2
     total_loss, total_sse, pixels, count = torch.tensor(0.0, device=device), torch.tensor(0.0, device=device), 0, 0
     optimizer = optim.AdamW(test_net.parameters(), lr=1e-4)
-    criterion2 = VGGLoss([0, 17, 26]).to(device)
-    # criterion2 = VGGLossWithFeatures([0, 17, 26]).to(device)
+    loss_vgg_fn = VGGLoss(layers).to(device)
+    # loss_vgg_fn = VGGLossWithFeatures(layers).to(device)
     test_net.train()
     scaler = torch.amp.GradScaler(device)
     loader = DataLoader(trainset, batch_size=64, shuffle=True, num_workers=4, pin_memory=True)
@@ -728,36 +738,44 @@ def test_fit(test_net):
     inputs, targets = prefetcher.next()
     # inputs, targets, targets_features = prefetcher.next()
     while inputs is not None:
-        with torch.amp.autocast(device):
+        with torch.amp.autocast(device, dtype=torch.bfloat16):
             out, mu, logvar = test_net(inputs)
             out_rescaled = (out + 1.0) / 2.0 * 255.0 - 128.0  # rescale to [-128, 127]
             inputs = (inputs * L_std + L_mean) * 100.0
-            loss_rec = (lambda x, y: torch.mean(torch.sqrt((x - y) ** 2 + 1e-6 ** 2)))(out_rescaled, targets)
+            loss_rec = torch.tensor(0.0, device=device)
+            if coeff_char > 0.0:
+                loss_rec += (lambda x, y: torch.mean(torch.sqrt((x - y) ** 2 + 1e-6 ** 2)))(out_rescaled, targets) * coeff_char
+            if coeff_cos > 0.0:
+                loss_rec += (1 - nn.functional.cosine_similarity(out_rescaled, targets)).mean() * coeff_cos
             if coeff_vgg > 0.0:
-                loss_rec += coeff_vgg * criterion2(inputs, out_rescaled, targets)
-                # loss_rec += coeff_vgg * criterion2(inputs, out_rescaled, targets_features)
+                loss_rec += loss_vgg_fn(inputs, out_rescaled, targets) * coeff_vgg
+                # loss_rec += coeff_vgg * loss_vgg_fn(inputs, out, targets_features)
             loss_kld = -0.5 * torch.sum(1 + logvar - mu ** 2 - logvar.exp(), dim=1).mean()
             loss = loss_rec + coeff_kld * loss_kld
         optimizer.zero_grad(set_to_none=True)
+        if not torch.isfinite(loss):
+            inputs, targets = prefetcher.next()
+            # inputs, targets, targets_features = prefetcher.next()
+            continue
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
-        nn.utils.clip_grad_norm_(net.parameters(), 2)
+        nn.utils.clip_grad_norm_(test_net.parameters(), 3)
         scaler.step(optimizer)
         scaler.update()
         with torch.no_grad():
-            total_loss += loss_rec.detach()
+            total_loss += loss.detach()
             count += 1
             sse = nn.functional.mse_loss(out, targets, reduction='sum')
             total_sse += sse
             pixels += targets.numel()
+        pbar.set_postfix({'loss': (total_loss / count).item()})
         pbar.update(1)
         inputs, targets = prefetcher.next()
         # inputs, targets, targets_features = prefetcher.next()
     pbar.close()
     mse = total_sse / pixels
     rmse = torch.sqrt(mse)
-    eps = 1e-10
-    psnr = 10 * torch.log10((255.0 ** 2) / (mse + eps))
+    psnr = 10 * torch.log10((255.0 ** 2) / (mse + 1e-8))
     return (total_loss / count).item(), rmse.item(), psnr.item()
 
 test_net = Net().to(device)
@@ -772,7 +790,6 @@ testloader = DataLoader(testset, batch_size=64, shuffle=False, num_workers=4, pi
 optimizer = optim.AdamW(net.parameters(), lr=1e-4, fused=True)
 scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5)
 loss_vgg_fn = VGGLoss(layers).to(device)
-del dummy
 early_stopping = EarlyStopping()
 train_losses, train_rmses, train_psnrs, train_pccs = [], [], [], []
 val_losses, val_rmses, val_psnrs, val_pccs = [], [], [], []
@@ -781,8 +798,9 @@ num_epochs = 50
 num_cycles = 4
 cycle_length = num_epochs // num_cycles
 final_coeff_kld = 0.5
-coeff_char = 1.0
-coeff_vgg = 1.0
+coeff_char = 0.0
+coeff_cos = 1.0
+coeff_vgg = 0.0
 gc.collect()
 torch.cuda.empty_cache()
 #%%
@@ -805,11 +823,11 @@ scaler = torch.amp.GradScaler(device)
 for epoch in prog_bar:
     cycle_pos = epoch % cycle_length
     coeff_kld = final_coeff_kld * (0.5 * (1 + np.cos(np.pi * (1 - cycle_pos / cycle_length))))
-    train_loss, train_rmse, train_psnr = fit(net, trainloader, optimizer, scaler,loss_vgg_fn, coeff_char, coeff_vgg, coeff_kld)
+    train_loss, train_rmse, train_psnr = fit(net, trainloader, optimizer, scaler,loss_vgg_fn, coeff_char, coeff_cos, coeff_vgg, coeff_kld)
     train_losses.append(train_loss)
     train_rmses.append(train_rmse)
     train_psnrs.append(train_psnr)
-    val_loss, val_rmse, val_psnr = predict(net, valloader, loss_vgg_fn, coeff_char, coeff_vgg)
+    val_loss, val_rmse, val_psnr = predict(net, valloader, loss_vgg_fn, coeff_char, coeff_cos, coeff_vgg, coeff_kld)
     val_losses.append(val_loss)
     val_rmses.append(val_rmse)
     val_psnrs.append(val_psnr)
