@@ -251,33 +251,25 @@ class VGGLoss(nn.Module):
         Z = Y - lab[:, 2:3, :, :] / 200.0
         # apply f^-1 (piecewise)
         eps = 0.008856
-        Y = torch.where(Y > eps, Y ** 3, (Y - 16.0 / 116.0) / 7.787)
-        X = torch.where(X > eps, X ** 3, (X - 16.0 / 116.0) / 7.787)
-        Z = torch.where(Z > eps, Z ** 3, (Z - 16.0 / 116.0) / 7.787)
         xyz = torch.cat([X, Y, Z], dim=1)
+        xyz = torch.where(xyz > 0.008856, xyz ** 3, (xyz - 16.0 / 116.0) / 7.787)
         # Apply D65 whitepoint scaling
         xyz = xyz.clone()
         xyz[:, 0:1, :, :] = xyz[:, 0:1, :, :] * 0.95047
         xyz[:, 2:3, :, :] = xyz[:, 2:3, :, :] * 1.08883
         rgb = torch.zeros_like(xyz)
-        rgb[:, 0:1, :, :] = (3.2404542 * xyz[:, 0:1, :, :] -
-                             1.5371385 * xyz[:, 1:2, :, :] -
-                             0.4985314 * xyz[:, 2:3, :, :])
-        rgb[:, 1:2, :, :] = (-0.9692660 * xyz[:, 0:1, :, :] +
-                             1.8760108 * xyz[:, 1:2, :, :] +
-                             0.0415560 * xyz[:, 2:3, :, :])
-        rgb[:, 2:3, :, :] = (0.0556434 * xyz[:, 0:1, :, :] -
-                             0.2040259 * xyz[:, 1:2, :, :] +
-                             1.0572252 * xyz[:, 2:3, :, :])
+        rgb[:, 0:1, :, :] = (xyz[:, 0:1, :, :] * 3.2406 + xyz[:, 1:2, :, :] * (-1.5372) + xyz[:, 2:3, :, :] * (-0.4986))
+        rgb[:, 1:2, :, :] = (xyz[:, 0:1, :, :] * (-0.9689) + xyz[:, 1:2, :, :] * 1.8758 + xyz[:, 2:3, :, :] * 0.0415)
+        rgb[:, 2:3, :, :] = (xyz[:, 0:1, :, :] * 0.0557 - xyz[:, 1:2, :, :] * (-0.2040) + xyz[:, 2:3, :, :] * 1.0570)
         # gamma correction
-        # sanitize NaN/inf first (replace with numeric safe values)
-        rgb_sane = torch.nan_to_num(rgb, nan=0.0, posinf=1e6, neginf=0.0)
-        # clamp negative values to avoid NaN in pow
-        rgb_for_pow = torch.clamp(rgb_sane, min=1e-10)
-        rgb_pow = rgb_for_pow ** (1.0 / 2.4)
-        # threshold mask (still uses original rgb for linear branch to preserve negatives)
-        mask = rgb_sane > 0.0031308
-        rgb = torch.where(mask, 1.055 * rgb_pow - 0.055, 12.92 * rgb_sane)
+        rgb = torch.where(rgb > 0.0031308, 1.055 * (torch.relu(rgb) ** (1 * 2.4)) - 0.055, 12.92 * rgb)
+        # # sanitize NaN/inf first (replace with numeric safe values)
+        # rgb_sane = torch.nan_to_num(rgb, nan=0.0, posinf=1e6, neginf=0.0)
+        # # clamp negative values to avoid NaN in pow
+        # rgb_for_pow = torch.clamp(rgb_sane, min=1e-8)
+        # rgb_pow = rgb_for_pow ** (1.0 / 2.4)
+        # # threshold (still uses original rgb for linear branch to preserve negatives)
+        # rgb = torch.where(rgb_sane > 0.0031308, 1.055 * rgb_pow - 0.055, 12.92 * rgb_sane)
         rgb = torch.clamp(rgb, 0.0, 1.0) # (B, 3, H, W)
         return rgb
 
@@ -317,33 +309,25 @@ class VGGLossWithFeatures(nn.Module):
         Z = Y - lab[:, 2:3, :, :] / 200.0
         # apply f^-1 (piecewise)
         eps = 0.008856
-        Y = torch.where(Y > eps, Y ** 3, (Y - 16.0 / 116.0) / 7.787)
-        X = torch.where(X > eps, X ** 3, (X - 16.0 / 116.0) / 7.787)
-        Z = torch.where(Z > eps, Z ** 3, (Z - 16.0 / 116.0) / 7.787)
         xyz = torch.cat([X, Y, Z], dim=1)
+        xyz = torch.where(xyz > 0.008856, xyz ** 3, (xyz - 16.0 / 116.0) / 7.787)
         # Apply D65 whitepoint scaling
         xyz = xyz.clone()
         xyz[:, 0:1, :, :] = xyz[:, 0:1, :, :] * 0.95047
         xyz[:, 2:3, :, :] = xyz[:, 2:3, :, :] * 1.08883
         rgb = torch.zeros_like(xyz)
-        rgb[:, 0:1, :, :] = (3.2404542 * xyz[:, 0:1, :, :] -
-                             1.5371385 * xyz[:, 1:2, :, :] -
-                             0.4985314 * xyz[:, 2:3, :, :])
-        rgb[:, 1:2, :, :] = (-0.9692660 * xyz[:, 0:1, :, :] +
-                             1.8760108 * xyz[:, 1:2, :, :] +
-                             0.0415560 * xyz[:, 2:3, :, :])
-        rgb[:, 2:3, :, :] = (0.0556434 * xyz[:, 0:1, :, :] -
-                             0.2040259 * xyz[:, 1:2, :, :] +
-                             1.0572252 * xyz[:, 2:3, :, :])
+        rgb[:, 0:1, :, :] = (xyz[:, 0:1, :, :] * 3.2406 + xyz[:, 1:2, :, :] * (-1.5372) + xyz[:, 2:3, :, :] * (-0.4986))
+        rgb[:, 1:2, :, :] = (xyz[:, 0:1, :, :] * (-0.9689) + xyz[:, 1:2, :, :] * 1.8758 + xyz[:, 2:3, :, :] * 0.0415)
+        rgb[:, 2:3, :, :] = (xyz[:, 0:1, :, :] * 0.0557 - xyz[:, 1:2, :, :] * (-0.2040) + xyz[:, 2:3, :, :] * 1.0570)
         # gamma correction
-        # sanitize NaN/inf first (replace with numeric safe values)
-        rgb_sane = torch.nan_to_num(rgb, nan=0.0, posinf=1e6, neginf=0.0)
-        # clamp negative values to avoid NaN in pow
-        rgb_for_pow = torch.clamp(rgb_sane, min=1e-10)
-        rgb_pow = rgb_for_pow ** (1.0 / 2.4)
-        # threshold mask (still uses original rgb for linear branch to preserve negatives)
-        mask = rgb_sane > 0.0031308
-        rgb = torch.where(mask, 1.055 * rgb_pow - 0.055, 12.92 * rgb_sane)
+        rgb = torch.where(rgb > 0.0031308, 1.055 * (torch.relu(rgb) ** (1 * 2.4)) - 0.055, 12.92 * rgb)
+        # # sanitize NaN/inf first (replace with numeric safe values)
+        # rgb_sane = torch.nan_to_num(rgb, nan=0.0, posinf=1e6, neginf=0.0)
+        # # clamp negative values to avoid NaN in pow
+        # rgb_for_pow = torch.clamp(rgb_sane, min=1e-8)
+        # rgb_pow = rgb_for_pow ** (1.0 / 2.4)
+        # # threshold (still uses original rgb for linear branch to preserve negatives)
+        # rgb = torch.where(rgb_sane > 0.0031308, 1.055 * rgb_pow - 0.055, 12.92 * rgb_sane)
         rgb = torch.clamp(rgb, 0.0, 1.0) # (B, 3, H, W)
         return rgb
 
@@ -370,7 +354,7 @@ class VGGLossWithFeatures(nn.Module):
             loss += nn.functional.l1_loss(x, y)
         return loss
 #%%
-def fit(net, trainloader, optimizer, scaler, loss_vgg_fn, coeff_char, coeff_vgg, coeff_cos, coeff_kld):
+def fit(net, trainloader, optimizer, scaler, loss_vgg_fn, coeff_char, coeff_cos, coeff_vgg, coeff_kld):
     total_loss, total_sse, pixels, count = torch.tensor(0.0, device=device), torch.tensor(0.0, device=device), 0, 0
     net.train()
     prefetcher = CUDAPrefetcher(trainloader)
@@ -382,12 +366,11 @@ def fit(net, trainloader, optimizer, scaler, loss_vgg_fn, coeff_char, coeff_vgg,
             out, mu, logvar = net(inputs)
             out_rescaled = (out + 1.0) / 2.0 * 255.0 - 128.0  # rescale to [-128, 127]
             inputs = (inputs * L_std + L_mean) * 100.0
-            # TODO: add other losses with relative coeffs to the composite loss_rec: charbonnier instead of L1 and cosine similarity
             loss_rec = torch.tensor(0.0, device=device)
             if coeff_char > 0.0:
                 loss_rec += (lambda x, y: torch.mean(torch.sqrt((x - y) ** 2 + 1e-6 ** 2)))(out_rescaled, targets) * coeff_char
             if coeff_cos > 0.0:
-                loss_rec += (1 - nn.functional.cosine_similarity(out_rescaled, targets)).mean() * coeff_cos
+                loss_rec += (1 - ((out_rescaled / (out_rescaled.norm(dim=1, keepdim=True) + 1e-8)) * (targets / (targets.norm(dim=1, keepdim=True) + 1e-6))).sum(dim=1)).mean() * coeff_cos
             if coeff_vgg > 0.0:
                 loss_rec += loss_vgg_fn(inputs, out_rescaled, targets) * coeff_vgg
                 # loss_rec += coeff_vgg * loss_vgg_fn(inputs, out, targets_features)
@@ -433,7 +416,7 @@ def predict(net, valloader, loss_vgg_fn, coeff_char, coeff_cos, coeff_vgg, coeff
             if coeff_char > 0.0:
                 loss_rec += (lambda x, y: torch.mean(torch.sqrt((x - y) ** 2 + 1e-6 ** 2)))(out_rescaled, targets) * coeff_char
             if coeff_cos > 0.0:
-                loss_rec += (1 - nn.functional.cosine_similarity(out_rescaled, targets)).mean() * coeff_cos
+                loss_rec += (1 - ((out_rescaled / (out_rescaled.norm(dim=1, keepdim=True) + 1e-8)) * (targets / (targets.norm(dim=1, keepdim=True) + 1e-6))).sum(dim=1)).mean() * coeff_cos
             if coeff_vgg > 0.0:
                 loss_rec += loss_vgg_fn(inputs, out_rescaled, targets) * coeff_vgg
                 # loss_rec += coeff_vgg * loss_vgg_fn(inputs, out, targets_features)
@@ -458,11 +441,12 @@ def predict(net, valloader, loss_vgg_fn, coeff_char, coeff_cos, coeff_vgg, coeff
 def objective(trial, trainset, scaler, X):
     num_cycles = trial.suggest_int('num_cycles', 4, 10)
     cycle_length = num_epochs // num_cycles
-    final_coeff_kld = 0.5
-    coeff_char = trial.suggest_float('coeff_char', 0.1, 1.0)
-    coeff_vgg = trial.suggest_float('coeff_vgg', 0.1, 1.0)
+    final_coeff_kld = trial.suggest_float('final_coeff_kld', 0.1, 1.0, log=True)
+    coeff_char = trial.suggest_float('coeff_char', 0.1, 1.0, log=True)
+    coeff_cos = trial.suggest_float('coeff_cos', 0.1, 1.0, log=True)
+    coeff_vgg = trial.suggest_float('coeff_vgg', 0.1, 1.0, log=True)
     layers = trial.suggest_categorical('layers', [[0, 17], [0, 26], [0, 17, 26]])
-    lr = trial.suggest_float('lr', 1e-5, 1e-1, log=True)
+    lr = trial.suggest_float('lr', 1e-6, 1e-1, log=True)
     batch_size = trial.suggest_categorical('batch_size', [32, 64, 128])
     latent_dim = trial.suggest_categorical('latent_dim', [64, 128, 256, 512])
     kf = KFold(n_splits=5, shuffle=True, random_state=42)
@@ -471,17 +455,17 @@ def objective(trial, trainset, scaler, X):
     prog_bar = tqdm(kf.split(X), desc="Splits", position=0)
     for train_idx, val_idx in prog_bar:
         split_n += 1
-        trainloader = DataLoader(trainset, batch_size=batch_size, sampler=SubsetRandomSampler(train_idx), num_workers=4, pin_memory=True, prefetch_factor=2)
-        valloader = DataLoader(trainset, batch_size=batch_size, sampler=SubsetRandomSampler(val_idx), num_workers=4, pin_memory=True, prefetch_factor=2)
+        trainloader = DataLoader(trainset, batch_size=batch_size, sampler=SubsetRandomSampler(train_idx), num_workers=4, pin_memory=True)
+        valloader = DataLoader(trainset, batch_size=batch_size, sampler=SubsetRandomSampler(val_idx), num_workers=4, pin_memory=True)
         loss_vgg_fn = VGGLoss(layers).to(device)
         net = Net(latent_dim).to(device)
         optimizer = optim.AdamW(net.parameters(), lr=lr)
         scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5)
-        for epoch in range(50):
+        for epoch in range(25):
             cycle_pos = epoch % cycle_length
             coeff_kld = final_coeff_kld * (0.5 * (1 + np.cos(np.pi * (1 - cycle_pos / cycle_length))))
-            train_loss, train_rmse, train_psnr = fit(net, trainloader, optimizer, scaler, loss_vgg_fn, coeff_char, coeff_vgg, coeff_kld)
-            val_loss, val_rmse, val_psnr = predict(net, valloader, loss_vgg_fn, coeff_char, coeff_vgg)
+            train_loss, train_rmse, train_psnr = fit(net, trainloader, optimizer, scaler, loss_vgg_fn, coeff_char, coeff_cos, coeff_vgg, coeff_kld)
+            val_loss, val_rmse, val_psnr = predict(net, valloader, loss_vgg_fn, coeff_char, coeff_cos, coeff_vgg, coeff_kld)
             val_losses.append(val_loss)
             scheduler.step(val_loss)
             prog_bar.set_description(f"Epoch {epoch + 1}, lr={current_lr}, coeff_kld={coeff_kld:.3f}, Loss={train_loss:.3f}/{val_loss:.3f} | "
@@ -497,17 +481,23 @@ class Net(nn.Module):
     def __init__(self, latent_dim=256):
         super(Net, self).__init__()
         self.latent_dim = latent_dim
-        self.encoder = nn.Sequential(
+        self.enc1 = nn.Sequential(
             nn.Conv2d(1, 64, kernel_size=3, stride=2, padding=1),
-            nn.LeakyReLU(),
+            nn.LeakyReLU()
+        ) # [B, 64, size/2, size/2]
+        self.enc2 = nn.Sequential(
             nn.Conv2d(64, 128, kernel_size=3, stride=1, padding=1),
             nn.LeakyReLU(),
             nn.Conv2d(128, 128, kernel_size=3, stride=2, padding=1),
-            nn.LeakyReLU(),
+            nn.LeakyReLU()
+        ) # [B, 128, size/4, size/4]
+        self.enc3 = nn.Sequential(
             nn.Conv2d(128, 256, kernel_size=3, stride=1, padding=1),
             nn.LeakyReLU(),
             nn.Conv2d(256, 256, kernel_size=3, stride=2, padding=1),
-            nn.LeakyReLU(),
+            nn.LeakyReLU()
+        )
+        self.enc4 = nn.Sequential(
             nn.Conv2d(256, 512, kernel_size=3, stride=1, padding=1),
             nn.LeakyReLU(),
             nn.Conv2d(512, 512, kernel_size=3, stride=1, padding=1),
@@ -517,15 +507,20 @@ class Net(nn.Module):
         )
         self.pool = nn.AdaptiveAvgPool2d((1, 1))
         self.fc_mu_logvar = nn.Conv2d(256, 2 * latent_dim, kernel_size=1)
-        self.decoder_input = nn.Linear(latent_dim, 256 * SIZE // 8 * SIZE // 8)
-        self.decoder = nn.Sequential(
-            nn.Unflatten(1, (256, SIZE // 8, SIZE // 8)),
+        self.decoder_input = nn.Linear(latent_dim, 256 * (SIZE // 8) * (SIZE // 8))
+        self.dec1 = nn.Sequential(
             nn.ConvTranspose2d(256, 128, kernel_size=3, stride=2, padding=1, output_padding=1),
-            nn.LeakyReLU(),
-            nn.ConvTranspose2d(128, 64, kernel_size=3, stride=2, padding=1, output_padding=1),
-            nn.LeakyReLU(),
-            nn.ConvTranspose2d(64, 32, kernel_size=3, stride=1, padding=1),
-            nn.LeakyReLU(),
+            nn.LeakyReLU()
+        )
+        self.dec2 = nn.Sequential(
+            nn.ConvTranspose2d(128 + 128, 64, kernel_size=3, stride=2, padding=1, output_padding=1),
+            nn.LeakyReLU()
+        )
+        self.dec3 = nn.Sequential(
+            nn.ConvTranspose2d(64 + 64, 32, kernel_size=3, stride=1, padding=1),
+            nn.LeakyReLU()
+        )
+        self.dec4 = nn.Sequential(
             nn.ConvTranspose2d(32, 16, kernel_size=3, stride=1, padding=1),
             nn.LeakyReLU(),
             nn.ConvTranspose2d(16, 2, kernel_size=3, stride=2, padding=1, output_padding=1),
@@ -538,14 +533,24 @@ class Net(nn.Module):
         return mu + eps * std
 
     def forward(self, x):
-        encoded = self.encoder(x) # [B, 256, 28, 28]
-        pooled = self.pool(encoded) # [B, 256, 1, 1]
-        mu_logvar = self.fc_mu_logvar(pooled).squeeze(-1).squeeze(-1) # [B, 2 * latent_dim]
+        e1 = self.enc1(x) # [B, 64, size/2, size/2]
+        e2 = self.enc2(e1) # [B, 128, size/4, size/4]
+        e3 = self.enc3(e2) # [B, 256, size/8, size/8]
+        e4 = self.enc4(e3) # [B, 256, size/8, size/8]
+        pooled = self.pool(e4)  # [B, 256, 1, 1]
+        mu_logvar = self.fc_mu_logvar(pooled).squeeze(-1).squeeze(-1)  # [B, 2*latent_dim]
         mu, logvar = mu_logvar.chunk(2, dim=1)
         z = self.reparameterize(mu, logvar)
-        decoder_input = self.decoder_input(z)
-        x = self.decoder(decoder_input)
-        return x, mu, logvar
+        dec_input = self.decoder_input(z)
+        d = dec_input.reshape(-1, 256, SIZE // 8, SIZE // 8)
+        d1 = self.dec1(d) # [B, 128, size/4, size/4]
+        d1 = torch.cat([d1, e2], dim=1)
+        d2 = self.dec2(d1) # [B, 64, size/2, size/2]
+        d2 = torch.cat([d2, e1], dim=1)
+        d3 = self.dec3(d2) # [B, 32, size/2, size/2]
+        out = self.dec4(d3) # [B, 2, size, size]
+
+        return out, mu, logvar
 #%%
 writer = SummaryWriter('../runs')
 net = Net().eval()
@@ -673,7 +678,7 @@ def test_grad_flow(test_net):
         inputs = (inputs * L_std + L_mean) * 100.0
         loss_pix = (lambda x, y: torch.mean(torch.sqrt((x - y) ** 2 + 1e-6 ** 2)))(out_rescaled, targets) * 1.0
         print(f"Pixel loss: {loss_pix.item():.4f}")
-        loss_cos = (1- nn.functional.cosine_similarity(out_rescaled, targets)).mean() * 1.0
+        loss_cos = (1 - ((out_rescaled / (out_rescaled.norm(dim=1, keepdim=True) + 1e-8)) * (targets / (targets.norm(dim=1, keepdim=True) + 1e-6))).sum(dim=1)).mean() * 0.5
         print(f"Cosine loss: {loss_cos.item():.4f}")
         loss_vgg = criterion2(inputs, out_rescaled, targets) * 1.0
         # loss_vgg = criterion2(inputs, out_rescaled, features) * 1.0
@@ -721,7 +726,7 @@ torch.cuda.empty_cache()
 #%% Test fit to check if it gets stuck somewhere
 def test_fit(test_net):
     coeff_char = 1.0
-    coeff_cos = 1.0
+    coeff_cos = 0.5
     coeff_vgg = 1.0
     coeff_kld = 0.2
     total_loss, total_sse, pixels, count = torch.tensor(0.0, device=device), torch.tensor(0.0, device=device), 0, 0
@@ -746,7 +751,7 @@ def test_fit(test_net):
             if coeff_char > 0.0:
                 loss_rec += (lambda x, y: torch.mean(torch.sqrt((x - y) ** 2 + 1e-6 ** 2)))(out_rescaled, targets) * coeff_char
             if coeff_cos > 0.0:
-                loss_rec += (1 - nn.functional.cosine_similarity(out_rescaled, targets)).mean() * coeff_cos
+                loss_rec += (1 - ((out_rescaled / (out_rescaled.norm(dim=1, keepdim=True) + 1e-8)) * (targets / (targets.norm(dim=1, keepdim=True) + 1e-6))).sum(dim=1)).mean() * coeff_cos
             if coeff_vgg > 0.0:
                 loss_rec += loss_vgg_fn(inputs, out_rescaled, targets) * coeff_vgg
                 # loss_rec += coeff_vgg * loss_vgg_fn(inputs, out, targets_features)
@@ -798,9 +803,9 @@ num_epochs = 50
 num_cycles = 4
 cycle_length = num_epochs // num_cycles
 final_coeff_kld = 0.5
-coeff_char = 0.0
-coeff_cos = 1.0
-coeff_vgg = 0.0
+coeff_char = 1.0
+coeff_cos = 0.2
+coeff_vgg = 1.0
 gc.collect()
 torch.cuda.empty_cache()
 #%%
