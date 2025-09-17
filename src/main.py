@@ -439,7 +439,7 @@ def objective(trial, trainset, scaler, X):
     latent_dim = trial.suggest_categorical('latent_dim', [64, 128, 256, 512])
     kf = KFold(n_splits=5, shuffle=True, random_state=42)
     fold_losses, split_n = [], 0
-    prog_bar = tqdm(kf.split(X), desc="Splits", position=0)
+    prog_bar = tqdm(kf.split(X), desc="Splits", total=5, position=0)
     for train_idx, val_idx in prog_bar:
         gc.collect()
         torch.cuda.empty_cache()
