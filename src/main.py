@@ -2,6 +2,7 @@
 import gc
 import os
 import re
+from collections import deque
 import cv2
 import lmdb
 import pickle
@@ -263,13 +264,6 @@ class VGGLoss(nn.Module):
         rgb[:, 2:3, :, :] = (xyz[:, 0:1, :, :] * 0.0557 - xyz[:, 1:2, :, :] * (-0.2040) + xyz[:, 2:3, :, :] * 1.0570)
         # gamma correction
         rgb = torch.where(rgb > 0.0031308, 1.055 * (torch.relu(rgb) ** (1 * 2.4)) - 0.055, 12.92 * rgb)
-        # # sanitize NaN/inf first (replace with numeric safe values)
-        # rgb_sane = torch.nan_to_num(rgb, nan=0.0, posinf=1e6, neginf=0.0)
-        # # clamp negative values to avoid NaN in pow
-        # rgb_for_pow = torch.clamp(rgb_sane, min=1e-8)
-        # rgb_pow = rgb_for_pow ** (1.0 / 2.4)
-        # # threshold (still uses original rgb for linear branch to preserve negatives)
-        # rgb = torch.where(rgb_sane > 0.0031308, 1.055 * rgb_pow - 0.055, 12.92 * rgb_sane)
         rgb = torch.clamp(rgb, 0.0, 1.0) # (B, 3, H, W)
         return rgb
 
@@ -321,13 +315,6 @@ class VGGLossWithFeatures(nn.Module):
         rgb[:, 2:3, :, :] = (xyz[:, 0:1, :, :] * 0.0557 - xyz[:, 1:2, :, :] * (-0.2040) + xyz[:, 2:3, :, :] * 1.0570)
         # gamma correction
         rgb = torch.where(rgb > 0.0031308, 1.055 * (torch.relu(rgb) ** (1 * 2.4)) - 0.055, 12.92 * rgb)
-        # # sanitize NaN/inf first (replace with numeric safe values)
-        # rgb_sane = torch.nan_to_num(rgb, nan=0.0, posinf=1e6, neginf=0.0)
-        # # clamp negative values to avoid NaN in pow
-        # rgb_for_pow = torch.clamp(rgb_sane, min=1e-8)
-        # rgb_pow = rgb_for_pow ** (1.0 / 2.4)
-        # # threshold (still uses original rgb for linear branch to preserve negatives)
-        # rgb = torch.where(rgb_sane > 0.0031308, 1.055 * rgb_pow - 0.055, 12.92 * rgb_sane)
         rgb = torch.clamp(rgb, 0.0, 1.0) # (B, 3, H, W)
         return rgb
 
@@ -446,36 +433,39 @@ def objective(trial, trainset, scaler, X):
     coeff_cos = trial.suggest_float('coeff_cos', 0.1, 1.0, log=True)
     coeff_vgg = trial.suggest_float('coeff_vgg', 0.1, 1.0, log=True)
     layers = trial.suggest_categorical('layers', [[0, 17], [0, 26], [0, 17, 26]])
-    lr = trial.suggest_float('lr', 1e-6, 1e-1, log=True)
-    batch_size = trial.suggest_categorical('batch_size', [32, 64, 128])
+    lr = trial.suggest_float('lr', 1e-6, 5e-4, log=True)
+    batch_size = trial.suggest_categorical('batch_size', [32, 64])
     latent_dim = trial.suggest_categorical('latent_dim', [64, 128, 256, 512])
     kf = KFold(n_splits=5, shuffle=True, random_state=42)
-    val_losses, mean_loss = [], 0.0
-    split_n = 0
-    prog_bar = tqdm(kf.split(X), desc="Splits", position=0)
-    for train_idx, val_idx in prog_bar:
+    fold_losses, split_n = [], 0
+    for train_idx, val_idx in tqdm(kf.split(X), desc="Splits", position=0):
+        gc.collect()
+        torch.cuda.empty_cache()
         split_n += 1
         trainloader = DataLoader(trainset, batch_size=batch_size, sampler=SubsetRandomSampler(train_idx), num_workers=4, pin_memory=True)
         valloader = DataLoader(trainset, batch_size=batch_size, sampler=SubsetRandomSampler(val_idx), num_workers=4, pin_memory=True)
         loss_vgg_fn = VGGLoss(layers).to(device)
         net = Net(latent_dim).to(device)
         optimizer = optim.AdamW(net.parameters(), lr=lr)
-        scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5)
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=5)
+        val_losses = deque(maxlen=3)
         for epoch in range(25):
+            gc.collect()
+            torch.cuda.empty_cache()
             cycle_pos = epoch % cycle_length
             coeff_kld = final_coeff_kld * (0.5 * (1 + np.cos(np.pi * (1 - cycle_pos / cycle_length))))
             train_loss, train_rmse, train_psnr = fit(net, trainloader, optimizer, scaler, loss_vgg_fn, coeff_char, coeff_cos, coeff_vgg, coeff_kld)
             val_loss, val_rmse, val_psnr = predict(net, valloader, loss_vgg_fn, coeff_char, coeff_cos, coeff_vgg, coeff_kld)
-            val_losses.append(val_loss)
-            scheduler.step(val_loss)
-            prog_bar.set_description(f"Epoch {epoch + 1}, lr={current_lr}, coeff_kld={coeff_kld:.3f}, Loss={train_loss:.3f}/{val_loss:.3f} | "
-                                     f"Metrics train/val: RMSE={train_rmse:.3f}/{val_rmse:.3f}, PSNR={train_psnr:.3f}/{val_psnr:.3f}")
+            # scheduler.step(val_psnr)
+            val_losses.append(val_loss.item())
+            prog_bar.set_description(f"Epoch {epoch + 1}, lr={current_lr}, coeff_kld={coeff_kld:.3f}, Loss={train_loss:.3f}/{val_loss:.3f} | Metrics train/val: RMSE={train_rmse:.3f}/{val_rmse:.3f}, PSNR={train_psnr:.3f}/{val_psnr:.3f}")
         del net, optimizer, scheduler
-        mean_loss = np.mean(val_losses)
-        trial.report(mean_loss, split_n)
+        fold_mean_loss = np.mean(val_losses)
+        fold_losses.append(fold_mean_loss)
+        trial.report(fold_mean_loss, split_n)
         if trial.should_prune():
             raise optuna.exceptions.TrialPruned()
-    return mean_loss
+    return np.mean(fold_losses)
 #%%
 class Net(nn.Module):
     def __init__(self, latent_dim=256):
@@ -488,12 +478,14 @@ class Net(nn.Module):
         self.enc2 = nn.Sequential(
             nn.Conv2d(64, 128, kernel_size=3, stride=1, padding=1),
             nn.LeakyReLU(),
+            nn.Dropout2d(0.2),
             nn.Conv2d(128, 128, kernel_size=3, stride=2, padding=1),
             nn.LeakyReLU()
         ) # [B, 128, size/4, size/4]
         self.enc3 = nn.Sequential(
             nn.Conv2d(128, 256, kernel_size=3, stride=1, padding=1),
             nn.LeakyReLU(),
+            nn.Dropout2d(0.2),
             nn.Conv2d(256, 256, kernel_size=3, stride=2, padding=1),
             nn.LeakyReLU()
         )
@@ -502,10 +494,12 @@ class Net(nn.Module):
             nn.LeakyReLU(),
             nn.Conv2d(512, 512, kernel_size=3, stride=1, padding=1),
             nn.LeakyReLU(),
+            nn.Dropout2d(0.2),
             nn.Conv2d(512, 256, kernel_size=3, stride=1, padding=1),
             nn.LeakyReLU()
         )
         self.pool = nn.AdaptiveAvgPool2d((1, 1))
+        self.dropout = nn.Dropout(0.2)
         self.fc_mu_logvar = nn.Conv2d(256, 2 * latent_dim, kernel_size=1)
         self.decoder_input = nn.Linear(latent_dim, 256 * (SIZE // 8) * (SIZE // 8))
         self.dec1 = nn.Sequential(
@@ -538,6 +532,7 @@ class Net(nn.Module):
         e3 = self.enc3(e2) # [B, 256, size/8, size/8]
         e4 = self.enc4(e3) # [B, 256, size/8, size/8]
         pooled = self.pool(e4)  # [B, 256, 1, 1]
+        pooled = self.dropout(pooled)
         mu_logvar = self.fc_mu_logvar(pooled).squeeze(-1).squeeze(-1)  # [B, 2*latent_dim]
         mu, logvar = mu_logvar.chunk(2, dim=1)
         z = self.reparameterize(mu, logvar)
@@ -572,7 +567,6 @@ del dummy
 gc.collect()
 torch.cuda.empty_cache()
 X = np.zeros(len(trainset))
-torch.cuda.empty_cache()
 scaler = torch.amp.GradScaler(device)
 study = optuna.create_study(direction='minimize', pruner=optuna.pruners.MedianPruner())
 study.optimize(lambda trial: objective(trial, trainset, scaler, X), n_trials=5)
@@ -726,7 +720,7 @@ torch.cuda.empty_cache()
 #%% Test fit to check if it gets stuck somewhere
 def test_fit(test_net):
     coeff_char = 1.0
-    coeff_cos = 0.5
+    coeff_cos = 0.1
     coeff_vgg = 1.0
     coeff_kld = 0.2
     total_loss, total_sse, pixels, count = torch.tensor(0.0, device=device), torch.tensor(0.0, device=device), 0, 0
@@ -793,18 +787,18 @@ trainloader = DataLoader(trainset, batch_size=64, shuffle=True, num_workers=4, p
 valloader = DataLoader(valset, batch_size=64, shuffle=False, num_workers=4, pin_memory=True)
 testloader = DataLoader(testset, batch_size=64, shuffle=False, num_workers=4, pin_memory=True)
 optimizer = optim.AdamW(net.parameters(), lr=1e-4, fused=True)
-scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5)
+scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=5)
 loss_vgg_fn = VGGLoss(layers).to(device)
 early_stopping = EarlyStopping()
-train_losses, train_rmses, train_psnrs, train_pccs = [], [], [], []
-val_losses, val_rmses, val_psnrs, val_pccs = [], [], [], []
+train_losses, train_rmses, train_psnrs = [], [], []
+val_losses, val_rmses, val_psnrs = [], [], []
 last_checkpoint = None
 num_epochs = 50
 num_cycles = 4
 cycle_length = num_epochs // num_cycles
 final_coeff_kld = 0.5
 coeff_char = 1.0
-coeff_cos = 0.2
+coeff_cos = 0.05
 coeff_vgg = 1.0
 gc.collect()
 torch.cuda.empty_cache()
@@ -826,6 +820,8 @@ ax.legend()
 
 scaler = torch.amp.GradScaler(device)
 for epoch in prog_bar:
+    gc.collect()
+    torch.cuda.empty_cache()
     cycle_pos = epoch % cycle_length
     coeff_kld = final_coeff_kld * (0.5 * (1 + np.cos(np.pi * (1 - cycle_pos / cycle_length))))
     train_loss, train_rmse, train_psnr = fit(net, trainloader, optimizer, scaler,loss_vgg_fn, coeff_char, coeff_cos, coeff_vgg, coeff_kld)
