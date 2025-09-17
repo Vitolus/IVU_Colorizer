@@ -426,6 +426,7 @@ def predict(net, valloader, loss_vgg_fn, coeff_char, coeff_cos, coeff_vgg, coeff
     return (total_loss / count).item(), rmse.item(), psnr.item()
 #%%
 def objective(trial, trainset, scaler, X):
+    num_epochs = 25
     num_cycles = trial.suggest_int('num_cycles', 4, 10)
     cycle_length = num_epochs // num_cycles
     final_coeff_kld = trial.suggest_float('final_coeff_kld', 0.1, 1.0, log=True)
@@ -438,7 +439,8 @@ def objective(trial, trainset, scaler, X):
     latent_dim = trial.suggest_categorical('latent_dim', [64, 128, 256, 512])
     kf = KFold(n_splits=5, shuffle=True, random_state=42)
     fold_losses, split_n = [], 0
-    for train_idx, val_idx in tqdm(kf.split(X), desc="Splits", position=0):
+    prog_bar = tqdm(kf.split(X), desc="Splits", position=0)
+    for train_idx, val_idx in prog_bar:
         gc.collect()
         torch.cuda.empty_cache()
         split_n += 1
@@ -449,7 +451,7 @@ def objective(trial, trainset, scaler, X):
         optimizer = optim.AdamW(net.parameters(), lr=lr)
         scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=5)
         val_losses = deque(maxlen=3)
-        for epoch in range(25):
+        for epoch in range(num_epochs):
             gc.collect()
             torch.cuda.empty_cache()
             cycle_pos = epoch % cycle_length
@@ -457,7 +459,8 @@ def objective(trial, trainset, scaler, X):
             train_loss, train_rmse, train_psnr = fit(net, trainloader, optimizer, scaler, loss_vgg_fn, coeff_char, coeff_cos, coeff_vgg, coeff_kld)
             val_loss, val_rmse, val_psnr = predict(net, valloader, loss_vgg_fn, coeff_char, coeff_cos, coeff_vgg, coeff_kld)
             # scheduler.step(val_psnr)
-            val_losses.append(val_loss.item())
+            val_losses.append(val_loss)
+            current_lr = optimizer.param_groups[0]['lr']
             prog_bar.set_description(f"Epoch {epoch + 1}, lr={current_lr}, coeff_kld={coeff_kld:.3f}, Loss={train_loss:.3f}/{val_loss:.3f} | Metrics train/val: RMSE={train_rmse:.3f}/{val_rmse:.3f}, PSNR={train_psnr:.3f}/{val_psnr:.3f}")
         del net, optimizer, scheduler
         fold_mean_loss = np.mean(val_losses)
