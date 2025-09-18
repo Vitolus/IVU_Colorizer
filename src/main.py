@@ -464,7 +464,7 @@ def objective(trial, trainset, scaler, X):
             val_psnrs.append(val_psnr)
             current_lr = optimizer.param_groups[0]['lr']
             prog_bar.set_description(f"Epoch {epoch + 1}, lr={current_lr}, coeff_kld={coeff_kld:.3f}, Loss={train_loss:.3f}/{val_loss:.3f} | Metrics train/val: RMSE={train_rmse:.3f}/{val_rmse:.3f}, PSNR={train_psnr:.3f}/{val_psnr:.3f}")
-        del net, optimizer, scheduler
+        del net, optimizer
         fold_mean_psnr = np.mean(val_psnrs)
         fold_psnrs.append(fold_mean_psnr)
         trial.report(fold_mean_psnr, split_n)
