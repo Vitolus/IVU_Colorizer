@@ -438,7 +438,7 @@ def objective(trial, trainset, scaler, X):
     batch_size = trial.suggest_categorical('batch_size', [32, 64])
     latent_dim = trial.suggest_categorical('latent_dim', [64, 128, 256, 512])
     kf = KFold(n_splits=5, shuffle=True, random_state=42)
-    fold_losses, split_n = [], 0
+    fold_psnrs, split_n = [], 0
     prog_bar = tqdm(kf.split(X), desc="Splits", total=5, position=0)
     for train_idx, val_idx in prog_bar:
         gc.collect()
@@ -449,8 +449,7 @@ def objective(trial, trainset, scaler, X):
         loss_vgg_fn = VGGLoss(layers).to(device)
         net = Net(latent_dim).to(device)
         optimizer = optim.AdamW(net.parameters(), lr=lr)
-        scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=5)
-        val_losses = deque(maxlen=3)
+        val_psnrs = deque(maxlen=3)
         for epoch in range(num_epochs):
             gc.collect()
             torch.cuda.empty_cache()
@@ -458,17 +457,16 @@ def objective(trial, trainset, scaler, X):
             coeff_kld = final_coeff_kld * (0.5 * (1 + np.cos(np.pi * (1 - cycle_pos / cycle_length))))
             train_loss, train_rmse, train_psnr = fit(net, trainloader, optimizer, scaler, loss_vgg_fn, coeff_char, coeff_cos, coeff_vgg, coeff_kld)
             val_loss, val_rmse, val_psnr = predict(net, valloader, loss_vgg_fn, coeff_char, coeff_cos, coeff_vgg, coeff_kld)
-            # scheduler.step(val_psnr)
-            val_losses.append(val_loss)
+            val_psnrs.append(val_psnr)
             current_lr = optimizer.param_groups[0]['lr']
             prog_bar.set_description(f"Epoch {epoch + 1}, lr={current_lr}, coeff_kld={coeff_kld:.3f}, Loss={train_loss:.3f}/{val_loss:.3f} | Metrics train/val: RMSE={train_rmse:.3f}/{val_rmse:.3f}, PSNR={train_psnr:.3f}/{val_psnr:.3f}")
         del net, optimizer, scheduler
-        fold_mean_loss = np.mean(val_losses)
-        fold_losses.append(fold_mean_loss)
-        trial.report(fold_mean_loss, split_n)
+        fold_mean_psnr = np.mean(val_psnrs)
+        fold_psnrs.append(fold_mean_psnr)
+        trial.report(fold_mean_psnr, split_n)
         if trial.should_prune():
             raise optuna.exceptions.TrialPruned()
-    return np.mean(fold_losses)
+    return np.mean(fold_psnrs)
 #%%
 class Net(nn.Module):
     def __init__(self, latent_dim=256):
@@ -571,7 +569,7 @@ gc.collect()
 torch.cuda.empty_cache()
 X = np.zeros(len(trainset))
 scaler = torch.amp.GradScaler(device)
-study = optuna.create_study(direction='minimize', pruner=optuna.pruners.MedianPruner())
+study = optuna.create_study(direction='maximize', pruner=optuna.pruners.MedianPruner())
 study.optimize(lambda trial: objective(trial, trainset, scaler, X), n_trials=5)
 #%%
 pruned_trials = study.get_trials(deepcopy=False, states=[TrialState.PRUNED])
