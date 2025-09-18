@@ -357,10 +357,12 @@ def fit(net, trainloader, optimizer, scaler, loss_vgg_fn, coeff_char, coeff_cos,
             if coeff_char > 0.0:
                 loss_rec += (lambda x, y: torch.mean(torch.sqrt((x - y) ** 2 + 1e-6 ** 2)))(out_rescaled, targets) * coeff_char
             if coeff_cos > 0.0:
-                loss_rec += (1 - ((out_rescaled / (out_rescaled.norm(dim=1, keepdim=True) + 1e-8)) * (targets / (targets.norm(dim=1, keepdim=True) + 1e-6))).sum(dim=1)).mean() * coeff_cos
+                loss_rec += (1 - ((out_rescaled / (out_rescaled.norm(dim=1, keepdim=True).clamp(min=1e-8))) *
+                                  (targets / (targets.norm(dim=1, keepdim=True).clamp(min=1e-8)))).sum(dim=1)).mean() * coeff_cos
             if coeff_vgg > 0.0:
                 loss_rec += loss_vgg_fn(inputs, out_rescaled, targets) * coeff_vgg
                 # loss_rec += coeff_vgg * loss_vgg_fn(inputs, out, targets_features)
+            logvar = torch.clamp(logvar, -30, 20)
             loss_kld = -0.5 * torch.sum(1 + logvar - mu ** 2 - logvar.exp(), dim=1).mean()
             loss = loss_rec + coeff_kld * loss_kld
         optimizer.zero_grad(set_to_none=True)
@@ -403,10 +405,12 @@ def predict(net, valloader, loss_vgg_fn, coeff_char, coeff_cos, coeff_vgg, coeff
             if coeff_char > 0.0:
                 loss_rec += (lambda x, y: torch.mean(torch.sqrt((x - y) ** 2 + 1e-6 ** 2)))(out_rescaled, targets) * coeff_char
             if coeff_cos > 0.0:
-                loss_rec += (1 - ((out_rescaled / (out_rescaled.norm(dim=1, keepdim=True) + 1e-8)) * (targets / (targets.norm(dim=1, keepdim=True) + 1e-6))).sum(dim=1)).mean() * coeff_cos
+                loss_rec += (1 - ((out_rescaled / (out_rescaled.norm(dim=1, keepdim=True).clamp(min=1e-8))) *
+                                  (targets / (targets.norm(dim=1, keepdim=True).clamp(min=1e-8)))).sum(dim=1)).mean() * coeff_cos
             if coeff_vgg > 0.0:
                 loss_rec += loss_vgg_fn(inputs, out_rescaled, targets) * coeff_vgg
                 # loss_rec += coeff_vgg * loss_vgg_fn(inputs, out, targets_features)
+            logvar = torch.clamp(logvar, -30, 20)
             loss_kld = -0.5 * torch.sum(1 + logvar - mu ** 2 - logvar.exp(), dim=1).mean()
             loss = loss_rec + coeff_kld * loss_kld
         if not torch.isfinite(loss):
