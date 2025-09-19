@@ -512,11 +512,11 @@ class Net(nn.Module):
             nn.LeakyReLU()
         )
         self.dec2 = nn.Sequential(
-            nn.ConvTranspose2d(128 + 128, 64, kernel_size=3, stride=2, padding=1, output_padding=1),
+            nn.ConvTranspose2d(128, 64, kernel_size=3, stride=2, padding=1, output_padding=1),
             nn.LeakyReLU()
         )
         self.dec3 = nn.Sequential(
-            nn.ConvTranspose2d(64 + 64, 32, kernel_size=3, stride=1, padding=1),
+            nn.ConvTranspose2d(64, 32, kernel_size=3, stride=1, padding=1),
             nn.LeakyReLU()
         )
         self.dec4 = nn.Sequential(
@@ -544,12 +544,9 @@ class Net(nn.Module):
         dec_input = self.decoder_input(z)
         d = dec_input.reshape(-1, 256, SIZE // 8, SIZE // 8)
         d1 = self.dec1(d) # [B, 128, size/4, size/4]
-        d1 = torch.cat([d1, e2], dim=1)
         d2 = self.dec2(d1) # [B, 64, size/2, size/2]
-        d2 = torch.cat([d2, e1], dim=1)
         d3 = self.dec3(d2) # [B, 32, size/2, size/2]
         out = self.dec4(d3) # [B, 2, size, size]
-
         return out, mu, logvar
 #%%
 writer = SummaryWriter('../runs')
